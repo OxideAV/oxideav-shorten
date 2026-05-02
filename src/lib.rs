@@ -29,13 +29,33 @@
 //!   treats the post-shift integer as the "true" sample and only widens
 //!   to S16 for the output buffer).
 //!
+//! # Round-1 encoder coverage
+//!
+//! - Bitwriter primitive (inverse of `BitReader`) and Rice/Golomb
+//!   writers (unsigned, signed-zig-zag, adaptive ulong).
+//! - Per-block predictor selection across DIFF0/1/2/3 (greedy: pick
+//!   the predictor with the smallest sum of `|residual|`).
+//! - FN_ZERO silence shortcut for all-zero blocks.
+//! - Per-block Rice-`k` selection from `floor(log2(mean(|residual|)))`.
+//! - Per-channel state mirroring the decoder: `nwrap = 3` history
+//!   ring, `nmean`-deep mean FIFO with v >= 2 rounding bias.
+//! - Round-robin channel interleave matching the decoder's emission
+//!   order.
+//! - All `internal_ftype` values 1..6 mapped from [`encoder::ShortenFtype`].
+//! - Header magic + version `2` + 6 ulong fields + minimal leading
+//!   FN_VERBATIM placeholder + trailing FN_QUIT.
+//!
 //! # Round-2 work (documented in CHANGELOG)
 //!
 //! - Streaming over multiple packets (today: each packet is treated as
 //!   a self-contained `.shn` file).
 //! - Producing native-bit-depth output (S8 / S32) instead of always S16.
 //! - Demuxer / probe registration in `oxideav-container`.
-//! - Encoder.
+//! - QLPC encoder (needs Levinson-Durbin + LPC quantisation at qshift=5).
+//! - BITSHIFT encoder for streams with consistent low-zero-bits (e.g.
+//!   24-bit-in-32-bit containers).
+//! - Mid-stream FN_BLOCKSIZE so the encoder can handle non-multiple-
+//!   of-blocksize inputs.
 //! - Reading the leading VERBATIM capsule for sample-rate /
 //!   bits-per-coded-sample (today the decoder skips the capsule bytes
 //!   and relies on `CodecParameters::sample_rate` from the caller).
@@ -45,7 +65,10 @@
 
 pub mod codec;
 pub mod decoder;
+pub mod encoder;
 pub mod rice;
+
+pub use encoder::{BlockInfo, ShortenEncoder, ShortenEncoderConfig, ShortenFtype};
 
 use oxideav_core::CodecRegistry;
 
