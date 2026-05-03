@@ -14,14 +14,7 @@ categories = ["multimedia::encoding", "multimedia::audio"]
 
 [dependencies]
 oxideav-core = "0.1"
-
-# This crate normally lives as a `crates/*` member of the OxideAV
-# umbrella workspace at https://github.com/OxideAV/oxideav-workspace,
-# which provides a [patch.crates-io] table that redirects every
-# `oxideav-*` dep to the matching local checkout. When this manifest
-# is opened standalone (or when sibling worktrees in the umbrella are
-# in flux during a multi-agent bootstrap), declaring an empty
-# `[workspace]` table here stops cargo from climbing up into the
+` table here stops cargo from climbing up into the
 # umbrella manifest — the standalone build then resolves
 # `oxideav-core` from crates.io as usual.
 [workspace]
