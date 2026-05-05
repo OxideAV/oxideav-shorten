@@ -86,7 +86,7 @@ fn make_decoder(channels: u32) -> Box<dyn oxideav_core::Decoder> {
     params.sample_rate = Some(44_100);
     params.channels = Some(channels as u16);
     params.sample_format = Some(SampleFormat::S16);
-    codecs.make_decoder(&params).expect("make_decoder")
+    codecs.first_decoder(&params).expect("make_decoder")
 }
 
 fn decode_to_s16(bytes: Vec<u8>, channels: u32) -> Vec<i16> {
