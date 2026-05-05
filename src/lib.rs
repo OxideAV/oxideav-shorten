@@ -45,15 +45,26 @@
 //! - Header magic + version `2` + 6 ulong fields + minimal leading
 //!   FN_VERBATIM placeholder + trailing FN_QUIT.
 //!
-//! # Round-2 work (documented in CHANGELOG)
+//! # Round-2 encoder additions (this version)
+//!
+//! - QLPC encoder: Levinson-Durbin auto-correlation → LPC coefficients
+//!   → quantised integers (multiply by 2^5, clamp); residuals via the
+//!   existing adaptive-Rice pipeline. Enabled via
+//!   [`ShortenEncoderConfig::with_maxnlpc`].
+//! - BITSHIFT encoder: detects consistent trailing zero bits across all
+//!   channels in each block; emits FN_BITSHIFT when the shift changes
+//!   and right-shifts samples before prediction. Enabled via
+//!   [`ShortenEncoderConfig::with_bitshift`].
+//! - Synthesised WAV leading FN_VERBATIM: encoder now builds a real
+//!   44-byte RIFF/WAV header (vs. 44 zero bytes) so ffmpeg and shntool
+//!   can identify sample rate, bit depth, and channel count.
+//!
+//! # Round-3 work (deferred)
 //!
 //! - Streaming over multiple packets (today: each packet is treated as
 //!   a self-contained `.shn` file).
 //! - Producing native-bit-depth output (S8 / S32) instead of always S16.
 //! - Demuxer / probe registration in `oxideav-container`.
-//! - QLPC encoder (needs Levinson-Durbin + LPC quantisation at qshift=5).
-//! - BITSHIFT encoder for streams with consistent low-zero-bits (e.g.
-//!   24-bit-in-32-bit containers).
 //! - Mid-stream FN_BLOCKSIZE so the encoder can handle non-multiple-
 //!   of-blocksize inputs.
 //! - Reading the leading VERBATIM capsule for sample-rate /

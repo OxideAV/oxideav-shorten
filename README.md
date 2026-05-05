@@ -63,51 +63,62 @@ println!("decoded {} samples per channel", af.samples);
 - Output is always packed S16 interleaved; 8-bit and U16 inputs are
   normalised to S16 before emission.
 
-## Round-1 encoder coverage
+## Encoder coverage
 
 - Bitwriter primitive (inverse of the decoder's `BitReader`) and
   Rice/Golomb writers (unsigned, signed-zig-zag, adaptive ulong).
-- Per-block predictor selection across DIFF0/1/2/3 (greedy: pick the
-  predictor with the smallest sum of `|residual|`).
+- Per-block predictor selection across **DIFF0/1/2/3 + QLPC** (greedy:
+  pick the predictor with the smallest sum of `|residual|`).
+- **QLPC** (Quantised Linear Predictor): Levinson-Durbin
+  auto-correlation → floating-point LPC coefficients → quantised
+  integers at `qshift = 5` (multiply by 2^5 = 32, round, clamp to
+  i16). Enabled via `with_maxnlpc(N)`; the QLPC candidate is included
+  in the per-block predictor race for orders 1..=N.
+- **BITSHIFT**: detects consistent trailing zero bits across all
+  channels' current block; emits FN_BITSHIFT when the shift count
+  changes; samples are right-shifted before prediction and the decoder
+  left-shifts the output to restore the original magnitude. Enabled
+  via `with_bitshift(true)`.
 - FN_ZERO silence shortcut for all-zero blocks.
 - Per-block Rice-`k` selection from
   `max(0, floor(log2(mean(|residual|))))`.
-- Per-channel state mirroring the decoder: 3-deep wrap-history ring,
-  `nmean`-deep mean FIFO with v >= 2 rounding bias.
+- Per-channel state mirroring the decoder: `nwrap = max(3, maxnlpc)`
+  history ring, `nmean`-deep mean FIFO with v >= 2 rounding bias.
 - Round-robin channel interleave matching the decoder's emission order.
 - All `internal_ftype` values 1..6 mapped from
   [`encoder::ShortenFtype`].
-- Header magic + version `2` + 6 ulong fields + 44-byte placeholder
-  leading FN_VERBATIM + trailing FN_QUIT.
+- Header magic + version `2` + 6 ulong fields + real 44-byte WAV
+  leading FN_VERBATIM (sample rate, bit depth, channel count) +
+  trailing FN_QUIT.
+- ffmpeg cross-decode verified: all encoder outputs (DIFFn, QLPC,
+  BITSHIFT, QLPC+BITSHIFT stereo) pass ffmpeg `shorten` decode
+  bit-exactly.
 
 ```rust,no_run
 use oxideav_shorten::{ShortenEncoder, ShortenEncoderConfig, ShortenFtype};
 
+// DIFFn-only encoder (simple use case):
 let cfg = ShortenEncoderConfig::new(ShortenFtype::S16Le, /*channels*/ 2, /*blocksize*/ 256);
 let mut enc = ShortenEncoder::new(cfg).unwrap();
 let pcm: Vec<i32> = vec![/* interleaved S16 samples */];
 let bytes = enc.encode(&pcm).unwrap();
 std::fs::write("song.shn", bytes).unwrap();
+
+// QLPC + BITSHIFT encoder (better compression):
+let cfg = ShortenEncoderConfig::new(ShortenFtype::S16Le, 2, 256)
+    .with_maxnlpc(8)        // enable QLPC up to order 8
+    .with_bitshift(true)    // auto-detect trailing-zero bits
+    .with_sample_rate(44_100);
+let mut enc = ShortenEncoder::new(cfg).unwrap();
+let bytes = enc.encode(&pcm).unwrap();
 ```
 
-The encoder's bit-exact correctness is verified against this crate's
-own decoder (ffmpeg ships only a Shorten *decoder*, so there is no
-reference encoder to cross-check against; the workspace policy
-prohibits consulting any third-party Shorten source code as an oracle).
-
-## Round-2 work (roadmap)
+## Round-3 work (roadmap)
 
 The following are not yet implemented but planned:
 
 ### Encoder
 
-- **QLPC encoder.** Needs Levinson-Durbin coefficient estimation +
-  quantisation at `qshift = 5` (the decoder is already wired up for
-  this — only the inverse half is missing). Once landed, compression
-  on tonal content jumps significantly.
-- **BITSHIFT encoder.** For streams with consistent low-zero bits
-  (e.g. 24-bit-in-32-bit containers); detect via per-block bitwise
-  AND and emit FN_BITSHIFT before the affected blocks.
 - **Mid-stream FN_BLOCKSIZE.** Today the encoder requires the
   per-channel sample count to be a multiple of `blocksize`; emitting
   FN_BLOCKSIZE before the trailing partial block would lift this.
@@ -116,9 +127,6 @@ The following are not yet implemented but planned:
   iterate `k-1 / k / k+1` and pick the actual minimum encoded length.
 - **Streaming / multi-packet encode.** Produce one block per
   `Encoder::send_frame` call, preserving inter-block state.
-- **Synthesised RIFF/AIFF leading FN_VERBATIM.** Today the encoder
-  emits a 44-byte zero placeholder; a real WAV header would let
-  downstream demuxers reconstruct the original container.
 
 ### Decoder
 
