@@ -338,11 +338,7 @@ impl ShortenEncoder {
         // parameters. ffmpeg and shntool both require this to identify
         // the audio format (sample rate, bit depth, channel count).
         // Chunk sizes are set to 0 (streaming / unknown length).
-        let wav = build_wav_header(
-            self.cfg.ftype,
-            self.cfg.channels,
-            self.cfg.sample_rate,
-        );
+        let wav = build_wav_header(self.cfg.ftype, self.cfg.channels, self.cfg.sample_rate);
         debug_assert_eq!(wav.len(), VERBATIM_LEN as usize);
         write_unsigned_k(&mut bw, FN_VERBATIM, FNSIZE);
         write_unsigned_k(&mut bw, VERBATIM_LEN, VERBATIM_CKSIZE_SIZE);

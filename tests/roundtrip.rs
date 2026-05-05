@@ -462,8 +462,7 @@ fn bitshift_reduces_stream_size() {
     let pcm: Vec<i32> = (0i32..256)
         .map(|i| ((i - 128) * 256) & !0xFF) // clear low 8 bits
         .collect();
-    let cfg_with =
-        ShortenEncoderConfig::new(ShortenFtype::S16Le, 1, 256).with_bitshift(true);
+    let cfg_with = ShortenEncoderConfig::new(ShortenFtype::S16Le, 1, 256).with_bitshift(true);
     let cfg_without = ShortenEncoderConfig::new(ShortenFtype::S16Le, 1, 256);
     let mut enc_with = ShortenEncoder::new(cfg_with).unwrap();
     let mut enc_without = ShortenEncoder::new(cfg_without).unwrap();
