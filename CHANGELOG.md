@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/OxideAV/oxideav-shorten/compare/v0.0.2...v0.0.3) - 2026-05-06
+
+### Other
+
+- prepend retirement notice (docs audit 2026-05-06)
+- registry calls: rename make_decoder/make_encoder → first_decoder/first_encoder
+- cargo fmt
+- add QLPC (Levinson-Durbin) + BITSHIFT + real WAV VERBATIM (round 2)
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-shorten/compare/v0.0.1...v0.0.2) - 2026-05-03
 
 ### Other
