@@ -1,0 +1,16 @@
+[package]
+name = "oxideav-shorten"
+version = "0.0.2"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust Shorten (.shn) lossless audio codec (decoder + DIFFn encoder) for the oxideav framework"
+repository = "https://github.com/OxideAV/oxideav-shorten"
+homepage = "https://github.com/OxideAV/oxideav-shorten"
+readme = "README.md"
+keywords = ["multimedia", "audio", "shorten", "lossless", "codec"]
+categories = ["multimedia::encoding", "multimedia::audio"]
+
+[dependencies]
+oxideav-core = "0.1"
