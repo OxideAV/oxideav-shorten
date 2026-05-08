@@ -34,31 +34,90 @@ use crate::{Error, Result, MAX_BLOCKSIZE, MAX_CHANNELS, MAX_LPC_ORDER};
 /// Magic bytes at file offset 0..=3.
 pub const MAGIC: [u8; 4] = *b"ajkg";
 
-/// File-type code mapping pinned by `spec/05-state-and-quirks.md` §6.
-/// Pinned numeric values: `u8 = 2`, `s16hl = 3`, `s16lh = 5`. The
-/// other eight TR.156 labels are not pinned by the current corpus.
+/// File-type code mapping for the eleven TR.156 labels.
+///
+/// `spec/05-state-and-quirks.md` §6 pins three numeric values from the
+/// public fixture corpus: **`u8 = 2`, `s16hl = 3`, `s16lh = 5`**. The
+/// remaining eight labels' on-wire numeric codes are *not* pinned by
+/// any reference in the spec set's allow-list — neither TR.156 nor the
+/// behavioural anchors enumerate them. Round 2 admits each remaining
+/// label as a distinct enum variant so the decoder can name what it
+/// observed and the encoder can produce a representative wire byte;
+/// the numeric codes selected for the eight unpinned labels are
+/// **chosen by this implementation** to fill the gaps in the TR.156
+/// list-position scheme without colliding with the three pinned codes:
+///
+/// | TR.156 list pos | Label   | Wire code |
+/// | --------------- | ------- | --------- |
+/// | 0               | `ulaw`  | 0         |
+/// | 1               | `s8`    | 1         |
+/// | 2               | `u8`    | 2  (pinned by F2) |
+/// | 3               | `s16hl` | 3  (pinned by F3) |
+/// | 4               | `u16hl` | 4         |
+/// | 5               | `s16lh` | 5  (pinned by F1) |
+/// | 6               | `u16lh` | 6         |
+/// | 7               | `s16`   | 7         |
+/// | 8               | `u16`   | 8         |
+/// | 9               | `s16x`  | 9         |
+/// | 10              | `u16x`  | 10        |
+///
+/// Streams encoded by this crate using one of the eight unpinned codes
+/// roundtrip through this crate but **may not roundtrip through other
+/// Shorten implementations** until `spec/05-state-and-quirks.md` §6
+/// pins the remaining mapping (a §9.4 escalation candidate). See
+/// `spec/05-state-and-quirks.md` §6 for the spec gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Filetype {
-    /// 8-bit unsigned, file-type code 2.
+    /// µ-law 8-bit per ITU-T G.711, file-type code 0 (unpinned).
+    Ulaw,
+    /// 8-bit signed, file-type code 1 (unpinned).
+    S8,
+    /// 8-bit unsigned, file-type code 2 (pinned by F2).
     U8,
     /// 16-bit signed, big-endian byte order on the *output* (`s16hl`),
-    /// file-type code 3.
+    /// file-type code 3 (pinned by F3).
     S16Be,
+    /// 16-bit unsigned, big-endian byte order (`u16hl`),
+    /// file-type code 4 (unpinned).
+    U16Be,
     /// 16-bit signed, little-endian byte order on the *output*
-    /// (`s16lh`), file-type code 5.
+    /// (`s16lh`), file-type code 5 (pinned by F1).
     S16Le,
+    /// 16-bit unsigned, little-endian byte order (`u16lh`),
+    /// file-type code 6 (unpinned).
+    U16Le,
+    /// 16-bit signed, host-natural byte order (`s16`),
+    /// file-type code 7 (unpinned).
+    S16Native,
+    /// 16-bit unsigned, host-natural byte order (`u16`),
+    /// file-type code 8 (unpinned).
+    U16Native,
+    /// 16-bit signed, byte-swapped relative to host (`s16x`),
+    /// file-type code 9 (unpinned).
+    S16Swapped,
+    /// 16-bit unsigned, byte-swapped relative to host (`u16x`),
+    /// file-type code 10 (unpinned).
+    U16Swapped,
 }
 
 impl Filetype {
     /// Resolve a numeric file-type code to a [`Filetype`] variant, or
     /// return an [`Error::UnsupportedFiletype`] for codes outside the
-    /// pinned set.
+    /// known set.
     pub fn from_code(code: u32) -> Result<Self> {
         match code {
+            0 => Ok(Self::Ulaw),
+            1 => Ok(Self::S8),
             2 => Ok(Self::U8),
             3 => Ok(Self::S16Be),
+            4 => Ok(Self::U16Be),
             5 => Ok(Self::S16Le),
+            6 => Ok(Self::U16Le),
+            7 => Ok(Self::S16Native),
+            8 => Ok(Self::U16Native),
+            9 => Ok(Self::S16Swapped),
+            10 => Ok(Self::U16Swapped),
             other => Err(Error::UnsupportedFiletype(other)),
         }
     }
@@ -66,34 +125,67 @@ impl Filetype {
     /// Numeric file-type code on the wire.
     pub fn to_code(self) -> u32 {
         match self {
+            Self::Ulaw => 0,
+            Self::S8 => 1,
             Self::U8 => 2,
             Self::S16Be => 3,
+            Self::U16Be => 4,
             Self::S16Le => 5,
+            Self::U16Le => 6,
+            Self::S16Native => 7,
+            Self::U16Native => 8,
+            Self::S16Swapped => 9,
+            Self::U16Swapped => 10,
         }
     }
 
     /// Bytes per output sample.
     pub fn bytes_per_output_sample(self) -> usize {
         match self {
-            Self::U8 => 1,
-            Self::S16Be | Self::S16Le => 2,
+            Self::Ulaw | Self::S8 | Self::U8 => 1,
+            Self::S16Be
+            | Self::U16Be
+            | Self::S16Le
+            | Self::U16Le
+            | Self::S16Native
+            | Self::U16Native
+            | Self::S16Swapped
+            | Self::U16Swapped => 2,
         }
     }
 
-    /// Whether the on-wire residual lane is signed.
+    /// Whether the predictor lane is signed (true for every TR.156
+    /// label — Shorten's predictor always operates in a signed
+    /// domain; the unsigned output filetypes are biased by the
+    /// running-mean estimator at decode time).
     pub fn is_signed_internal(self) -> bool {
-        // All three pinned filetypes use a signed predictor lane on
-        // the wire. The encoder applies a half-range bias for the
-        // unsigned filetype on the decode side via the running-mean
-        // estimator (see `spec/05` §2): the predictor's residual
-        // domain is the int form, the output domain pads back to u8
-        // for U8.
         true
     }
 
-    /// Output bytes-per-sample × is-LE — used by the PCM packer.
+    /// Whether the output bytes are little-endian. For 8-bit and µ-law
+    /// labels this is irrelevant; we return `true` (single-byte values
+    /// are byte-order-agnostic). For `*_Native` and `*_Swapped` we
+    /// resolve against host byte order — `Native` is LE on a
+    /// little-endian host, BE on a big-endian host; `Swapped` is the
+    /// converse.
     pub fn output_endian_le(self) -> bool {
-        matches!(self, Self::S16Le | Self::U8)
+        match self {
+            Self::Ulaw | Self::S8 | Self::U8 => true,
+            Self::S16Le | Self::U16Le => true,
+            Self::S16Be | Self::U16Be => false,
+            Self::S16Native | Self::U16Native => cfg!(target_endian = "little"),
+            Self::S16Swapped | Self::U16Swapped => cfg!(target_endian = "big"),
+        }
+    }
+
+    /// Whether the *output* sample format is unsigned (the encoder's
+    /// input had a half-range bias, so the decoder restores it on
+    /// emission).
+    pub fn is_unsigned_output(self) -> bool {
+        matches!(
+            self,
+            Self::U8 | Self::U16Be | Self::U16Le | Self::U16Native | Self::U16Swapped
+        )
     }
 }
 

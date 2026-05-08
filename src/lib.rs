@@ -38,16 +38,35 @@
 //!   `oxideav-core`-integrated decoder packs to `u8` / `s16` per the
 //!   stream's filetype and the framework's [`SampleFormat`] target).
 //!
-//! ## What's intentionally out (deferred to round 2+)
+//! ## Round 2 additions
+//!
+//! * **Production encoder** ([`encode`], [`EncoderConfig`]) — predictor
+//!   search across `DIFF0..3` and `QLPC` (when `max_lpc_order > 0`),
+//!   energy-width optimisation per TR.156 §3.3 eq. 21.
+//! * **All eleven filetypes** of TR.156's `-t` enumeration. The
+//!   numeric codes for the eight unpinned labels are chosen by this
+//!   implementation per `header::Filetype` rustdoc; cross-implementation
+//!   roundtrip on those codes is not guaranteed until `spec/05` §6
+//!   pins them.
+//! * **Container demuxer + 'ajkg' probe** registered on the
+//!   `oxideav-core` `ContainerRegistry` under the name `"shorten"`. A
+//!   `.shn` file emits a single packet containing the entire stream;
+//!   the codec-side decoder handles framing internally.
+//!
+//! ## What's intentionally out (deferred to round 3+)
 //!
 //! * High-throughput optimisations (table-driven uvar prefix decode,
 //!   SIMD residual unpacking).
-//! * `BLOCK_FN_QLPC` byte-exactness verified through the TR.156 test
-//!   oracle (Variant B asymmetric oracle): the coefficient
-//!   quantisation domain is the encoder's choice; the round-1
-//!   decoder applies coefficients verbatim per `spec/03` §3.5.
-//! * Production encoder. The crate's test scaffold ships a minimal
-//!   encoder for self-roundtrip; a real encoder belongs in round 2.
+//! * Lossy `BLOCK_FN_BITSHIFT` mode on the encoder side. The round-2
+//!   encoder always writes `bshift = 0`.
+//! * Mean-estimator on the encode side. The round-2 encoder writes
+//!   `H_meanblocks = 0`, sidestepping the ±1 sub-bit-precision drift
+//!   documented in `audit/01` §8.1. The decoder still handles
+//!   `mean_blocks > 0` for streams produced externally.
+//! * Format-version 1 / 3 wire-format deltas. No v1 or v3 fixture is
+//!   reachable in the docs corpus; v1 is syntactically accepted (per
+//!   the FFmpeg-observed T3 tampering test) but the v1 header layout
+//!   is not behaviourally pinned.
 //!
 //! ## Cargo features
 //!
@@ -68,11 +87,14 @@ mod registry;
 mod varint;
 
 pub use crate::decoder::{decode, DecodedStream};
+pub use crate::encoder::{encode, EncodeError, EncoderConfig};
 pub use crate::error::{Error, Result};
 pub use crate::header::{parse_header, Filetype, StreamHeader, MAGIC};
 
 #[cfg(feature = "registry")]
-pub use crate::registry::{register, register_codecs, CODEC_ID_STR};
+pub use crate::registry::{
+    container_register, register, register_codecs, shorten_probe, CODEC_ID_STR, CONTAINER_NAME,
+};
 
 /// Maximum channels accepted by the decoder. The Hydrogenaudio entry
 /// notes Shorten "lacks ... support for multichannel ... and high
@@ -96,3 +118,6 @@ oxideav_core::register!("oxideav-shorten", register);
 
 #[cfg(test)]
 mod roundtrip_tests;
+
+#[cfg(test)]
+mod round2_tests;

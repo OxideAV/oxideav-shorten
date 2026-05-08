@@ -120,8 +120,8 @@ pub(crate) fn unsigned_to_signed(u: u32) -> i32 {
     }
 }
 
-/// Forward of the one's-complement folding (test-only encoder).
-#[cfg(test)]
+/// Forward of the one's-complement folding. Used by the production
+/// encoder + the test-only round-1 helpers.
 #[inline]
 pub(crate) fn signed_to_unsigned(s: i32) -> u32 {
     if s >= 0 {

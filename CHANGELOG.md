@@ -16,8 +16,26 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stereo i32-lane PCM output.
 - `oxideav-core` framework integration (default-on `registry`
   feature) — codec id `shorten`, `register(ctx)` entry point.
-- 38 unit + roundtrip tests covering every implemented function
-  code path.
+- Round-2 production encoder (`encode` + `EncoderConfig` +
+  `EncodeError`): predictor search across `DIFF0..3` plus `QLPC`
+  (when `max_lpc_order > 0`); energy-width optimisation minimising
+  the per-block Rice-coding bit cost (TR.156 §3.3 eq. 21 with the
+  `+1` offset of `spec/05` §3).
+- Round-2 expansion of `Filetype` to all eleven TR.156 labels
+  (`Ulaw`, `S8`, `U8`, `S16Be`, `U16Be`, `S16Le`, `U16Le`,
+  `S16Native`, `U16Native`, `S16Swapped`, `U16Swapped`). The eight
+  numeric codes the spec set leaves unpinned are assigned by this
+  implementation; the three pinned codes (`u8 = 2`, `s16hl = 3`,
+  `s16lh = 5`) match `spec/05` §6.
+- Round-2 container demuxer + `'ajkg'` content-based probe
+  registered with `oxideav-core`'s `ContainerRegistry` under the
+  name `"shorten"`. The `.shn` extension is also registered.
+- Round-2 PCM packer covers all 11 filetypes (signed and unsigned
+  8/16-bit; explicit, native, and byte-swapped 16-bit endianness;
+  µ-law passthrough).
+- 75 unit + roundtrip tests covering every function-code path,
+  every filetype, encoder error handling, and the demuxer's
+  end-to-end packet emission.
 
 ### Changed
 
