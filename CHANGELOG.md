@@ -8,6 +8,30 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-3 Levinson–Durbin LPC coefficient search inside the encoder's
+  per-block predictor candidates. When `max_lpc_order > 0` the
+  encoder runs the standard recursion over the per-block-plus-carry
+  autocorrelation, rounds the float direct-form coefficients to
+  integers (Shorten's QLPC predictor applies coefficients without
+  an implicit shift per `spec/03` §3.5), and adopts the result
+  whenever it beats the polynomial-equivalent identity baseline.
+  See `levinson_durbin` and `lpc_candidate_coefs` in `encoder.rs`.
+- Round-3 `BLOCK_FN_BITSHIFT` lossy encode mode via
+  `EncoderConfig::with_bshift` (capped at `BITSHIFT_MAX = 31`).
+  The encoder emits a leading `BITSHIFT` command and right-shifts
+  every input sample by `bshift` before predictor application; the
+  decoder restores the bottom `bshift` bits as zeros via its
+  existing left-shift on emission. Round-3 emits the command once
+  at stream start; per `spec/04` §3 it may also appear later, but
+  there is no encoder use-case that requires that yet.
+- Round-3 corpus-style structural tests covering F1, F2, F3, F4,
+  F5, F6, F7, F8, F9, F12, F13, F16, F17, F18 (14 fixtures from the
+  audit/01 §2 enumeration). Each reproduces the fixture's
+  filetype + channel count + bshift via the production encoder,
+  decodes the round-tripped stream, and asserts the magic bytes
+  (`ajkg`), version byte (`0x02`), filetype, channel count, and
+  the bshift round-trip property `recovered = (input >> bshift) <<
+  bshift`. The `.shn` binaries themselves are not in the docs tree.
 - Round-1 decoder: header parse, function codes 0..=9 (`DIFF0..3`,
   `QUIT`, `BLOCKSIZE`, `BITSHIFT`, `QLPC`, `ZERO`, `VERBATIM`),
   Rice / Golomb residual coding (`uvar` / `svar` / `ulong`),
@@ -35,7 +59,8 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   µ-law passthrough).
 - 75 unit + roundtrip tests covering every function-code path,
   every filetype, encoder error handling, and the demuxer's
-  end-to-end packet emission.
+  end-to-end packet emission. Round 3 brings the suite to 105
+  with the LPC + bitshift + corpus additions above.
 
 ### Changed
 

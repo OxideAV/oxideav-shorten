@@ -23,6 +23,26 @@
 //! next byte boundary per `spec/05` §4. The output is a complete
 //! `.shn` byte buffer.
 //!
+//! ## Round 3 additions
+//!
+//! * **Levinson–Durbin LPC coefficient search.** When `max_lpc_order >
+//!   0`, the encoder solves the Yule-Walker system on the per-block
+//!   autocorrelation to derive LPC coefficients (TR.156 §3.5 narrative;
+//!   the standard textbook recursion). The float coefficients are
+//!   then rounded to integer for the spec's coefficient-without-scaling
+//!   recurrence. The search keeps the integer-rounded set if it beats
+//!   the polynomial-equivalent baseline; otherwise the latter wins on a
+//!   tie. Composes with the existing `DIFF0..3` candidates within the
+//!   same per-block predictor search.
+//! * **`BLOCK_FN_BITSHIFT` lossy mode.** When [`EncoderConfig::bshift`]
+//!   is non-zero, the encoder emits a `BLOCK_FN_BITSHIFT` command at
+//!   the start of the per-block stream and right-shifts every input
+//!   sample by `bshift` before encoding. The decoder applies the
+//!   inverse left-shift, so the recovered samples have the lower
+//!   `bshift` bits zeroed. Per `spec/04` §3 the BITSHIFT command may
+//!   appear anywhere in the stream; round 3 emits it once at stream
+//!   start.
+//!
 //! ## What this encoder does **not** do
 //!
 //! * Running-mean-estimator (`mean_blocks > 0`) on the encode side.
@@ -30,19 +50,14 @@
 //!   ±1 sub-bit-precision drift documented in `audit/01` §8.1. The
 //!   decoder still handles `mean_blocks > 0` for streams produced
 //!   externally.
-//! * Bit-shift mode (`BLOCK_FN_BITSHIFT`). The encoder emits a
-//!   `bshift = 0` stream — i.e. a fully lossless encode of the input
-//!   `i32` lanes. Lossy bshift is a future enhancement.
 //! * Skip-bytes (`H_skipbytes`). Verbatim-prefix bytes are emitted
 //!   via `BLOCK_FN_VERBATIM` instead.
 
 use crate::decoder::fn_code;
 use crate::header::{Filetype, MAGIC};
-#[cfg(test)]
-use crate::varint::BITSHIFTSIZE;
 use crate::varint::{
-    signed_to_unsigned, ENERGYSIZE, FNSIZE, LPCQSIZE, LPCQUANT, ULONGSIZE, VERBATIM_BYTE_SIZE,
-    VERBATIM_CHUNK_SIZE,
+    signed_to_unsigned, BITSHIFTSIZE, ENERGYSIZE, FNSIZE, LPCQSIZE, LPCQUANT, ULONGSIZE,
+    VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE,
 };
 
 /// Encoder configuration.
@@ -64,7 +79,18 @@ pub struct EncoderConfig {
     /// preserve a host-format header (e.g. RIFF/WAVE preamble) at the
     /// front of the stream.
     pub verbatim: Vec<u8>,
+    /// Lossy bit-shift count emitted via a leading `BLOCK_FN_BITSHIFT`
+    /// command and applied as a right-shift to every input sample
+    /// prior to predictor application. `0` disables (lossless encode).
+    /// Capped at `BITSHIFT_MAX` (`(1 << BITSHIFTSIZE) - 1` plus the
+    /// uvar-prefix headroom; the decoder rejects any `bshift >= 32`).
+    pub bshift: u32,
 }
+
+/// Maximum lossy bit-shift the encoder accepts. The decoder rejects
+/// `bshift >= 32` (per `spec/04` §3 + `decoder::Error::BitShiftOverflow`),
+/// so the encoder caps below that bound.
+pub const BITSHIFT_MAX: u32 = 31;
 
 impl EncoderConfig {
     /// Construct a minimal config for `filetype` and `channels`. The
@@ -76,6 +102,7 @@ impl EncoderConfig {
             blocksize: 256,
             max_lpc_order: 0,
             verbatim: Vec::new(),
+            bshift: 0,
         }
     }
 
@@ -94,6 +121,13 @@ impl EncoderConfig {
     /// Set the verbatim prefix.
     pub fn with_verbatim(mut self, verbatim: Vec<u8>) -> Self {
         self.verbatim = verbatim;
+        self
+    }
+
+    /// Enable lossy `BLOCK_FN_BITSHIFT` mode at the given shift count.
+    /// `0` is lossless. See [`EncoderConfig::bshift`].
+    pub fn with_bshift(mut self, bshift: u32) -> Self {
+        self.bshift = bshift;
         self
     }
 }
@@ -160,6 +194,9 @@ pub fn encode(cfg: &EncoderConfig, samples: &[i32]) -> Result<Vec<u8>, EncodeErr
             "max_lpc_order exceeds MAX_LPC_ORDER",
         ));
     }
+    if cfg.bshift > BITSHIFT_MAX {
+        return Err(EncodeError::InvalidConfig("bshift exceeds BITSHIFT_MAX"));
+    }
     if samples.len() % cfg.channels as usize != 0 {
         return Err(EncodeError::SamplesNotChannelAligned {
             samples: samples.len(),
@@ -191,11 +228,25 @@ pub fn encode(cfg: &EncoderConfig, samples: &[i32]) -> Result<Vec<u8>, EncodeErr
         write_verbatim(&mut bw, &cfg.verbatim);
     }
 
-    // De-interleave for per-channel predictor application.
+    // BITSHIFT command — emitted once at stream start when the
+    // encoder is configured for lossy bshift > 0. The decoder
+    // applies the inverse left-shift on emitted samples.
+    if cfg.bshift > 0 {
+        bw.write_uvar(fn_code::BITSHIFT, FNSIZE);
+        bw.write_uvar(cfg.bshift, BITSHIFTSIZE);
+    }
+
+    // De-interleave for per-channel predictor application. Apply the
+    // configured `bshift` (right-shift, signed-arithmetic) per sample
+    // before queuing — the decoder restores the lower zero bits via
+    // its own left-shift on emission.
     let mut per_ch: Vec<Vec<i32>> = (0..nch).map(|_| Vec::with_capacity(total_per_ch)).collect();
+    let bshift = cfg.bshift;
     for i in 0..total_per_ch {
         for ch in 0..nch {
-            per_ch[ch].push(samples[i * nch + ch]);
+            let s = samples[i * nch + ch];
+            let shifted = if bshift == 0 { s } else { s >> bshift };
+            per_ch[ch].push(shifted);
         }
     }
 
@@ -292,59 +343,193 @@ fn best_predictor(block: &[i32], carry: &[i32], max_lpc_order: u32) -> Predictor
         }
     }
 
-    // QLPC candidates: orders 1..=max_lpc_order. The encoder uses a
-    // simple identity-style coefficient set (e.g. order=1 → coefs=[1]
-    // ≡ DIFF1) for now; a full Levinson-Durbin search is a future
-    // enhancement. We still consider them so a stream advertised
-    // with `max_lpc_order > 0` actually exercises the QLPC command.
+    // QLPC candidates: orders 1..=max_lpc_order. Round 3 derives
+    // the coefficients via Levinson–Durbin recursion on the per-block
+    // (with carry) autocorrelation, then quantises the float
+    // coefficients to small signed integers — Shorten's QLPC predictor
+    // applies coefficients without scaling, so the integer-valued
+    // estimate that the recursion produces is the wire form. For
+    // many natural-audio blocks this lands close to the polynomial
+    // DIFF predictors at low orders ([1] for order 1, [2,-1] for
+    // order 2, [3,-3,1] for order 3), but signals with non-trivial
+    // resonance prefer different integer coefficients. For each order
+    // we additionally consider the polynomial-equivalent baseline so
+    // a regression on a flat-spectrum block falls back to the
+    // identity coefficient set rather than to the (possibly inferior)
+    // Levinson estimate.
     for order in 1..=max_lpc_order.min(crate::MAX_LPC_ORDER) {
-        let coefs = identity_lpc_coefs(order as usize);
-        let residuals = compute_qlpc_residuals(&coefs, carry, block);
-        let width = pick_width(&residuals);
-        let cost = cost_of_residuals(&residuals, width);
-        let coef_overhead = 1 + LPCQSIZE as u64 + (order as u64) * (1 + LPCQUANT as u64);
-        let total = cost.saturating_add(1 + FNSIZE as u64 + coef_overhead + 1 + ENERGYSIZE as u64);
-        if best.as_ref().map_or(true, |(b, _)| total < *b) {
-            best = Some((
-                total,
-                PredictorChoice {
-                    fn_code: fn_code::QLPC,
-                    lpc_order: order,
-                    lpc_coefs: coefs,
-                    width,
-                    residuals,
-                },
-            ));
+        for coefs in lpc_candidate_coefs(order as usize, carry, block) {
+            let residuals = compute_qlpc_residuals(&coefs, carry, block);
+            let width = pick_width(&residuals);
+            let cost = cost_of_residuals(&residuals, width);
+            let coef_overhead =
+                1 + LPCQSIZE as u64 + coefs.iter().map(|&c| svar_cost(c, LPCQUANT)).sum::<u64>();
+            let total =
+                cost.saturating_add(1 + FNSIZE as u64 + coef_overhead + 1 + ENERGYSIZE as u64);
+            if best.as_ref().map_or(true, |(b, _)| total < *b) {
+                best = Some((
+                    total,
+                    PredictorChoice {
+                        fn_code: fn_code::QLPC,
+                        lpc_order: order,
+                        lpc_coefs: coefs,
+                        width,
+                        residuals,
+                    },
+                ));
+            }
         }
     }
 
     best.expect("at least DIFF0 is always evaluated").1
 }
 
-/// Identity LPC coefficients for an `order`-tap predictor that
-/// reproduces DIFF1 / DIFF2 / DIFF3 / shifted-DIFF behaviour.
+/// Bit cost of the `svar(n)` encoding of `s` — folds to unsigned
+/// then computes the same prefix + mantissa + terminator cost as
+/// [`cost_of_residuals`] for a single value.
+fn svar_cost(s: i32, n: u32) -> u64 {
+    if n >= 32 {
+        return u64::MAX;
+    }
+    let u = signed_to_unsigned(s);
+    let high = (u >> n) as u64;
+    high + 1 + n as u64
+}
+
+/// Identity (polynomial-equivalent) LPC coefficient set for an
+/// `order`-tap predictor. These are the integer coefficients that
+/// reproduce DIFF1 / DIFF2 / DIFF3 / DIFF3-padded behaviour:
 ///
-/// * order = 1 → `[1]`           (predicts s(t-1))
-/// * order = 2 → `[2, -1]`       (DIFF2 polynomial)
-/// * order = 3 → `[3, -3, 1]`    (DIFF3 polynomial)
+/// * order = 1 → `[1]`
+/// * order = 2 → `[2, -1]`
+/// * order = 3 → `[3, -3, 1]`
 /// * order ≥ 4 → `[3, -3, 1, 0, 0, …]`
-///
-/// The QLPC residual stream computed under these coefficients matches
-/// the corresponding DIFF predictor's residuals exactly; the QLPC
-/// command's only added cost is the coefficient encoding.
 fn identity_lpc_coefs(order: usize) -> Vec<i32> {
     let mut coefs = vec![0i32; order];
-    let template: [i32; 3] = [3, -3, 1];
-    for (i, slot) in coefs.iter_mut().enumerate().take(template.len().min(order)) {
-        *slot = template[i];
-    }
-    if order == 1 {
+    if order >= 1 {
         coefs[0] = 1;
-    } else if order == 2 {
+    }
+    if order == 2 {
         coefs[0] = 2;
         coefs[1] = -1;
+    } else if order >= 3 {
+        coefs[0] = 3;
+        coefs[1] = -3;
+        coefs[2] = 1;
     }
     coefs
+}
+
+/// Levinson–Durbin recursion on the per-block (with carry)
+/// autocorrelation, returning a quantised integer coefficient set of
+/// length `order`.
+///
+/// The autocorrelation is taken over the concatenation of the carry
+/// (most-recent first) and the block — `[carry[order-1], …, carry[0],
+/// block[0], block[1], …]`. This matches the predictor's view: when
+/// computing `ŝ(t) = Σ a_i · s(t − i)`, the index `t − i` reaches into
+/// the carry for the first `order` samples of the block.
+///
+/// The recursion produces float reflection coefficients `k_i` and the
+/// derived direct-form `a_i`. Each `a_i` is rounded to the nearest
+/// signed integer for emission — Shorten's QLPC predictor applies
+/// coefficients without an implicit shift, so any fractional precision
+/// is lost on the wire. Where the float estimate rounds to a value
+/// the polynomial-DIFF predictor already covers, the search will
+/// re-discover the polynomial equivalent (and the identity baseline
+/// guarantees a tie-break in that direction).
+fn levinson_durbin(order: usize, carry: &[i32], block: &[i32]) -> Vec<i32> {
+    if order == 0 {
+        return Vec::new();
+    }
+    // Build the windowed signal `[carry[order-1], …, carry[0], block...]`.
+    let mut windowed: Vec<f64> = Vec::with_capacity(order + block.len());
+    for i in (0..order).rev() {
+        windowed.push(carry.get(i).copied().unwrap_or(0) as f64);
+    }
+    for &s in block {
+        windowed.push(s as f64);
+    }
+
+    // Autocorrelation r[0..=order] over the windowed signal.
+    let n = windowed.len();
+    let mut r = vec![0.0f64; order + 1];
+    for lag in 0..=order {
+        let mut acc = 0.0f64;
+        if n > lag {
+            for i in 0..(n - lag) {
+                acc += windowed[i] * windowed[i + lag];
+            }
+        }
+        r[lag] = acc;
+    }
+
+    // Degenerate / silent block — every coefficient stays zero. The
+    // residuals will equal the input samples themselves.
+    if r[0] <= 0.0 {
+        return vec![0i32; order];
+    }
+
+    // Levinson–Durbin proper. `a` accumulates the direct-form
+    // coefficients across iterations; `e` is the prediction-error
+    // energy of the current order's predictor.
+    let mut a = vec![0.0f64; order + 1];
+    let mut e = r[0];
+    a[0] = 1.0;
+    for i in 1..=order {
+        // Reflection coefficient k_i.
+        let mut acc = 0.0f64;
+        for j in 1..i {
+            acc += a[j] * r[i - j];
+        }
+        let k = -(r[i] + acc) / e;
+        if !k.is_finite() {
+            // Numerical breakdown — bail out with zero coefficients,
+            // which is a valid (non-predictive) fallback.
+            return vec![0i32; order];
+        }
+        // Update direct-form coefficients in place.
+        let half = i / 2;
+        for j in 1..=half {
+            let aj = a[j];
+            let ai_minus_j = a[i - j];
+            a[j] = aj + k * ai_minus_j;
+            a[i - j] = ai_minus_j + k * aj;
+        }
+        if i % 2 != 0 {
+            let mid = i / 2 + 1;
+            a[mid] += k * a[i - mid];
+        }
+        a[i] = k;
+        e *= 1.0 - k * k;
+        if e <= 0.0 {
+            // Degenerate (rank-deficient) — stop expanding. Lower-
+            // order coefficients remain valid; remaining slots stay 0.
+            break;
+        }
+    }
+
+    // Round the predictor coefficients (the negation of `a[1..=order]`,
+    // since LPC convention represents the prediction as `s(t) +
+    // Σ a_i · s(t-i) ≈ 0`, while Shorten's emitted coefficient set
+    // represents `ŝ(t) = Σ c_i · s(t-i)` directly: c_i = -a_i).
+    (1..=order).map(|i| (-a[i]).round() as i32).collect()
+}
+
+/// Candidate integer LPC coefficient sets the search evaluates for a
+/// given block + order: the polynomial-equivalent identity set plus
+/// the Levinson–Durbin estimate. A coefficient set rejected by the
+/// `svar(LPCQUANT)` magnitude budget (i.e. an outlier with a
+/// runaway prefix cost) is filtered before reaching the search.
+fn lpc_candidate_coefs(order: usize, carry: &[i32], block: &[i32]) -> Vec<Vec<i32>> {
+    let mut out = Vec::with_capacity(2);
+    let identity = identity_lpc_coefs(order);
+    out.push(identity.clone());
+    let levinson = levinson_durbin(order, carry, block);
+    if levinson != identity && levinson.iter().all(|&c| c.unsigned_abs() <= 1 << 16) {
+        out.push(levinson);
+    }
+    out
 }
 
 /// Residuals for the `order`-th polynomial-difference predictor.

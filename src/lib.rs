@@ -53,13 +53,29 @@
 //!   `.shn` file emits a single packet containing the entire stream;
 //!   the codec-side decoder handles framing internally.
 //!
-//! ## What's intentionally out (deferred to round 3+)
+//! ## Round 3 additions
+//!
+//! * **Levinson–Durbin LPC coefficient search** ([`encode`] when
+//!   `max_lpc_order > 0`). The encoder solves the Yule-Walker system
+//!   over the per-block-plus-carry autocorrelation to derive integer
+//!   LPC coefficients (TR.156 §3.5 narrative). The polynomial-DIFF
+//!   identity coefficient set is retained as a baseline candidate so
+//!   regressions on flat-spectrum blocks fall back to the polynomial
+//!   predictor rather than to a numerically-degenerate Levinson
+//!   estimate.
+//! * **`BLOCK_FN_BITSHIFT` lossy mode** on the encoder side. Setting
+//!   [`EncoderConfig::with_bshift`] to a non-zero value emits a
+//!   leading `BLOCK_FN_BITSHIFT` command with that count and
+//!   right-shifts every input sample by `bshift` before encoding.
+//!   The decoder inverts the shift on emission. Per `spec/04` §3 the
+//!   command may appear anywhere in the stream; round 3 emits it once
+//!   at stream start.
+//!
+//! ## What's intentionally out (deferred to round 4+)
 //!
 //! * High-throughput optimisations (table-driven uvar prefix decode,
 //!   SIMD residual unpacking).
-//! * Lossy `BLOCK_FN_BITSHIFT` mode on the encoder side. The round-2
-//!   encoder always writes `bshift = 0`.
-//! * Mean-estimator on the encode side. The round-2 encoder writes
+//! * Mean-estimator on the encode side. The round-3 encoder writes
 //!   `H_meanblocks = 0`, sidestepping the ±1 sub-bit-precision drift
 //!   documented in `audit/01` §8.1. The decoder still handles
 //!   `mean_blocks > 0` for streams produced externally.
@@ -87,7 +103,7 @@ mod registry;
 mod varint;
 
 pub use crate::decoder::{decode, DecodedStream};
-pub use crate::encoder::{encode, EncodeError, EncoderConfig};
+pub use crate::encoder::{encode, EncodeError, EncoderConfig, BITSHIFT_MAX};
 pub use crate::error::{Error, Result};
 pub use crate::header::{parse_header, Filetype, StreamHeader, MAGIC};
 
@@ -121,3 +137,6 @@ mod roundtrip_tests;
 
 #[cfg(test)]
 mod round2_tests;
+
+#[cfg(test)]
+mod round3_tests;
