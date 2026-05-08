@@ -8,6 +8,29 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-7 fused SoA stereo / multi-channel decode path. The decoder
+  no longer accumulates per-channel `Vec<i32>` buffers and runs an
+  end-of-stream interleave pass; each per-channel block is written
+  directly into the interleaved output at strided positions
+  (`interleaved[(t + i) * nch + c]`), with the per-stream `bshift`
+  left-shift applied inline. A single reusable scratch block buffer
+  is allocated once per `decode` call and re-used across every block,
+  eliminating the per-block `Vec<i32>` allocation that the round-6
+  path performed. **Throughput delta**: 4 KB-block × 64-block ×
+  2-channel decode is **1.16× faster** than round-6 master (3.05 ms
+  → 2.63 ms, best-of-5, M-series macOS host, 524288 samples). The
+  mono path inherits a smaller speed-up (1.46 ms → 1.35 ms) from the
+  same reusable-scratch + no-final-pass changes. As a side-effect
+  the variable-`BLOCK_FN_BITSHIFT`-stream behaviour becomes more
+  correct: the bshift in effect at each block's commit is applied,
+  not the final stream-end bshift; existing fixtures (which emit
+  `BITSHIFT` at most once at start) are unaffected.
+- 6 round-7 tests: bit-exact stereo 4 KB-block roundtrip, 4-channel
+  4 KB-block roundtrip, stereo `bshift = 2` lossy-mode roundtrip,
+  stereo many-blocks (32 blocks/channel × 128 samples) roundtrip,
+  and stereo throughput-floor + best-of-5 print. Crate ships
+  **164 tests total** (up from 158).
+
 - Round-6 64-bit bit-reservoir residual unpack
   (`bitstream64::Bitstream64`). The per-block residual decode loop now
   drops down into an in-register `u64` reader that resolves `uvar`

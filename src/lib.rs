@@ -117,7 +117,21 @@
 //!   compiles down to a tighter inner kernel (the residual loop is
 //!   straight-line, the recurrence loop has no I/O).
 //!
-//! ## What's intentionally out (deferred to round 7+)
+//! ## Round 7 additions
+//!
+//! * **Fused SoA stereo / multi-channel decode path.** The decoder no
+//!   longer accumulates per-channel `Vec<i32>` buffers and runs a
+//!   final interleave pass at end-of-stream. Each per-channel block
+//!   is written **directly into the interleaved output** at strided
+//!   positions (`interleaved[(t + i) * nch + c]`), with the
+//!   `bshift` left-shift applied inline. A single reusable scratch
+//!   block buffer is allocated once per [`decode`] call and re-used
+//!   across every block — eliminating the per-block `Vec<i32>`
+//!   allocation. On a 64×4096 stereo stream this is a **1.16×
+//!   speed-up** on this implementer's M-series macOS host (3.05 ms
+//!   → 2.64 ms best-of-5 for 524288 samples).
+//!
+//! ## What's intentionally out (deferred to round 8+)
 //!
 //! * Format-version 1 / 3 wire-format deltas. No v1 or v3 fixture is
 //!   reachable in the docs corpus; v1 is syntactically accepted (per
@@ -196,3 +210,6 @@ mod round5_tests;
 
 #[cfg(test)]
 mod round6_tests;
+
+#[cfg(test)]
+mod round7_tests;

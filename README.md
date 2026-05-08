@@ -6,15 +6,17 @@ for the
 
 ## Status
 
-**Round 6 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
+**Round 7 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
 v2/v3 wire format pinned in `spec/00..05` (with v1 syntactically
 accepted; no v1 fixture is reachable to confirm the v1 layout).
 Encodes via a predictor-search + energy-width-optimised production
 encoder with Levinson–Durbin LPC, lossy bit-shift, running-mean
 estimator, and round-5 bit-budget / bit-rate target lossy modes.
 Round-6 64-bit-reservoir residual unpack lands a 2.13× decode
-speed-up on long blocks. Mono / stereo / multi-channel PCM I/O
-across all eleven TR.156 filetype labels.
+speed-up on long blocks; round-7 fused SoA stereo write lands an
+additional 1.16× speed-up on the most common 2-channel shape.
+Mono / stereo / multi-channel PCM I/O across all eleven TR.156
+filetype labels.
 
 | Round | Adds                                                                                   |
 | ----- | -------------------------------------------------------------------------------------- |
@@ -24,6 +26,28 @@ across all eleven TR.156 filetype labels.
 | 4     | Running-mean estimator on encode side (`with_mean_blocks`); closes audit/01 §8.1 ±1 drift on `bshift > 0`. |
 | 5     | Bit-budget (`-n N`) / bit-rate (`-r N`) lossy encoder modes; LUT-driven `uvar` prefix decode. |
 | 6     | 64-bit-reservoir residual unpack (`u64::leading_zeros`); 2.13× decode throughput on 4 KB+ blocks. |
+| 7     | Fused SoA stereo decode (strided write, no end-of-stream interleave pass); 1.16× decode throughput on stereo 4 KB+ blocks. |
+
+## What round 7 lands
+
+- **Fused SoA stereo / multi-channel decode.** The decoder no longer
+  accumulates per-channel `Vec<i32>` buffers and runs an end-of-stream
+  interleave pass. Each block is written **directly into the
+  interleaved output** at strided positions
+  (`interleaved[(t + i) * nch + c]`), with the per-stream `bshift`
+  left-shift applied inline. A single reusable scratch block buffer
+  is allocated once per `decode` call and re-used across every
+  block — eliminating the per-block `Vec<i32>` allocation that the
+  round-6 path performed.
+- **Throughput delta**: 4 KB-block × 64-block × 2-channel decode is
+  **1.16× faster** than round 6 master (3.05 ms → 2.63 ms best-of-5
+  on an M-series macOS host for 524288 samples). The mono path
+  inherits a smaller speed-up (1.46 ms → 1.35 ms) from the same
+  reusable-scratch + no-final-pass changes.
+- **6 round-7 tests** covering bit-exact stereo 4 KB-block roundtrip,
+  4-channel 4 KB-block roundtrip, stereo `bshift = 2` lossy mode,
+  stereo many-blocks roundtrip, and stereo throughput-floor /
+  best-of-5 print. The crate ships **164 tests total** (up from 158).
 
 ## What round 6 lands
 
@@ -141,7 +165,7 @@ across all eleven TR.156 filetype labels.
   demuxer reads the entire input into a single packet — Shorten has no
   internal framing — and lets the codec decoder unpack the bit stream.
 
-## What's not yet implemented (round 6+ candidates)
+## What's not yet implemented (round 8+ candidates)
 
 - **Bit-stream-corpus byte-exact decode** of the public `.shn` fixture
   set. Round 4 closes audit/01 §8.1's ±1 drift in the *internal*
@@ -156,6 +180,13 @@ across all eleven TR.156 filetype labels.
 - **SIMD residual unpacking.** Round 5 lands the LUT-driven uvar
   prefix decode; SIMD-batched residual mantissa reads are the next
   throughput tier.
+- **`bshift` left-shift loop SIMD-isation.** The per-block strided
+  write currently applies `wrapping_shl(bshift)` scalar-style; a
+  portable-SIMD lane-wise shift would chew through long stereo
+  blocks faster but requires Rust 1.79+ MSRV.
+- **Vendor-specific CLZ intrinsics** (`_lzcnt_u64` / `__clz`) — only
+  if profiling shows `u64::leading_zeros` not lowering cleanly on
+  some target.
 
 ## Cargo features
 

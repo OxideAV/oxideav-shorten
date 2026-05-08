@@ -172,6 +172,18 @@ fn block_mean(block: &[i32]) -> i32 {
 }
 
 /// One-shot decoder over an entire `.shn` byte buffer.
+///
+/// **Round 7 — fused SoA stereo path.** The decoder writes each
+/// per-channel block directly into the **interleaved** output buffer
+/// at strided positions (`interleaved[(t + i) * nch + c]`) instead of
+/// appending to per-channel `Vec<i32>`s and running a final
+/// interleave pass. A single reusable scratch block buffer is
+/// allocated outside the per-block loop, so a multi-block stream
+/// performs **one** allocation for the output plus **one** for the
+/// scratch (down from `nch + 1 + n_blocks` allocations on the
+/// previous path). The `bshift` left-shift is applied inline during
+/// the strided write, eliminating the read-modify-write pass over
+/// the entire output buffer at end-of-stream.
 pub fn decode(file_bytes: &[u8]) -> Result<DecodedStream> {
     let header = crate::header::parse_header(file_bytes)?;
 
@@ -188,10 +200,19 @@ pub fn decode(file_bytes: &[u8]) -> Result<DecodedStream> {
         .map(|_| ChannelState::new(carry_len, header.mean_blocks))
         .collect();
 
-    // Per-channel output — accumulate flat blocks, then interleave at
-    // the end. We can size the buffer dynamically since we don't know
-    // the final sample count up-front.
-    let mut per_channel_samples: Vec<Vec<i32>> = (0..nch).map(|_| Vec::new()).collect();
+    // Round-7 SoA fast path: pre-grow the interleaved output as each
+    // block lands, written directly at strided positions. `committed`
+    // tracks the next per-channel sample index for each channel, so
+    // channel `c`'s block at sample-index `t..t+bs` writes into
+    // `interleaved[(t + i) * nch + c]` for `i = 0..bs`.
+    let mut interleaved: Vec<i32> = Vec::new();
+    let mut committed: Vec<usize> = vec![0; nch];
+
+    // Reusable scratch buffer for the per-block predictor recurrence.
+    // Allocated once per decode call; resized on first use, reused
+    // thereafter. This eliminates the per-block `Vec` allocation the
+    // round-6 path performed.
+    let mut block_scratch: Vec<i32> = Vec::new();
 
     let mut current_block_size: u32 = header.blocksize;
     let mut bshift: u32 = 0;
@@ -202,34 +223,47 @@ pub fn decode(file_bytes: &[u8]) -> Result<DecodedStream> {
         let fn_code = read_uvar(&mut br, FNSIZE)?;
         match fn_code {
             fn_code::DIFF0 | fn_code::DIFF1 | fn_code::DIFF2 | fn_code::DIFF3 => {
-                let block = decode_diff_block(
+                let bs = current_block_size as usize;
+                block_scratch.resize(bs, 0);
+                decode_diff_block(
                     &mut br,
                     fn_code,
-                    current_block_size as usize,
+                    bs,
                     &channels[channel_cursor],
                     header.mean_blocks,
+                    &mut block_scratch,
                 )?;
-                // Update mean buffer & carry, then commit.
-                let mu_blk = block_mean(&block);
-                let cs = &mut channels[channel_cursor];
-                cs.push_block_mean(mu_blk);
-                cs.update_carry(&block);
-                per_channel_samples[channel_cursor].extend_from_slice(&block);
+                commit_block(
+                    &mut channels[channel_cursor],
+                    &block_scratch,
+                    &mut interleaved,
+                    &mut committed,
+                    channel_cursor,
+                    nch,
+                    bshift,
+                );
                 channel_cursor = (channel_cursor + 1) % nch;
             }
             fn_code::QLPC => {
-                let block = decode_qlpc_block(
+                let bs = current_block_size as usize;
+                block_scratch.resize(bs, 0);
+                decode_qlpc_block(
                     &mut br,
-                    current_block_size as usize,
+                    bs,
                     header.max_lpc_order,
                     &channels[channel_cursor],
                     header.mean_blocks,
+                    &mut block_scratch,
                 )?;
-                let mu_blk = block_mean(&block);
-                let cs = &mut channels[channel_cursor];
-                cs.push_block_mean(mu_blk);
-                cs.update_carry(&block);
-                per_channel_samples[channel_cursor].extend_from_slice(&block);
+                commit_block(
+                    &mut channels[channel_cursor],
+                    &block_scratch,
+                    &mut interleaved,
+                    &mut committed,
+                    channel_cursor,
+                    nch,
+                    bshift,
+                );
                 channel_cursor = (channel_cursor + 1) % nch;
             }
             fn_code::ZERO => {
@@ -237,12 +271,17 @@ pub fn decode(file_bytes: &[u8]) -> Result<DecodedStream> {
                 let cs = &channels[channel_cursor];
                 let mu = cs.running_mean(header.mean_blocks);
                 let bs = current_block_size as usize;
-                let block = vec![mu; bs];
-                let mu_blk = mu;
-                let cs = &mut channels[channel_cursor];
-                cs.push_block_mean(mu_blk);
-                cs.update_carry(&block);
-                per_channel_samples[channel_cursor].extend_from_slice(&block);
+                block_scratch.resize(bs, 0);
+                block_scratch.fill(mu);
+                commit_block(
+                    &mut channels[channel_cursor],
+                    &block_scratch,
+                    &mut interleaved,
+                    &mut committed,
+                    channel_cursor,
+                    nch,
+                    bshift,
+                );
                 channel_cursor = (channel_cursor + 1) % nch;
             }
             fn_code::BLOCKSIZE => {
@@ -275,27 +314,15 @@ pub fn decode(file_bytes: &[u8]) -> Result<DecodedStream> {
         }
     }
 
-    // Apply per-stream bshift and assemble the interleaved output.
-    let samples_per_channel = per_channel_samples.iter().map(Vec::len).min().unwrap_or(0);
     // Round-robin per spec — every channel should have the same
-    // sample count if the stream is well-formed. If they differ
-    // we truncate to the shortest, which is the conservative
-    // behaviour for partial-block tails.
+    // sample count if the stream is well-formed. We truncate to the
+    // shortest, which is the conservative behaviour for partial-block
+    // tails. `interleaved` may currently extend past the shortest
+    // channel because some channels may have committed an extra block
+    // in a malformed stream; truncate explicitly.
+    let samples_per_channel = committed.iter().copied().min().unwrap_or(0);
     let total = samples_per_channel * nch;
-    let mut interleaved = Vec::with_capacity(total);
-    for i in 0..samples_per_channel {
-        for ch_samples in per_channel_samples.iter().take(nch) {
-            // Samples in carry/internal lane are pre-shift; output
-            // is the lane left-shifted by the current bshift.
-            let s = ch_samples[i];
-            let out = if bshift == 0 {
-                s
-            } else {
-                s.wrapping_shl(bshift)
-            };
-            interleaved.push(out);
-        }
-    }
+    interleaved.truncate(total);
 
     Ok(DecodedStream {
         header,
@@ -304,6 +331,54 @@ pub fn decode(file_bytes: &[u8]) -> Result<DecodedStream> {
         samples_per_channel,
         final_bshift: bshift,
     })
+}
+
+/// Commit `block` (per-channel scratch buffer) into the interleaved
+/// output at the strided positions for `channel_cursor`, while
+/// updating the channel's mean window + carry. Applies `bshift` inline
+/// so the interleaved buffer holds shift-applied output samples.
+///
+/// On entry `block.len()` is the per-block sample count. The
+/// interleaved buffer is grown if `(committed[ch] + bs) * nch` exceeds
+/// the current length; the write fills the channel's stride lane and
+/// leaves slots for the other channels' future blocks at value 0
+/// (which they will overwrite when their corresponding block is
+/// committed).
+#[inline]
+fn commit_block(
+    cs: &mut ChannelState,
+    block: &[i32],
+    interleaved: &mut Vec<i32>,
+    committed: &mut [usize],
+    channel_cursor: usize,
+    nch: usize,
+    bshift: u32,
+) {
+    // Mean + carry update (channel-local, unaffected by bshift).
+    let mu_blk = block_mean(block);
+    cs.push_block_mean(mu_blk);
+    cs.update_carry(block);
+
+    // Strided write into the interleaved buffer. `t0` is the per-channel
+    // sample offset at which this block starts.
+    let bs = block.len();
+    let t0 = committed[channel_cursor];
+    let needed = (t0 + bs) * nch;
+    if interleaved.len() < needed {
+        interleaved.resize(needed, 0);
+    }
+    let stride = nch;
+    let base = t0 * nch + channel_cursor;
+    if bshift == 0 {
+        for (i, &s) in block.iter().enumerate() {
+            interleaved[base + i * stride] = s;
+        }
+    } else {
+        for (i, &s) in block.iter().enumerate() {
+            interleaved[base + i * stride] = s.wrapping_shl(bshift);
+        }
+    }
+    committed[channel_cursor] = t0 + bs;
 }
 
 /// Bulk-decode `bs` `svar(width)` residuals into `out` using a 64-bit
@@ -334,14 +409,17 @@ fn read_residuals_into(
     Ok(())
 }
 
-/// Decode one polynomial-difference predictor block (DIFF0..DIFF3).
+/// Decode one polynomial-difference predictor block (DIFF0..DIFF3)
+/// into the provided scratch buffer. `out.len()` must equal `bs`.
 fn decode_diff_block(
     br: &mut BitReader<'_>,
     fn_code: u32,
     bs: usize,
     cs: &ChannelState,
     mean_blocks: u32,
-) -> Result<Vec<i32>> {
+    out: &mut [i32],
+) -> Result<()> {
+    debug_assert_eq!(out.len(), bs);
     let energy_field = read_uvar(br, ENERGYSIZE)?;
     let width = energy_field
         .checked_add(1)
@@ -358,22 +436,21 @@ fn decode_diff_block(
     let mut residuals: Vec<i32> = Vec::with_capacity(bs);
     read_residuals_into(br, width, bs, &mut residuals)?;
 
-    let mut samples = Vec::with_capacity(bs);
     let mu = cs.running_mean(mean_blocks);
 
     match fn_code {
         // DIFF0: s = r + mu (mean estimator only on order-0).
         fn_code::DIFF0 => {
-            for &r in &residuals {
-                samples.push(r.wrapping_add(mu));
+            for (slot, &r) in out.iter_mut().zip(residuals.iter()) {
+                *slot = r.wrapping_add(mu);
             }
         }
         // DIFF1: s = s(t-1) + r.
         fn_code::DIFF1 => {
             let mut s1 = cs.carry.first().copied().unwrap_or(0);
-            for &r in &residuals {
+            for (slot, &r) in out.iter_mut().zip(residuals.iter()) {
                 let s = s1.wrapping_add(r);
-                samples.push(s);
+                *slot = s;
                 s1 = s;
             }
         }
@@ -381,9 +458,9 @@ fn decode_diff_block(
         fn_code::DIFF2 => {
             let mut s1 = cs.carry.first().copied().unwrap_or(0);
             let mut s2 = cs.carry.get(1).copied().unwrap_or(0);
-            for &r in &residuals {
+            for (slot, &r) in out.iter_mut().zip(residuals.iter()) {
                 let s = s1.wrapping_mul(2).wrapping_sub(s2).wrapping_add(r);
-                samples.push(s);
+                *slot = s;
                 s2 = s1;
                 s1 = s;
             }
@@ -393,13 +470,13 @@ fn decode_diff_block(
             let mut s1 = cs.carry.first().copied().unwrap_or(0);
             let mut s2 = cs.carry.get(1).copied().unwrap_or(0);
             let mut s3 = cs.carry.get(2).copied().unwrap_or(0);
-            for &r in &residuals {
+            for (slot, &r) in out.iter_mut().zip(residuals.iter()) {
                 let s = s1
                     .wrapping_mul(3)
                     .wrapping_sub(s2.wrapping_mul(3))
                     .wrapping_add(s3)
                     .wrapping_add(r);
-                samples.push(s);
+                *slot = s;
                 s3 = s2;
                 s2 = s1;
                 s1 = s;
@@ -407,17 +484,20 @@ fn decode_diff_block(
         }
         _ => unreachable!("decode_diff_block called with non-DIFF code"),
     }
-    Ok(samples)
+    Ok(())
 }
 
-/// Decode one `BLOCK_FN_QLPC` quantised-LPC predictor block.
+/// Decode one `BLOCK_FN_QLPC` quantised-LPC predictor block into the
+/// provided scratch buffer. `out.len()` must equal `bs`.
 fn decode_qlpc_block(
     br: &mut BitReader<'_>,
     bs: usize,
     header_max_order: u32,
     cs: &ChannelState,
     _mean_blocks: u32,
-) -> Result<Vec<i32>> {
+    out: &mut [i32],
+) -> Result<()> {
+    debug_assert_eq!(out.len(), bs);
     let order = read_uvar(br, LPCQSIZE)?;
     if order > header_max_order {
         return Err(Error::LpcOrderExceedsHeader {
@@ -458,8 +538,7 @@ fn decode_qlpc_block(
     let mut residuals: Vec<i32> = Vec::with_capacity(bs);
     read_residuals_into(br, width, bs, &mut residuals)?;
 
-    let mut samples = Vec::with_capacity(bs);
-    for &r in &residuals {
+    for (slot, &r) in out.iter_mut().zip(residuals.iter()) {
         // Predict: ŝ(t) = sum_{i=1..=order} a_i * s(t - i)
         //                = sum_{i=0..order} coefs[i] * hist[i]
         let mut pred: i64 = 0;
@@ -467,7 +546,7 @@ fn decode_qlpc_block(
             pred = pred.wrapping_add((coefs[i] as i64).wrapping_mul(hist[i] as i64));
         }
         let s = (pred as i32).wrapping_add(r);
-        samples.push(s);
+        *slot = s;
         // Roll history: shift right by 1, write s at index 0.
         for i in (1..hist.len()).rev() {
             hist[i] = hist[i - 1];
@@ -476,7 +555,7 @@ fn decode_qlpc_block(
             hist[0] = s;
         }
     }
-    Ok(samples)
+    Ok(())
 }
 
 #[cfg(test)]
