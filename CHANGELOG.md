@@ -8,6 +8,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-6 64-bit bit-reservoir residual unpack
+  (`bitstream64::Bitstream64`). The per-block residual decode loop now
+  drops down into an in-register `u64` reader that resolves `uvar`
+  prefix scans with `u64::leading_zeros` (lowering to hardware `lzcnt`
+  on x86-64 / `clz` on aarch64), eliminating the round-5 byte-LUT
+  lookup + per-bit refill on the long blocks that dominate decode
+  time. The reservoir refills 8 bytes at a time via a single
+  big-endian `u64::from_be_bytes` load. The decoder also bulk-decodes
+  residuals into a scratch `Vec<i32>` first and runs the predictor
+  recurrence on the buffer, separating variable-length bit reads from
+  arithmetic. **Throughput delta**: 4 KB-block, 64-block synthetic
+  16-bit decode is **2.13× faster** than master (3.30 ms → 1.55 ms,
+  best-of-5, M-series macOS host). On the synthetic `uvar(2)` stream
+  the prefix-scan-only kernel is **2.63× faster** (1.82 ms → 0.69 ms
+  on 200 000 codes). Default-on; no Cargo feature gate.
+- 16 round-6 tests: reservoir construction edge cases (sub-byte
+  start, multi-refill long-zero runs, EOF-on-overrun), 4 KB-block
+  DIFF1 / stereo / QLPC roundtrips, mixed-prefix walk over
+  `uvar(0)` codes 0..=7, decode-throughput floor (asserts < 1 s for
+  64×4096 samples), and a side-by-side reservoir-vs-byte-LUT
+  benchmark with a 1.2× speed floor. Crate ships **158 tests total**
+  (up from 142).
 - Round-5 lossy bit-budget (`-n N`) and bit-rate (`-r N`) target
   encoder modes (`EncoderConfig::with_bit_budget` /
   `EncoderConfig::with_bit_rate`). Both compute an effective

@@ -20,12 +20,18 @@
 //!   `H_channels` after every sample-producing command.
 
 use crate::bitreader::BitReader;
+use crate::bitstream64::Bitstream64;
 use crate::header::StreamHeader;
 use crate::varint::{
     read_svar, read_ulong, read_uvar, BITSHIFTSIZE, ENERGYSIZE, FNSIZE, LPCQSIZE, LPCQUANT,
     RESIDUAL_WIDTH_CAP, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE,
 };
 use crate::{Error, Result};
+
+/// Cap on the number of zero bits permitted in any `uvar` prefix —
+/// matches the private `UVAR_MAX_ZEROS` in `varint.rs`. Duplicated
+/// here to keep the [`Bitstream64`] residual-batch path standalone.
+const RESIDUAL_UVAR_MAX_ZEROS: u32 = 64;
 
 /// Function-code values pinned in `spec/04-function-code-resolution.md`.
 pub(crate) mod fn_code {
@@ -300,6 +306,34 @@ pub fn decode(file_bytes: &[u8]) -> Result<DecodedStream> {
     })
 }
 
+/// Bulk-decode `bs` `svar(width)` residuals into `out` using a 64-bit
+/// reservoir reader. Round-6 hot path: the reservoir keeps the next
+/// 32–64 unread bits in-register and resolves prefix scans with
+/// `u64::leading_zeros` (hardware `lzcnt`/`clz`), avoiding the
+/// byte-LUT + per-bit refill overhead of
+/// [`BitReader::read_uvar_prefix`] on the long blocks that dominate
+/// decode time.
+///
+/// On return the underlying [`BitReader`] cursor is advanced past the
+/// last residual consumed. Returns [`Error::UnexpectedEof`] if the
+/// stream ends before `bs` residuals have been read.
+fn read_residuals_into(
+    br: &mut BitReader<'_>,
+    width: u32,
+    bs: usize,
+    out: &mut Vec<i32>,
+) -> Result<()> {
+    out.clear();
+    out.reserve(bs);
+    let mut bs64 = Bitstream64::from_bit_reader(br);
+    for _ in 0..bs {
+        let s = bs64.read_svar(width, RESIDUAL_UVAR_MAX_ZEROS)?;
+        out.push(s);
+    }
+    bs64.finalize_into(br)?;
+    Ok(())
+}
+
 /// Decode one polynomial-difference predictor block (DIFF0..DIFF3).
 fn decode_diff_block(
     br: &mut BitReader<'_>,
@@ -316,37 +350,62 @@ fn decode_diff_block(
         return Err(Error::ResidualWidthOverflow(width));
     }
 
-    let mut samples = Vec::with_capacity(bs);
-    // Pull initial history from carry.
-    // carry[0] = s(t-1), carry[1] = s(t-2), carry[2] = s(t-3).
-    let mut s1 = cs.carry.first().copied().unwrap_or(0);
-    let mut s2 = cs.carry.get(1).copied().unwrap_or(0);
-    let mut s3 = cs.carry.get(2).copied().unwrap_or(0);
+    // Round-6: bulk-decode all residuals into a scratch buffer, then
+    // run the predictor recurrence on the buffer. Separating I/O
+    // (variable-length bit reads) from arithmetic (predictor
+    // recurrence) lets the inner residual loop run from a 64-bit
+    // bit reservoir rather than per-bit through the `BitReader` API.
+    let mut residuals: Vec<i32> = Vec::with_capacity(bs);
+    read_residuals_into(br, width, bs, &mut residuals)?;
 
+    let mut samples = Vec::with_capacity(bs);
     let mu = cs.running_mean(mean_blocks);
 
-    for _ in 0..bs {
-        let r = read_svar(br, width)?;
-        let s = match fn_code {
-            // DIFF0: s = r + mu (mean estimator only on order-0).
-            fn_code::DIFF0 => r.wrapping_add(mu),
-            // DIFF1: s = s(t-1) + r.
-            fn_code::DIFF1 => s1.wrapping_add(r),
-            // DIFF2: s = 2 s(t-1) - s(t-2) + r.
-            fn_code::DIFF2 => s1.wrapping_mul(2).wrapping_sub(s2).wrapping_add(r),
-            // DIFF3: s = 3 s(t-1) - 3 s(t-2) + s(t-3) + r.
-            fn_code::DIFF3 => s1
-                .wrapping_mul(3)
-                .wrapping_sub(s2.wrapping_mul(3))
-                .wrapping_add(s3)
-                .wrapping_add(r),
-            _ => unreachable!("decode_diff_block called with non-DIFF code"),
-        };
-        samples.push(s);
-        // Roll the history.
-        s3 = s2;
-        s2 = s1;
-        s1 = s;
+    match fn_code {
+        // DIFF0: s = r + mu (mean estimator only on order-0).
+        fn_code::DIFF0 => {
+            for &r in &residuals {
+                samples.push(r.wrapping_add(mu));
+            }
+        }
+        // DIFF1: s = s(t-1) + r.
+        fn_code::DIFF1 => {
+            let mut s1 = cs.carry.first().copied().unwrap_or(0);
+            for &r in &residuals {
+                let s = s1.wrapping_add(r);
+                samples.push(s);
+                s1 = s;
+            }
+        }
+        // DIFF2: s = 2 s(t-1) - s(t-2) + r.
+        fn_code::DIFF2 => {
+            let mut s1 = cs.carry.first().copied().unwrap_or(0);
+            let mut s2 = cs.carry.get(1).copied().unwrap_or(0);
+            for &r in &residuals {
+                let s = s1.wrapping_mul(2).wrapping_sub(s2).wrapping_add(r);
+                samples.push(s);
+                s2 = s1;
+                s1 = s;
+            }
+        }
+        // DIFF3: s = 3 s(t-1) - 3 s(t-2) + s(t-3) + r.
+        fn_code::DIFF3 => {
+            let mut s1 = cs.carry.first().copied().unwrap_or(0);
+            let mut s2 = cs.carry.get(1).copied().unwrap_or(0);
+            let mut s3 = cs.carry.get(2).copied().unwrap_or(0);
+            for &r in &residuals {
+                let s = s1
+                    .wrapping_mul(3)
+                    .wrapping_sub(s2.wrapping_mul(3))
+                    .wrapping_add(s3)
+                    .wrapping_add(r);
+                samples.push(s);
+                s3 = s2;
+                s2 = s1;
+                s1 = s;
+            }
+        }
+        _ => unreachable!("decode_diff_block called with non-DIFF code"),
     }
     Ok(samples)
 }
@@ -393,15 +452,20 @@ fn decode_qlpc_block(
         *slot = cs.carry.get(i).copied().unwrap_or(0);
     }
 
+    // Round-6: bulk-decode residuals first, then run the LPC
+    // predictor recurrence on the buffer. Same rationale as
+    // [`decode_diff_block`].
+    let mut residuals: Vec<i32> = Vec::with_capacity(bs);
+    read_residuals_into(br, width, bs, &mut residuals)?;
+
     let mut samples = Vec::with_capacity(bs);
-    for _ in 0..bs {
+    for &r in &residuals {
         // Predict: ŝ(t) = sum_{i=1..=order} a_i * s(t - i)
         //                = sum_{i=0..order} coefs[i] * hist[i]
         let mut pred: i64 = 0;
         for i in 0..order_us {
             pred = pred.wrapping_add((coefs[i] as i64).wrapping_mul(hist[i] as i64));
         }
-        let r = read_svar(br, width)?;
         let s = (pred as i32).wrapping_add(r);
         samples.push(s);
         // Roll history: shift right by 1, write s at index 0.

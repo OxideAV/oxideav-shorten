@@ -46,6 +46,29 @@ impl<'a> BitReader<'a> {
         self.total_bits().saturating_sub(self.pos)
     }
 
+    /// Borrow the underlying byte slice. Used by
+    /// [`crate::bitstream64::Bitstream64`] to construct a reservoir
+    /// reader that decodes residuals in batch from the same buffer.
+    #[inline]
+    pub(crate) fn bytes_slice(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Advance the cursor to `target_bit` (which must be `>= bit_pos`).
+    /// Used to write back the bit count consumed by a transient
+    /// reservoir reader (see [`crate::bitstream64::Bitstream64`]).
+    /// Returns [`Error::UnexpectedEof`] if `target_bit` exceeds
+    /// `total_bits()`.
+    #[inline]
+    pub(crate) fn advance_to_bit(&mut self, target_bit: usize) -> Result<()> {
+        debug_assert!(target_bit >= self.pos);
+        if target_bit > self.total_bits() {
+            return Err(Error::UnexpectedEof);
+        }
+        self.pos = target_bit;
+        Ok(())
+    }
+
     /// Read a single bit, advancing the cursor.
     #[allow(dead_code)]
     pub fn read_bit(&mut self) -> Result<u32> {

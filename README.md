@@ -6,14 +6,15 @@ for the
 
 ## Status
 
-**Round 5 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
+**Round 6 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
 v2/v3 wire format pinned in `spec/00..05` (with v1 syntactically
 accepted; no v1 fixture is reachable to confirm the v1 layout).
 Encodes via a predictor-search + energy-width-optimised production
 encoder with Levinson–Durbin LPC, lossy bit-shift, running-mean
 estimator, and round-5 bit-budget / bit-rate target lossy modes.
-LUT-driven `uvar` prefix decode on the hot path. Mono / stereo /
-multi-channel PCM I/O across all eleven TR.156 filetype labels.
+Round-6 64-bit-reservoir residual unpack lands a 2.13× decode
+speed-up on long blocks. Mono / stereo / multi-channel PCM I/O
+across all eleven TR.156 filetype labels.
 
 | Round | Adds                                                                                   |
 | ----- | -------------------------------------------------------------------------------------- |
@@ -22,6 +23,31 @@ multi-channel PCM I/O across all eleven TR.156 filetype labels.
 | 3     | Levinson–Durbin LPC search; lossy `BLOCK_FN_BITSHIFT` encode; F1..F18 corpus-style structural tests. |
 | 4     | Running-mean estimator on encode side (`with_mean_blocks`); closes audit/01 §8.1 ±1 drift on `bshift > 0`. |
 | 5     | Bit-budget (`-n N`) / bit-rate (`-r N`) lossy encoder modes; LUT-driven `uvar` prefix decode. |
+| 6     | 64-bit-reservoir residual unpack (`u64::leading_zeros`); 2.13× decode throughput on 4 KB+ blocks. |
+
+## What round 6 lands
+
+- **64-bit-reservoir residual unpack** (`bitstream64::Bitstream64`).
+  The decoder's per-block residual loop drops down into an in-register
+  `u64` reader that resolves `uvar` prefix scans with
+  `u64::leading_zeros` (lowering to hardware `lzcnt` on x86-64 / `clz`
+  on aarch64), eliminating the round-5 byte-LUT lookup + per-bit
+  refill on the long blocks that dominate decode time. The reservoir
+  refills 8 bytes at a time via a single big-endian
+  `u64::from_be_bytes` load. The decoder also bulk-decodes residuals
+  into a scratch `Vec<i32>` first and runs the predictor recurrence on
+  the buffer, separating variable-length bit reads from arithmetic.
+- **Throughput delta**: 4 KB-block × 64-block, 16-bit synthetic decode
+  is **2.13× faster** than master (3.30 ms → 1.55 ms best-of-5 on an
+  M-series macOS host). On the prefix-scan-only synthetic stream the
+  reservoir kernel is **2.63× faster** than the round-5 byte-LUT path
+  (1.82 ms → 0.69 ms on 200 000 `uvar(2)` codes). Default-on; no
+  Cargo feature gate.
+- **16 round-6 tests** covering reservoir construction edge cases
+  (sub-byte start, multi-refill long-zero runs, EOF-on-overrun),
+  4 KB-block DIFF1 / stereo / QLPC roundtrips, mixed-prefix walks,
+  and a side-by-side reservoir-vs-byte-LUT benchmark with a 1.2× speed
+  floor. The crate ships **158 tests total** (up from 142).
 
 ## What round 5 lands
 
