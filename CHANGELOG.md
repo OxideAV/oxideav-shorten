@@ -8,6 +8,37 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-5 lossy bit-budget (`-n N`) and bit-rate (`-r N`) target
+  encoder modes (`EncoderConfig::with_bit_budget` /
+  `EncoderConfig::with_bit_rate`). Both compute an effective
+  `bshift` such that the per-sample post-Rice residual bit cost
+  is `<= target`. The encoder probes candidate shifts
+  `0..=BITSHIFT_MAX` against the leading per-channel block, runs
+  the same predictor search the full encode would, and picks the
+  smallest shift whose measured cost meets the target. Targets so
+  tight nothing in the range hits them cap at `BITSHIFT_MAX`
+  rather than failing. Closes audit/01 §2's `F10` (`-n 8`),
+  `F11` (`-n 16`), `F14` (`-r 2.5`), and `F15` (`-r 4`) lossy-mode
+  encoder coverage. Returns `EncodeError::BothBshiftAndBudget` when
+  combined with a non-zero `bshift`. Composes with
+  `with_max_lpc_order` and `with_mean_blocks`.
+- Round-5 speed: 256-entry leading-zero LUT
+  (`bitreader::UVAR_PREFIX_LUT`) backing
+  `BitReader::read_uvar_prefix`. The hot residual-decode path now
+  consumes up to a full byte of zero-prefix per LUT lookup when
+  byte-aligned, replacing the round-1 bit-by-bit scan loop.
+  `varint::read_uvar` routes its prefix scan through the new
+  helper, accelerating decode of long predictor blocks. The
+  bit-by-bit fallback handles cursor positions straddling a byte
+  boundary.
+- 17 round-5 tests: bit-budget / bit-rate effective-shift
+  selection (F10/F11/F14/F15 + lossless F12 corner), monotonicity
+  in target, mutual exclusion with explicit `bshift`, invalid-rate
+  rejection (NaN, zero, negative), composition with LPC and
+  running-mean, stereo roundtrip, and a hand-crafted prefix-decode
+  matrix that walks every leading-zero count 0..=15 across each
+  byte-alignment offset 0..=7. Crate ships 142 tests total
+  (up from 125).
 - Round-4 running-mean estimator on the encode side
   (`EncoderConfig::with_mean_blocks`, capped at `MEAN_BLOCKS_MAX =
   64`). The encoder mirrors the decoder's per-channel

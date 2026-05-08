@@ -6,13 +6,14 @@ for the
 
 ## Status
 
-**Round 4 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
+**Round 5 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
 v2/v3 wire format pinned in `spec/00..05` (with v1 syntactically
 accepted; no v1 fixture is reachable to confirm the v1 layout).
 Encodes via a predictor-search + energy-width-optimised production
-encoder with Levinson–Durbin LPC, lossy bit-shift, and round-4
-running-mean-estimator modes. Mono / stereo / multi-channel PCM I/O
-across all eleven TR.156 filetype labels.
+encoder with Levinson–Durbin LPC, lossy bit-shift, running-mean
+estimator, and round-5 bit-budget / bit-rate target lossy modes.
+LUT-driven `uvar` prefix decode on the hot path. Mono / stereo /
+multi-channel PCM I/O across all eleven TR.156 filetype labels.
 
 | Round | Adds                                                                                   |
 | ----- | -------------------------------------------------------------------------------------- |
@@ -20,6 +21,36 @@ across all eleven TR.156 filetype labels.
 | 2     | Production encoder (`encode` + `EncoderConfig`); all 11 TR.156 filetypes; container demuxer + `ajkg` probe. |
 | 3     | Levinson–Durbin LPC search; lossy `BLOCK_FN_BITSHIFT` encode; F1..F18 corpus-style structural tests. |
 | 4     | Running-mean estimator on encode side (`with_mean_blocks`); closes audit/01 §8.1 ±1 drift on `bshift > 0`. |
+| 5     | Bit-budget (`-n N`) / bit-rate (`-r N`) lossy encoder modes; LUT-driven `uvar` prefix decode. |
+
+## What round 5 lands
+
+- **Bit-budget `-n N` and bit-rate `-r N` lossy encoder modes**
+  (`EncoderConfig::with_bit_budget` / `EncoderConfig::with_bit_rate`).
+  Both compute an effective `bshift` such that the per-sample
+  post-Rice residual bit cost is `<= target`. The encoder probes
+  candidate shifts `0..=BITSHIFT_MAX` against the leading
+  per-channel block, runs the same predictor search the full
+  encode would, and picks the smallest shift whose measured cost
+  meets the target. Closes audit/01 §2 fixtures `F10` (`-n 8`),
+  `F11` (`-n 16`), `F14` (`-r 2.5`), `F15` (`-r 4`) at the
+  encoder side. Composes with `with_max_lpc_order` and
+  `with_mean_blocks`. Mutually exclusive with an explicit non-zero
+  `bshift` (returns `EncodeError::BothBshiftAndBudget`).
+- **Speed: LUT-driven `uvar` prefix decode.** A 256-entry
+  leading-zero table indexes each MSB-first byte to its position
+  of first set bit, letting `BitReader::read_uvar_prefix` consume
+  up to a full byte of `uvar` zero-prefix per LUT lookup when
+  byte-aligned. `varint::read_uvar` routes its prefix scan through
+  the new helper, replacing the round-1 bit-by-bit loop on the
+  hot residual-decode path.
+- **17 round-5 tests** covering bit-budget / bit-rate
+  effective-shift selection across F10/F11/F12/F14/F15,
+  monotonicity in target, mutual exclusion with explicit `bshift`,
+  invalid-rate rejection (NaN, zero, negative), composition with
+  LPC + running-mean, stereo roundtrip, and a hand-crafted
+  prefix-decode matrix walking every zero-count 0..=15 across each
+  byte-alignment 0..=7. The crate ships 142 tests total.
 
 ## What round 4 lands
 
@@ -84,20 +115,21 @@ across all eleven TR.156 filetype labels.
   demuxer reads the entire input into a single packet — Shorten has no
   internal framing — and lets the codec decoder unpack the bit stream.
 
-## What's not yet implemented (round 5+ candidates)
+## What's not yet implemented (round 6+ candidates)
 
 - **Bit-stream-corpus byte-exact decode** of the public `.shn` fixture
   set. Round 4 closes audit/01 §8.1's ±1 drift in the *internal*
   encode/decode pair (synthetic round-trips); the residual gap
   against ffmpeg on public-fixture pipeline-A still requires §9.4
-  binary procurement to fully pin.
-- **Bit-budget (`-n N`) / bit-rate (`-r N`) target lossy modes**
-  matching audit/01 fixtures `F10`/`F11`/`F14`/`F15`.
+  binary procurement to fully pin. The round-5 `-n N` / `-r N`
+  modes pick a defensible bshift heuristic; matching the reference
+  encoder's exact heuristic on the same input is also §9.4-blocked.
 - **Format-version 1 / 3 wire-format deltas.** No v1 or v3 fixture is
   reachable in the docs corpus; v1 is syntactically accepted but not
   behaviourally pinned.
-- **High-throughput optimisations.** Table-driven `uvar` prefix
-  decode + SIMD residual unpacking are not in scope yet.
+- **SIMD residual unpacking.** Round 5 lands the LUT-driven uvar
+  prefix decode; SIMD-batched residual mantissa reads are the next
+  throughput tier.
 
 ## Cargo features
 

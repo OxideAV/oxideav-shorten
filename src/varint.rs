@@ -68,22 +68,18 @@ pub(crate) const RESIDUAL_WIDTH_CAP: u32 = 32;
 ///
 /// `n` is checked against [`RESIDUAL_WIDTH_CAP`] so that residual
 /// reads cannot demand more than the lane can hold.
+///
+/// Round 5 routes the prefix scan through the table-driven
+/// [`crate::bitreader::BitReader::read_uvar_prefix`] LUT for the
+/// hot decoder loop.
 #[inline]
 pub(crate) fn read_uvar(br: &mut BitReader<'_>, n: u32) -> Result<u32> {
     if n > RESIDUAL_WIDTH_CAP {
         return Err(Error::ResidualWidthOverflow(n));
     }
-    let mut zeros: u32 = 0;
-    loop {
-        let bit = br.read_bit()?;
-        if bit == 1 {
-            break;
-        }
-        zeros = zeros.checked_add(1).ok_or(Error::UnexpectedEof)?;
-        if zeros > UVAR_MAX_ZEROS {
-            return Err(Error::UnexpectedEof);
-        }
-    }
+    let zeros = br
+        .read_uvar_prefix(UVAR_MAX_ZEROS)
+        .ok_or(Error::UnexpectedEof)?;
     let mantissa = br.read_bits(n)?;
     // (zeros << n) | mantissa; check for overflow above the 32-bit lane.
     let high = zeros

@@ -47,6 +47,7 @@ impl<'a> BitReader<'a> {
     }
 
     /// Read a single bit, advancing the cursor.
+    #[allow(dead_code)]
     pub fn read_bit(&mut self) -> Result<u32> {
         if self.pos >= self.total_bits() {
             return Err(Error::UnexpectedEof);
@@ -94,7 +95,125 @@ impl<'a> BitReader<'a> {
         self.pos += pad;
         pad as u32
     }
+
+    /// Round-5 hot-path helper: count the leading zero bits up to and
+    /// including the terminating `1` for a `uvar(n)` prefix. Returns
+    /// the zero count (cursor advanced past the terminator). Uses
+    /// the 256-entry [`UVAR_PREFIX_LUT`] to consume a full byte of
+    /// zeros at a time when the cursor is byte-aligned, and falls
+    /// back to a bit-by-bit scan when straddling byte boundaries.
+    ///
+    /// Returns `None` on EOF (the caller maps that to
+    /// [`crate::Error::UnexpectedEof`]).
+    #[inline]
+    pub fn read_uvar_prefix(&mut self, max_zeros: u32) -> Option<u32> {
+        let mut zeros: u32 = 0;
+        // Fast path: consume entire bytes of zeros while byte-aligned.
+        // The LUT lookup yields the position of the highest set bit
+        // (0..=7 from the MSB; 8 if the byte is zero).
+        loop {
+            let bit_offset = self.pos & 7;
+            if bit_offset != 0 {
+                break;
+            }
+            let byte_idx = self.pos >> 3;
+            if byte_idx >= self.bytes.len() {
+                return None;
+            }
+            let byte = self.bytes[byte_idx];
+            if byte == 0 {
+                // Whole byte is zeros — consume it.
+                zeros = zeros.checked_add(8)?;
+                if zeros > max_zeros {
+                    return None;
+                }
+                self.pos += 8;
+                continue;
+            }
+            // The byte has a 1 somewhere; the LUT entry is the index
+            // (0..=7 from the MSB) of the first 1 — i.e. the count of
+            // leading zeros within this byte.
+            let leading = UVAR_PREFIX_LUT[byte as usize] as u32;
+            zeros = zeros.checked_add(leading)?;
+            if zeros > max_zeros {
+                return None;
+            }
+            // Consume the leading zeros and the terminating `1` bit.
+            self.pos += leading as usize + 1;
+            return Some(zeros);
+        }
+        // Straddling fallback: read bits one at a time.
+        loop {
+            if self.pos >= self.total_bits() {
+                return None;
+            }
+            let byte = self.bytes[self.pos >> 3];
+            let shift = 7 - (self.pos & 7);
+            self.pos += 1;
+            let bit = (byte >> shift) & 1;
+            if bit == 1 {
+                return Some(zeros);
+            }
+            zeros = zeros.checked_add(1)?;
+            if zeros > max_zeros {
+                return None;
+            }
+            // After consuming one bit, if we're now byte-aligned, jump
+            // back into the fast path.
+            if self.pos & 7 == 0 {
+                loop {
+                    let byte_idx = self.pos >> 3;
+                    if byte_idx >= self.bytes.len() {
+                        return None;
+                    }
+                    let b = self.bytes[byte_idx];
+                    if b == 0 {
+                        zeros = zeros.checked_add(8)?;
+                        if zeros > max_zeros {
+                            return None;
+                        }
+                        self.pos += 8;
+                        continue;
+                    }
+                    let leading = UVAR_PREFIX_LUT[b as usize] as u32;
+                    zeros = zeros.checked_add(leading)?;
+                    if zeros > max_zeros {
+                        return None;
+                    }
+                    self.pos += leading as usize + 1;
+                    return Some(zeros);
+                }
+            }
+        }
+    }
 }
+
+/// 256-entry leading-zero table for an MSB-first byte. Entry `b` is
+/// the index (0..=7) of the most-significant set bit, counted from
+/// the MSB. For `b = 0` the entry is `8` (no set bit). Used by the
+/// round-5 [`BitReader::read_uvar_prefix`] fast path to consume up to
+/// 8 zero bits per byte in a single LUT lookup, replacing the
+/// bit-by-bit scan loop the round-1 `read_uvar` used.
+const fn make_uvar_prefix_lut() -> [u8; 256] {
+    let mut t = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut leading = 0u8;
+        let mut bit = 7i32;
+        while bit >= 0 {
+            if ((i >> bit) & 1) == 1 {
+                break;
+            }
+            leading += 1;
+            bit -= 1;
+        }
+        t[i] = leading;
+        i += 1;
+    }
+    t
+}
+
+pub(crate) const UVAR_PREFIX_LUT: [u8; 256] = make_uvar_prefix_lut();
 
 #[cfg(test)]
 mod tests {

@@ -61,13 +61,35 @@
 //!   still `mean_blocks = 0` to preserve the round-3 wire format
 //!   exactly.
 //!
+//! ## Round 5 additions
+//!
+//! * **Bit-budget `-n N` lossy mode** ([`EncoderConfig::with_bit_budget`])
+//!   and **bit-rate `-r N` lossy mode** ([`EncoderConfig::with_bit_rate`]).
+//!   Both compute an effective `bshift` such that the resulting
+//!   per-sample residual bit cost satisfies the target. The encoder
+//!   probes candidate `bshift` values starting at 0, encodes a
+//!   per-channel sample of the input under each, measures the actual
+//!   bits-per-sample of the residual stream, and selects the smallest
+//!   `bshift` whose output meets the target. When a target is
+//!   unreachable even at `bshift = BITSHIFT_MAX`, the encoder caps at
+//!   the maximum (the result is the lowest-rate stream it can
+//!   produce). Composes with `with_max_lpc_order` and the running-mean
+//!   estimator. Closes `audit/01` `F10`/`F11`/`F14`/`F15` lossy-mode
+//!   coverage at the encoder side; matching ffmpeg / Tony Robinson's
+//!   reference encoder on the same input remains §9.4-blocked because
+//!   the exact bit-budget search heuristic the reference uses is not
+//!   pinned in the spec set.
+//! * **Speed: table-driven `uvar` prefix decode.** A 256-entry LUT
+//!   indexes every 8-bit chunk to its leading-zero prefix length and
+//!   the position of the terminating 1-bit, accelerating the
+//!   [`crate::bitreader::BitReader::read_uvar_prefix`] hot path on
+//!   long predictor-block residual streams. See
+//!   `bitreader::UVAR_PREFIX_LUT`.
+//!
 //! ## What this encoder does **not** do
 //!
 //! * Skip-bytes (`H_skipbytes`). Verbatim-prefix bytes are emitted
 //!   via `BLOCK_FN_VERBATIM` instead.
-//! * Bit-budget (`-n N`) / bit-rate (`-r N`) target lossy modes per
-//!   audit/01 fixtures `F10`/`F11`/`F14`/`F15`. Round-4 is focused on
-//!   the running-mean drift closure.
 
 use crate::decoder::fn_code;
 use crate::header::{Filetype, MAGIC};
@@ -109,6 +131,23 @@ pub struct EncoderConfig {
     /// to `mu_chan` rather than zero. Default `0` — the round-3 wire
     /// format. Capped at `MEAN_BLOCKS_MAX`.
     pub mean_blocks: u32,
+    /// Round-5 lossy bit-budget target (`-n N` mode of TR.156's
+    /// reference encoder). `Some(n)` instructs the encoder to pick the
+    /// smallest `bshift` such that the per-sample post-Rice residual
+    /// cost is `<= n` bits per sample. `None` (the default) disables
+    /// the heuristic and uses the explicit [`Self::bshift`] field
+    /// instead. Setting this field at the same time as a non-zero
+    /// `bshift` returns [`EncodeError::BothBshiftAndBudget`].
+    pub bit_budget: Option<u32>,
+    /// Round-5 lossy bit-rate target (`-r N` mode of TR.156's
+    /// reference encoder). `Some(r)` instructs the encoder to pick
+    /// the smallest `bshift` such that the per-sample post-Rice
+    /// residual cost is `<= r` bits per sample. Same semantics as
+    /// [`Self::bit_budget`] but expressed as a real number; `r =
+    /// 2.5` is fixture `F14`'s `-r 2_5`, `r = 4.0` is `F15`'s `-r 4`.
+    /// Setting this field at the same time as a non-zero `bshift` or
+    /// a `bit_budget` returns [`EncodeError::BothBshiftAndBudget`].
+    pub bit_rate: Option<f32>,
 }
 
 /// Maximum running-mean window size accepted by the encoder. The
@@ -136,6 +175,8 @@ impl EncoderConfig {
             verbatim: Vec::new(),
             bshift: 0,
             mean_blocks: 0,
+            bit_budget: None,
+            bit_rate: None,
         }
     }
 
@@ -172,16 +213,39 @@ impl EncoderConfig {
         self.mean_blocks = n;
         self
     }
+
+    /// Enable round-5 lossy `-n N` bit-budget mode at `n` bits per
+    /// sample. The encoder picks the smallest `bshift` such that the
+    /// per-sample post-Rice residual cost is `<= n`. See
+    /// [`Self::bit_budget`].
+    pub fn with_bit_budget(mut self, n: u32) -> Self {
+        self.bit_budget = Some(n);
+        self
+    }
+
+    /// Enable round-5 lossy `-r N` bit-rate mode at `r` bits per
+    /// sample (real-valued). Mirrors `with_bit_budget` but supports
+    /// fractional targets — `r = 2.5` is fixture `F14`. See
+    /// [`Self::bit_rate`].
+    pub fn with_bit_rate(mut self, r: f32) -> Self {
+        self.bit_rate = Some(r);
+        self
+    }
 }
 
 /// Encoder errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum EncodeError {
     /// `samples.len()` is not a multiple of `channels`.
     SamplesNotChannelAligned { samples: usize, channels: u16 },
     /// `channels`, `blocksize`, or `max_lpc_order` outside accepted bounds.
     InvalidConfig(&'static str),
+    /// Both `bit_budget`/`bit_rate` and a non-zero `bshift` were set.
+    /// The two modes are mutually exclusive — a fixed `bshift` is the
+    /// `-q N` mode, while `bit_budget` / `bit_rate` are the
+    /// auto-`bshift` modes that pick a shift internally.
+    BothBshiftAndBudget,
 }
 
 impl core::fmt::Display for EncodeError {
@@ -192,11 +256,107 @@ impl core::fmt::Display for EncodeError {
                 "oxideav-shorten encode: samples ({samples}) not a multiple of channels ({channels})"
             ),
             Self::InvalidConfig(msg) => write!(f, "oxideav-shorten encode: {msg}"),
+            Self::BothBshiftAndBudget => write!(
+                f,
+                "oxideav-shorten encode: bit_budget / bit_rate are mutually exclusive with a non-zero bshift; pick one mode"
+            ),
         }
     }
 }
 
+impl Eq for EncodeError {}
+
 impl std::error::Error for EncodeError {}
+
+/// Compute the effective `bshift` for the given config + input.
+///
+/// * If neither [`EncoderConfig::bit_budget`] nor
+///   [`EncoderConfig::bit_rate`] is set, returns `cfg.bshift`
+///   unchanged.
+/// * Otherwise probes candidate shifts `0..=BITSHIFT_MAX`, encoding
+///   a representative slice of the input under each shift and
+///   measuring the resulting per-sample post-Rice residual bit cost.
+///   Returns the smallest shift whose measured cost is `<= target`,
+///   or `BITSHIFT_MAX` if no shift in the range can hit the target
+///   (the lowest-rate stream the encoder can produce).
+///
+/// The probe encodes one block per channel of size up to
+/// [`EncoderConfig::blocksize`] from the *front* of the input —
+/// representative for the typical short-correlation-length signals
+/// Shorten targets, and bounded so the probe overhead stays small
+/// relative to the full encode.
+fn compute_effective_bshift(cfg: &EncoderConfig, samples: &[i32]) -> Result<u32, EncodeError> {
+    // Translate the public config to a single target bits/sample
+    // value, preferring `bit_budget` over `bit_rate` when both are
+    // set (the validation upstream rejects that case via
+    // BothBshiftAndBudget; the precedence here is defensive).
+    let target_bps: f32 = match (cfg.bit_budget, cfg.bit_rate) {
+        (Some(n), _) => n as f32,
+        (None, Some(r)) => r,
+        (None, None) => return Ok(cfg.bshift),
+    };
+    // bit_budget = 0 is accepted and treated as "unreachable", which
+    // caps the search at BITSHIFT_MAX. bit_rate < 0 / NaN is rejected
+    // upstream of this helper.
+    // Probe each candidate shift. We measure on a per-channel slice
+    // of up to one default block; the probe runs the same predictor
+    // search the full encode would, so the measured per-residual
+    // cost is exactly what the full encode would produce on this
+    // probe block.
+    let nch = cfg.channels as usize;
+    let total_per_ch = samples.len() / nch;
+    if total_per_ch == 0 {
+        return Ok(0);
+    }
+    let probe_len = (cfg.blocksize as usize).min(total_per_ch);
+    // De-interleave just the probe slice.
+    let mut per_ch: Vec<Vec<i32>> = (0..nch).map(|_| Vec::with_capacity(probe_len)).collect();
+    for i in 0..probe_len {
+        for (ch, lane) in per_ch.iter_mut().enumerate().take(nch) {
+            lane.push(samples[i * nch + ch]);
+        }
+    }
+    let carry_len = core::cmp::max(3, cfg.max_lpc_order as usize);
+    for shift in 0..=BITSHIFT_MAX {
+        let bps = measure_bps_for_shift(&per_ch, cfg, carry_len, shift);
+        if bps <= target_bps {
+            return Ok(shift);
+        }
+    }
+    Ok(BITSHIFT_MAX)
+}
+
+/// Measure per-sample bits for the probe slice at a candidate
+/// `bshift`. The cost includes only the residual stream itself
+/// (mantissa + Golomb-prefix + terminator) — block headers /
+/// LPC-coefficient overhead amortise across the block and would
+/// flatten the signal between candidates.
+fn measure_bps_for_shift(
+    per_ch: &[Vec<i32>],
+    cfg: &EncoderConfig,
+    carry_len: usize,
+    shift: u32,
+) -> f32 {
+    let mut total_bits: u64 = 0;
+    let mut total_residuals: u64 = 0;
+    for lane in per_ch {
+        let shifted: Vec<i32> = if shift == 0 {
+            lane.clone()
+        } else {
+            lane.iter().map(|&s| s >> shift).collect()
+        };
+        let carry = vec![0i32; carry_len];
+        let choice = best_predictor(&shifted, &carry, cfg.max_lpc_order);
+        if !choice.residuals.is_empty() {
+            total_bits += cost_of_residuals(&choice.residuals, choice.width);
+            total_residuals += choice.residuals.len() as u64;
+        }
+    }
+    if total_residuals == 0 {
+        return 0.0;
+    }
+    total_bits as f32 / total_residuals as f32
+}
 
 /// Encode interleaved `i32` PCM lanes into a complete `.shn` byte
 /// buffer.
@@ -244,12 +404,30 @@ pub fn encode(cfg: &EncoderConfig, samples: &[i32]) -> Result<Vec<u8>, EncodeErr
             "mean_blocks exceeds MEAN_BLOCKS_MAX",
         ));
     }
+    if (cfg.bit_budget.is_some() || cfg.bit_rate.is_some()) && cfg.bshift != 0 {
+        return Err(EncodeError::BothBshiftAndBudget);
+    }
+    if let Some(r) = cfg.bit_rate {
+        if !r.is_finite() || r <= 0.0 {
+            return Err(EncodeError::InvalidConfig(
+                "bit_rate must be finite and > 0",
+            ));
+        }
+    }
     if samples.len() % cfg.channels as usize != 0 {
         return Err(EncodeError::SamplesNotChannelAligned {
             samples: samples.len(),
             channels: cfg.channels,
         });
     }
+
+    // Round-5 `-n N` / `-r N` modes: pick an effective bshift before
+    // entering the predictor search. The target is per-sample
+    // post-Rice residual bits; we probe candidate shifts and pick the
+    // smallest whose measured cost meets the target. For
+    // `bit_budget = None && bit_rate = None` this evaluates to the
+    // configured (possibly zero) `cfg.bshift` unchanged.
+    let effective_bshift = compute_effective_bshift(cfg, samples)?;
 
     let nch = cfg.channels as usize;
     let total_per_ch = samples.len() / nch;
@@ -277,10 +455,12 @@ pub fn encode(cfg: &EncoderConfig, samples: &[i32]) -> Result<Vec<u8>, EncodeErr
 
     // BITSHIFT command — emitted once at stream start when the
     // encoder is configured for lossy bshift > 0. The decoder
-    // applies the inverse left-shift on emitted samples.
-    if cfg.bshift > 0 {
+    // applies the inverse left-shift on emitted samples. Round 5:
+    // `effective_bshift` resolves either the explicit `cfg.bshift`
+    // or the auto-shift computed from `bit_budget` / `bit_rate`.
+    if effective_bshift > 0 {
         bw.write_uvar(fn_code::BITSHIFT, FNSIZE);
-        bw.write_uvar(cfg.bshift, BITSHIFTSIZE);
+        bw.write_uvar(effective_bshift, BITSHIFTSIZE);
     }
 
     // De-interleave for per-channel predictor application. Apply the
@@ -288,7 +468,7 @@ pub fn encode(cfg: &EncoderConfig, samples: &[i32]) -> Result<Vec<u8>, EncodeErr
     // before queuing — the decoder restores the lower zero bits via
     // its own left-shift on emission.
     let mut per_ch: Vec<Vec<i32>> = (0..nch).map(|_| Vec::with_capacity(total_per_ch)).collect();
-    let bshift = cfg.bshift;
+    let bshift = effective_bshift;
     for i in 0..total_per_ch {
         for ch in 0..nch {
             let s = samples[i * nch + ch];

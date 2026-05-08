@@ -84,12 +84,27 @@
 //!   same arithmetic. Default remains `mean_blocks = 0` (the round-3
 //!   wire format).
 //!
-//! ## What's intentionally out (deferred to round 5+)
+//! ## Round 5 additions
 //!
-//! * High-throughput optimisations (table-driven uvar prefix decode,
-//!   SIMD residual unpacking).
-//! * Bit-budget (`-n N`) / bit-rate (`-r N`) target lossy modes
-//!   matching audit/01 fixtures `F10`/`F11`/`F14`/`F15`.
+//! * **Bit-budget `-n N` / bit-rate `-r N` lossy modes**
+//!   ([`EncoderConfig::with_bit_budget`] /
+//!   [`EncoderConfig::with_bit_rate`]). Both compute an effective
+//!   `bshift` such that the resulting per-sample post-Rice residual
+//!   bit cost satisfies the target. Closes the encoder-side coverage
+//!   gap for audit/01 fixtures `F10`/`F11`/`F14`/`F15`. Mutually
+//!   exclusive with an explicit non-zero `bshift`.
+//! * **Speed: table-driven `uvar` prefix decode.** The MSB-first
+//!   bit reader exposes `read_uvar_prefix(max_zeros)` which consumes
+//!   up to a full byte of zeros per LUT lookup
+//!   ([`crate::bitreader`] `UVAR_PREFIX_LUT`). Wired into the
+//!   [`varint::read_uvar`](crate) hot path used by every per-block
+//!   command and per-residual decode.
+//!
+//! ## What's intentionally out (deferred to round 6+)
+//!
+//! * SIMD residual unpacking (the LUT-driven uvar prefix decode lands
+//!   in round 5; SIMD batching of the residual mantissa reads is the
+//!   next throughput tier).
 //! * Format-version 1 / 3 wire-format deltas. No v1 or v3 fixture is
 //!   reachable in the docs corpus; v1 is syntactically accepted (per
 //!   the FFmpeg-observed T3 tampering test) but the v1 header layout
@@ -154,3 +169,6 @@ mod round3_tests;
 
 #[cfg(test)]
 mod round4_tests;
+
+#[cfg(test)]
+mod round5_tests;
