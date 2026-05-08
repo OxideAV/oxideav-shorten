@@ -6,19 +6,40 @@ for the
 
 ## Status
 
-**Round 3 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
+**Round 4 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
 v2/v3 wire format pinned in `spec/00..05` (with v1 syntactically
 accepted; no v1 fixture is reachable to confirm the v1 layout).
 Encodes via a predictor-search + energy-width-optimised production
-encoder with Levinson–Durbin LPC + lossy bit-shift modes. Mono /
-stereo / multi-channel PCM I/O across all eleven TR.156 filetype
-labels.
+encoder with Levinson–Durbin LPC, lossy bit-shift, and round-4
+running-mean-estimator modes. Mono / stereo / multi-channel PCM I/O
+across all eleven TR.156 filetype labels.
 
 | Round | Adds                                                                                   |
 | ----- | -------------------------------------------------------------------------------------- |
 | 1     | Decoder + 10 function codes + Rice/Golomb residuals + carry + mean estimator + 3 pinned filetypes. |
 | 2     | Production encoder (`encode` + `EncoderConfig`); all 11 TR.156 filetypes; container demuxer + `ajkg` probe. |
 | 3     | Levinson–Durbin LPC search; lossy `BLOCK_FN_BITSHIFT` encode; F1..F18 corpus-style structural tests. |
+| 4     | Running-mean estimator on encode side (`with_mean_blocks`); closes audit/01 §8.1 ±1 drift on `bshift > 0`. |
+
+## What round 4 lands
+
+- **Running-mean estimator on the encode side**
+  (`EncoderConfig::with_mean_blocks`, capped at `MEAN_BLOCKS_MAX =
+  64`). The encoder mirrors the decoder's per-channel
+  `mean_blocks`-slot ring buffer with the Validator-pinned C-style
+  `trunc_div(sum + divisor/2, divisor)` arithmetic of `spec/05` §2.5
+  + `audit/01` §6.1, computes `mu_chan` at block start, and produces
+  `BLOCK_FN_DIFF0` residuals as `s - mu_chan`. Constant-`mu_chan`
+  blocks short-circuit to a parameter-less `BLOCK_FN_ZERO`. This
+  closes `audit/01` §8.1's ±1 drift on `bshift > 0` lossy fixtures
+  by lock-stepping encoder and decoder on identical `mu_chan`
+  arithmetic. Default remains `mean_blocks = 0` (round-3 wire
+  format). Composes with `with_max_lpc_order` and `with_bshift`.
+- **20 round-4 tests** covering lossless roundtrip across
+  `mean_blocks ∈ {0,1,4,8,16}` (mono + stereo), drift closure on
+  `bshift ∈ {1,4,8,12}`, the `BLOCK_FN_ZERO` short-circuit, and
+  composition with the round-3 LPC + bshift features. The crate
+  ships 125 tests total.
 
 ## What round 3 lands
 
@@ -63,13 +84,15 @@ labels.
   demuxer reads the entire input into a single packet — Shorten has no
   internal framing — and lets the codec decoder unpack the bit stream.
 
-## What's not yet implemented (round 4+ candidates)
+## What's not yet implemented (round 5+ candidates)
 
 - **Bit-stream-corpus byte-exact decode** of the public `.shn` fixture
-  set. The mean-estimator residual ±1 drift documented in
-  `audit/01-validation-report.md §8.1` remains the known-bounded gap.
-- **Mean estimator on the encode side.** Round 3 still writes
-  `H_meanblocks = 0`, sidestepping the ±1 drift.
+  set. Round 4 closes audit/01 §8.1's ±1 drift in the *internal*
+  encode/decode pair (synthetic round-trips); the residual gap
+  against ffmpeg on public-fixture pipeline-A still requires §9.4
+  binary procurement to fully pin.
+- **Bit-budget (`-n N`) / bit-rate (`-r N`) target lossy modes**
+  matching audit/01 fixtures `F10`/`F11`/`F14`/`F15`.
 - **Format-version 1 / 3 wire-format deltas.** No v1 or v3 fixture is
   reachable in the docs corpus; v1 is syntactically accepted but not
   behaviourally pinned.

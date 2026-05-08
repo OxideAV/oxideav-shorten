@@ -8,6 +8,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-4 running-mean estimator on the encode side
+  (`EncoderConfig::with_mean_blocks`, capped at `MEAN_BLOCKS_MAX =
+  64`). The encoder mirrors the decoder's per-channel
+  `mean_blocks`-slot ring buffer with the Validator-pinned C-style
+  `trunc_div(sum + divisor/2, divisor)` arithmetic of `spec/05` §2.5
+  + `audit/01` §6.1, computes `mu_chan` at block start, and produces
+  `BLOCK_FN_DIFF0` residuals as `s - mu_chan` rather than `s - 0`.
+  Constant-`mu_chan` blocks short-circuit to a parameter-less
+  `BLOCK_FN_ZERO` emission. This closes `audit/01` §8.1's ±1 drift
+  on `bshift > 0` lossy fixtures by lock-stepping encoder and
+  decoder on the same `mu_chan`. Default remains `mean_blocks = 0`
+  (round-3 wire format). Composes with `with_max_lpc_order` and
+  `with_bshift`. Adds 20 round-4 self-roundtrip + drift-closure
+  tests, bringing the suite to 125.
 - Round-3 Levinson–Durbin LPC coefficient search inside the encoder's
   per-block predictor candidates. When `max_lpc_order > 0` the
   encoder runs the standard recursion over the per-block-plus-carry

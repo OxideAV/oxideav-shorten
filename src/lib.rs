@@ -71,14 +71,25 @@
 //!   command may appear anywhere in the stream; round 3 emits it once
 //!   at stream start.
 //!
-//! ## What's intentionally out (deferred to round 4+)
+//! ## Round 4 additions
+//!
+//! * **Running-mean estimator on encode side**
+//!   ([`EncoderConfig::with_mean_blocks`]). The encoder mirrors the
+//!   decoder's per-channel mean-buffer state (`spec/05` §2.5; the
+//!   Validator-pinned C-truncation rule of `audit/01` §6.1) so that
+//!   `BLOCK_FN_DIFF0` residuals are produced relative to `mu_chan`
+//!   rather than zero, and constant-`mu_chan` blocks short-circuit to
+//!   `BLOCK_FN_ZERO`. This closes `audit/01` §8.1's ±1 drift on
+//!   `bshift > 0` lossy fixtures because encoder and decoder share the
+//!   same arithmetic. Default remains `mean_blocks = 0` (the round-3
+//!   wire format).
+//!
+//! ## What's intentionally out (deferred to round 5+)
 //!
 //! * High-throughput optimisations (table-driven uvar prefix decode,
 //!   SIMD residual unpacking).
-//! * Mean-estimator on the encode side. The round-3 encoder writes
-//!   `H_meanblocks = 0`, sidestepping the ±1 sub-bit-precision drift
-//!   documented in `audit/01` §8.1. The decoder still handles
-//!   `mean_blocks > 0` for streams produced externally.
+//! * Bit-budget (`-n N`) / bit-rate (`-r N`) target lossy modes
+//!   matching audit/01 fixtures `F10`/`F11`/`F14`/`F15`.
 //! * Format-version 1 / 3 wire-format deltas. No v1 or v3 fixture is
 //!   reachable in the docs corpus; v1 is syntactically accepted (per
 //!   the FFmpeg-observed T3 tampering test) but the v1 header layout
@@ -103,7 +114,7 @@ mod registry;
 mod varint;
 
 pub use crate::decoder::{decode, DecodedStream};
-pub use crate::encoder::{encode, EncodeError, EncoderConfig, BITSHIFT_MAX};
+pub use crate::encoder::{encode, EncodeError, EncoderConfig, BITSHIFT_MAX, MEAN_BLOCKS_MAX};
 pub use crate::error::{Error, Result};
 pub use crate::header::{parse_header, Filetype, StreamHeader, MAGIC};
 
@@ -140,3 +151,6 @@ mod round2_tests;
 
 #[cfg(test)]
 mod round3_tests;
+
+#[cfg(test)]
+mod round4_tests;

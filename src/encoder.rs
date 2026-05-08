@@ -43,15 +43,31 @@
 //!   appear anywhere in the stream; round 3 emits it once at stream
 //!   start.
 //!
+//! ## Round 4 additions
+//!
+//! * **Running-mean estimator on encode side** ([`EncoderConfig::with_mean_blocks`]).
+//!   When `mean_blocks > 0` the encoder maintains a per-channel
+//!   `mean_blocks`-slot ring buffer of past per-block means, computes
+//!   the at-block-start running mean `mu_chan` with the same C-style
+//!   `trunc_div(sum + divisor/2, divisor)` rule as the decoder, and
+//!   feeds it into the `BLOCK_FN_DIFF0` predictor's residuals
+//!   (`r = s - mu_chan`). On constant-`mu_chan` blocks the encoder
+//!   may emit `BLOCK_FN_ZERO` instead of a DIFF0 stream of all-zero
+//!   residuals — saving the energy + per-residual cost. Composes with
+//!   the LPC search and lossy `bshift > 0` mode, closing
+//!   `audit/01` §8.1's ±1 drift on `bshift > 0` lossy fixtures
+//!   because the encoder's DIFF0 residuals are now produced under the
+//!   same `mu_chan` the decoder will subtract back. The default is
+//!   still `mean_blocks = 0` to preserve the round-3 wire format
+//!   exactly.
+//!
 //! ## What this encoder does **not** do
 //!
-//! * Running-mean-estimator (`mean_blocks > 0`) on the encode side.
-//!   The encoder always writes `H_meanblocks = 0`, sidestepping the
-//!   ±1 sub-bit-precision drift documented in `audit/01` §8.1. The
-//!   decoder still handles `mean_blocks > 0` for streams produced
-//!   externally.
 //! * Skip-bytes (`H_skipbytes`). Verbatim-prefix bytes are emitted
 //!   via `BLOCK_FN_VERBATIM` instead.
+//! * Bit-budget (`-n N`) / bit-rate (`-r N`) target lossy modes per
+//!   audit/01 fixtures `F10`/`F11`/`F14`/`F15`. Round-4 is focused on
+//!   the running-mean drift closure.
 
 use crate::decoder::fn_code;
 use crate::header::{Filetype, MAGIC};
@@ -85,7 +101,23 @@ pub struct EncoderConfig {
     /// Capped at `BITSHIFT_MAX` (`(1 << BITSHIFTSIZE) - 1` plus the
     /// uvar-prefix headroom; the decoder rejects any `bshift >= 32`).
     pub bshift: u32,
+    /// `H_meanblocks` written into the header. When > 0 the encoder
+    /// maintains a per-channel running-mean estimator with the same
+    /// arithmetic the decoder applies (`spec/05` §2.5; the
+    /// Validator-pinned C-truncation rule), and the
+    /// `BLOCK_FN_DIFF0` predictor's residuals are produced relative
+    /// to `mu_chan` rather than zero. Default `0` — the round-3 wire
+    /// format. Capped at `MEAN_BLOCKS_MAX`.
+    pub mean_blocks: u32,
 }
+
+/// Maximum running-mean window size accepted by the encoder. The
+/// decoder accepts arbitrary `H_meanblocks` from the header but the
+/// encoder caps to a reasonable bound so the per-channel buffer
+/// allocation stays small and predictable. TR.156's typical default
+/// is 4; the reference implementation's documented options range over
+/// 0..=16.
+pub const MEAN_BLOCKS_MAX: u32 = 64;
 
 /// Maximum lossy bit-shift the encoder accepts. The decoder rejects
 /// `bshift >= 32` (per `spec/04` §3 + `decoder::Error::BitShiftOverflow`),
@@ -103,6 +135,7 @@ impl EncoderConfig {
             max_lpc_order: 0,
             verbatim: Vec::new(),
             bshift: 0,
+            mean_blocks: 0,
         }
     }
 
@@ -128,6 +161,15 @@ impl EncoderConfig {
     /// `0` is lossless. See [`EncoderConfig::bshift`].
     pub fn with_bshift(mut self, bshift: u32) -> Self {
         self.bshift = bshift;
+        self
+    }
+
+    /// Enable the running-mean estimator with a window of `n` per-block
+    /// means. `0` (the default) disables. The reference Shorten
+    /// encoder's typical value is 4; the spec set has not pinned a
+    /// preferred default for round 4. See [`EncoderConfig::mean_blocks`].
+    pub fn with_mean_blocks(mut self, n: u32) -> Self {
+        self.mean_blocks = n;
         self
     }
 }
@@ -197,6 +239,11 @@ pub fn encode(cfg: &EncoderConfig, samples: &[i32]) -> Result<Vec<u8>, EncodeErr
     if cfg.bshift > BITSHIFT_MAX {
         return Err(EncodeError::InvalidConfig("bshift exceeds BITSHIFT_MAX"));
     }
+    if cfg.mean_blocks > MEAN_BLOCKS_MAX {
+        return Err(EncodeError::InvalidConfig(
+            "mean_blocks exceeds MEAN_BLOCKS_MAX",
+        ));
+    }
     if samples.len() % cfg.channels as usize != 0 {
         return Err(EncodeError::SamplesNotChannelAligned {
             samples: samples.len(),
@@ -220,7 +267,7 @@ pub fn encode(cfg: &EncoderConfig, samples: &[i32]) -> Result<Vec<u8>, EncodeErr
     bw.write_ulong(cfg.channels as u32);
     bw.write_ulong(cfg.blocksize);
     bw.write_ulong(cfg.max_lpc_order);
-    bw.write_ulong(0); // mean_blocks — encoder side disables the running mean.
+    bw.write_ulong(cfg.mean_blocks); // running-mean window (round 4).
     bw.write_ulong(0); // skip_bytes — verbatim is emitted via BLOCK_FN_VERBATIM.
 
     // Verbatim prefix.
@@ -254,6 +301,12 @@ pub fn encode(cfg: &EncoderConfig, samples: &[i32]) -> Result<Vec<u8>, EncodeErr
     // Length matches the decoder's `max(3, max_lpc_order)` convention.
     let carry_len = core::cmp::max(3, cfg.max_lpc_order as usize);
     let mut carry: Vec<Vec<i32>> = (0..nch).map(|_| vec![0i32; carry_len]).collect();
+    // Running-mean window — `mean_blocks` slots per channel, all zero
+    // at stream start. Mirrors the decoder's `ChannelState::mean_buf`
+    // (`spec/05` §2.5).
+    let mut mean_buf: Vec<Vec<i32>> = (0..nch)
+        .map(|_| vec![0i32; cfg.mean_blocks as usize])
+        .collect();
     let mut written: Vec<usize> = vec![0; nch];
 
     let mut current_bs = cfg.blocksize as usize;
@@ -272,12 +325,25 @@ pub fn encode(cfg: &EncoderConfig, samples: &[i32]) -> Result<Vec<u8>, EncodeErr
                 current_bs = take;
             }
             let block = &per_ch[ch][written[ch]..written[ch] + take];
-            // Search for the best (predictor, width) pair.
-            let choice = best_predictor(block, &carry[ch], cfg.max_lpc_order);
+            // Compute the at-block-start running mean. For
+            // `mean_blocks == 0` this is always zero (matching the
+            // round-3 wire format).
+            let mu_chan = running_mean(&mean_buf[ch], cfg.mean_blocks);
+            // Search for the best (predictor, width) pair, including
+            // the BLOCK_FN_ZERO short-circuit when the block is
+            // constant `mu_chan`.
+            let choice = best_predictor_with_mean(
+                block,
+                &carry[ch],
+                cfg.max_lpc_order,
+                mu_chan,
+                cfg.mean_blocks,
+            );
             // Emit the chosen command + payload.
             emit_block(&mut bw, &choice);
-            // Update the per-channel carry.
+            // Update the per-channel carry + mean buffer.
             update_carry(&mut carry[ch], block);
+            push_block_mean(&mut mean_buf[ch], block_mean_of(block));
             written[ch] += take;
         }
     }
@@ -292,7 +358,8 @@ pub fn encode(cfg: &EncoderConfig, samples: &[i32]) -> Result<Vec<u8>, EncodeErr
 /// One predictor candidate's evaluated state. Held by the search to
 /// pick the best one.
 struct PredictorChoice {
-    /// Function-code for emission (`fn_code::DIFF*` or `QLPC`).
+    /// Function-code for emission (`fn_code::DIFF*`, `QLPC`, or
+    /// `ZERO`).
     fn_code: u32,
     /// LPC order — only meaningful when `fn_code == fn_code::QLPC`.
     /// Zero for the polynomial predictors.
@@ -300,10 +367,125 @@ struct PredictorChoice {
     /// LPC coefficients (length `lpc_order`).
     lpc_coefs: Vec<i32>,
     /// Encoder-side mantissa width (`n` of TR.156 §3.3 eq. 21). The
-    /// energy field on the wire is `n - 1`.
+    /// energy field on the wire is `n - 1`. Unused for `ZERO`.
     width: u32,
-    /// The residual sequence.
+    /// The residual sequence. Empty for `ZERO`.
     residuals: Vec<i32>,
+}
+
+/// Per-block mean — mirrors `decoder::block_mean` (the
+/// Validator-pinned C-truncation rule of `spec/05` §2.5 step 1).
+pub(crate) fn block_mean_of(block: &[i32]) -> i32 {
+    let bs = block.len() as i64;
+    if bs == 0 {
+        return 0;
+    }
+    let sum: i64 = block.iter().map(|&v| v as i64).sum();
+    let bias = bs / 2;
+    let numerator = sum + bias;
+    (numerator / bs) as i32
+}
+
+/// Running-mean estimator value at block start — mirrors
+/// `decoder::ChannelState::running_mean`.
+pub(crate) fn running_mean(buf: &[i32], mean_blocks: u32) -> i32 {
+    if mean_blocks == 0 || buf.is_empty() {
+        return 0;
+    }
+    let divisor = mean_blocks as i64;
+    let sum: i64 = buf.iter().map(|&v| v as i64).sum();
+    let bias = divisor / 2;
+    let numerator = sum + bias;
+    (numerator / divisor) as i32
+}
+
+/// Sliding-window update — mirrors
+/// `decoder::ChannelState::push_block_mean`.
+pub(crate) fn push_block_mean(buf: &mut [i32], mu_blk: i32) {
+    let n = buf.len();
+    if n == 0 {
+        return;
+    }
+    for i in 0..n - 1 {
+        buf[i] = buf[i + 1];
+    }
+    buf[n - 1] = mu_blk;
+}
+
+/// Search wrapper that augments the round-3 polynomial+QLPC search
+/// with the round-4 mean-aware DIFF0 candidate (residual `s - mu_chan`)
+/// and a `BLOCK_FN_ZERO` short-circuit when the entire block equals
+/// `mu_chan`.
+fn best_predictor_with_mean(
+    block: &[i32],
+    carry: &[i32],
+    max_lpc_order: u32,
+    mu_chan: i32,
+    mean_blocks: u32,
+) -> PredictorChoice {
+    // ZERO short-circuit: when the running-mean estimator is active
+    // and every sample of the block equals `mu_chan`, emit ZERO. The
+    // decoder emits `bs` samples = `mu_chan` for ZERO blocks
+    // (`spec/05` §2.4). The block-mean-of `mu_chan` is `mu_chan` so
+    // the running-mean state evolves identically on both sides.
+    if mean_blocks > 0 && !block.is_empty() && block.iter().all(|&s| s == mu_chan) {
+        return PredictorChoice {
+            fn_code: fn_code::ZERO,
+            lpc_order: 0,
+            lpc_coefs: Vec::new(),
+            width: 1, // unused; stay non-zero for cost accounting.
+            residuals: Vec::new(),
+        };
+    }
+
+    let mut best = best_predictor(block, carry, max_lpc_order);
+
+    // Recompute DIFF0 candidate with the running-mean offset. For
+    // `mean_blocks == 0` `mu_chan` is always 0 and this re-evaluates
+    // to exactly the round-3 DIFF0 candidate; for `mean_blocks > 0`
+    // it may beat the round-3 baseline because the residual stream
+    // is `s - mu_chan` which is centred near zero on DC-active
+    // signals.
+    if mean_blocks > 0 {
+        let residuals: Vec<i32> = block.iter().map(|&s| s.wrapping_sub(mu_chan)).collect();
+        let width = pick_width(&residuals);
+        let cost = cost_of_residuals(&residuals, width);
+        // Match the overhead accounting in `best_predictor`.
+        let overhead = 1 + FNSIZE as u64 + 1 + ENERGYSIZE as u64;
+        let total = cost.saturating_add(overhead);
+        let best_cost = predictor_cost(&best);
+        if total < best_cost {
+            best = PredictorChoice {
+                fn_code: fn_code::DIFF0,
+                lpc_order: 0,
+                lpc_coefs: Vec::new(),
+                width,
+                residuals,
+            };
+        }
+    }
+    best
+}
+
+/// Back-compute a candidate's emission cost — keeps the round-4
+/// short-circuit comparisons honest against the round-3 search's
+/// best.
+fn predictor_cost(choice: &PredictorChoice) -> u64 {
+    if choice.fn_code == fn_code::ZERO {
+        return (1 + FNSIZE) as u64;
+    }
+    let body = cost_of_residuals(&choice.residuals, choice.width);
+    let mut overhead = 1 + FNSIZE as u64 + 1 + ENERGYSIZE as u64;
+    if choice.fn_code == fn_code::QLPC {
+        overhead += 1
+            + LPCQSIZE as u64
+            + choice
+                .lpc_coefs
+                .iter()
+                .map(|&c| svar_cost(c, LPCQUANT))
+                .sum::<u64>();
+    }
+    body.saturating_add(overhead)
 }
 
 /// Search for the predictor + width pair that minimises the per-block
@@ -648,6 +830,10 @@ fn cost_of_residuals(residuals: &[i32], n: u32) -> u64 {
 /// candidate.
 fn emit_block(bw: &mut BitWriter, choice: &PredictorChoice) {
     bw.write_uvar(choice.fn_code, FNSIZE);
+    // BLOCK_FN_ZERO is parameter-less — emit just the function code.
+    if choice.fn_code == fn_code::ZERO {
+        return;
+    }
     if choice.fn_code == fn_code::QLPC {
         bw.write_uvar(choice.lpc_order, LPCQSIZE);
         for &c in &choice.lpc_coefs {
