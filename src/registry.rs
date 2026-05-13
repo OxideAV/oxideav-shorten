@@ -161,6 +161,52 @@ impl CoreDecoder for ShortenDecoder {
 
 // ───────────────────────── Demuxer ─────────────────────────
 
+/// Test-only typed factory. Constructs a [`ShortenDemuxer`] directly
+/// over the in-memory byte buffer — the same path
+/// [`open_demuxer`] takes, but returning the concrete type so the
+/// integration test in `tests/seek.rs` can inspect the cached frame
+/// index and the scan counter. Hidden from public Rustdoc.
+#[doc(hidden)]
+pub fn __open_demuxer_typed(buf: Vec<u8>) -> CoreResult<ShortenDemuxer> {
+    if buf.len() < 5 || buf[0..4] != crate::MAGIC[..] {
+        return Err(CoreError::invalid(
+            "oxideav-shorten: input is not a Shorten stream (missing 'ajkg' magic)",
+        ));
+    }
+    let header = crate::parse_header(&buf)
+        .map_err(|e| CoreError::invalid(format!("oxideav-shorten: {e}")))?;
+    let sample_fmt = match header.filetype {
+        Filetype::U8 => SampleFormat::U8,
+        Filetype::S8 => SampleFormat::S8,
+        Filetype::S16Be | Filetype::S16Le | Filetype::S16Native | Filetype::S16Swapped => {
+            SampleFormat::S16
+        }
+        Filetype::U16Be | Filetype::U16Le | Filetype::U16Native | Filetype::U16Swapped => {
+            SampleFormat::S16
+        }
+        Filetype::Ulaw => SampleFormat::U8,
+    };
+    let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+    params.media_type = MediaType::Audio;
+    params.channels = Some(header.channels);
+    params.sample_format = Some(sample_fmt);
+    let stream = StreamInfo {
+        index: 0,
+        time_base: TimeBase::new(1, 44_100),
+        duration: None,
+        start_time: None,
+        params,
+    };
+    Ok(ShortenDemuxer {
+        streams: vec![stream],
+        payload: buf,
+        emitted: false,
+        next_pts: 0,
+        frame_index: None,
+        scan_count: 0,
+    })
+}
+
 fn open_demuxer(
     mut input: Box<dyn ReadSeek>,
     _codecs: &dyn CodecResolver,
@@ -215,13 +261,122 @@ fn open_demuxer(
 
     Ok(Box::new(ShortenDemuxer {
         streams: vec![stream],
-        payload: Some(buf),
+        payload: buf,
+        emitted: false,
+        next_pts: 0,
+        frame_index: None,
+        scan_count: 0,
     }))
 }
 
-struct ShortenDemuxer {
+/// Granularity of the lazy frame index. We sample one entry every
+/// [`FRAME_INDEX_STRIDE`] per-channel block-rounds; smaller values give
+/// finer seek precision at the cost of a longer index. `10` is a
+/// pragmatic compromise: on TR.156's default 256-sample block the
+/// index lands every 2 560 per-channel samples (~58 ms at 44 100 Hz),
+/// well below the audible threshold for a missed seek target while
+/// keeping a 5-minute mono file's index under ~1 KB.
+const FRAME_INDEX_STRIDE: u64 = 10;
+
+/// Cached entry in the lazy frame index. `pts` is the per-channel
+/// sample index at which the indexed block starts (matches the
+/// container time-base); `byte_offset` is the file-relative byte at
+/// which the block stream **begins** for that pts (not used for
+/// payload slicing in round-8 — see the seek semantics note in the
+/// `seek_to` doc-comment, which slices on `pts` alone and accepts a
+/// transient predictor-state glitch).
+#[derive(Debug, Clone, Copy)]
+struct FrameIndexEntry {
+    pts: i64,
+    /// Informational — file-relative byte at which the indexed
+    /// block-round begins. Not consumed by [`ShortenDemuxer::seek_to`]
+    /// in round 8 (the payload is sliced on pts alone, see the
+    /// `seek_to` doc-comment) but recorded so a future round can
+    /// switch to byte-aware slicing once predictor-state replay is
+    /// supported. Surfaced through the test-only
+    /// [`ShortenDemuxer::frame_index_byte_offsets`] helper.
+    #[cfg_attr(not(test), allow(dead_code))]
+    byte_offset: u64,
+}
+
+/// Concrete Shorten demuxer. Exposed publicly (with `#[doc(hidden)]`)
+/// so the seek integration test in `tests/seek.rs` can inspect the
+/// scan counter and the cached frame index — see
+/// [`__open_demuxer_typed`]. Framework consumers should always go
+/// through the [`Demuxer`] trait via the registered container.
+#[doc(hidden)]
+pub struct ShortenDemuxer {
     streams: Vec<StreamInfo>,
-    payload: Option<Vec<u8>>,
+    payload: Vec<u8>,
+    emitted: bool,
+    /// Per-channel sample index at which the next emitted packet's
+    /// pts/dts is anchored. Default 0; mutated by [`seek_to`].
+    next_pts: i64,
+    /// Lazy frame index — built on first [`seek_to`]. `None` until
+    /// then; [`Some`] thereafter (even if empty for a degenerate
+    /// stream).
+    frame_index: Option<Vec<FrameIndexEntry>>,
+    /// Cheap diagnostic counter — incremented each time the demuxer
+    /// scans the FN command stream. Tests use this to assert that the
+    /// frame index is cached across multiple [`seek_to`] calls (a
+    /// scanned-once invariant means the counter stays at 1 across the
+    /// 2nd and Nth seek). Not exposed through the public Demuxer
+    /// trait; accessed from the test module through an internal
+    /// helper [`scan_count`].
+    scan_count: u32,
+}
+
+impl ShortenDemuxer {
+    /// Diagnostic — number of times the FN command scan has run.
+    /// Used by the seek tests to assert the index is cached across
+    /// calls. `#[doc(hidden)]` since framework consumers shouldn't
+    /// reach for it.
+    #[doc(hidden)]
+    pub fn scan_count(&self) -> u32 {
+        self.scan_count
+    }
+
+    /// Diagnostic — file-relative byte offsets recorded in the lazy
+    /// frame index, in the order the scan emitted them. Returns
+    /// `None` if [`Self::seek_to`] has not yet built the index.
+    /// `#[doc(hidden)]`.
+    #[doc(hidden)]
+    pub fn frame_index_byte_offsets(&self) -> Option<Vec<u64>> {
+        self.frame_index
+            .as_ref()
+            .map(|v| v.iter().map(|e| e.byte_offset).collect())
+    }
+
+    /// Diagnostic — pts list from the lazy frame index. `None` if
+    /// [`Self::seek_to`] has not yet been called.
+    #[doc(hidden)]
+    pub fn frame_index_pts(&self) -> Option<Vec<i64>> {
+        self.frame_index
+            .as_ref()
+            .map(|v| v.iter().map(|e| e.pts).collect())
+    }
+
+    /// Current `next_pts` cursor — pts at which the next emitted
+    /// packet will be anchored. `#[doc(hidden)]`.
+    #[doc(hidden)]
+    pub fn next_pts(&self) -> i64 {
+        self.next_pts
+    }
+
+    /// Build or return the frame index. Memoised across calls.
+    fn ensure_index(&mut self) -> CoreResult<&[FrameIndexEntry]> {
+        if self.frame_index.is_none() {
+            let entries = build_frame_index(&self.payload, FRAME_INDEX_STRIDE)
+                .map_err(|e| CoreError::invalid(format!("oxideav-shorten: {e}")))?;
+            self.scan_count = self.scan_count.saturating_add(1);
+            self.frame_index = Some(entries);
+        }
+        Ok(self
+            .frame_index
+            .as_ref()
+            .expect("frame_index just set")
+            .as_slice())
+    }
 }
 
 impl Demuxer for ShortenDemuxer {
@@ -234,17 +389,242 @@ impl Demuxer for ShortenDemuxer {
     }
 
     fn next_packet(&mut self) -> CoreResult<Packet> {
-        match self.payload.take() {
-            Some(data) => {
-                let mut pkt = Packet::new(0, self.streams[0].time_base, data);
-                pkt.pts = Some(0);
-                pkt.dts = Some(0);
-                pkt.flags.keyframe = true;
-                Ok(pkt)
+        if self.emitted {
+            return Err(CoreError::Eof);
+        }
+        self.emitted = true;
+        let mut pkt = Packet::new(0, self.streams[0].time_base, self.payload.clone());
+        pkt.pts = Some(self.next_pts);
+        pkt.dts = Some(self.next_pts);
+        pkt.flags.keyframe = true;
+        Ok(pkt)
+    }
+
+    /// Seek to the nearest indexed block at or before `pts`.
+    ///
+    /// **Seek semantics — round 8.** Shorten has no built-in seek
+    /// table: per-block predictor + carry state accumulates from byte
+    /// 0 of the stream, so a clean seek requires either replaying the
+    /// stream from the start (no gain) or accepting that the first
+    /// block or two after the seek point will decode with a stale
+    /// predictor state (one to two blocks of audible glitch on
+    /// lossless content, less on lossy / smooth audio).
+    ///
+    /// This implementation:
+    ///
+    /// 1. Lazily builds a `Vec<FrameIndexEntry>` on the first call by
+    ///    walking the FN command stream and recording
+    ///    `(per-channel-sample-pts, byte_offset)` every
+    ///    [`FRAME_INDEX_STRIDE`] per-channel block-rounds. The index
+    ///    is cached on the demuxer; subsequent calls are O(log n)
+    ///    over the index plus the `next_pts` write.
+    /// 2. Binary-searches the index for the largest entry whose pts
+    ///    is `<= target_pts`. Below the first entry it clamps to 0;
+    ///    past the last entry it clamps to the last indexed pts.
+    /// 3. Sets [`Self::next_pts`] to the chosen entry's pts and
+    ///    arms [`Self::next_packet`] to re-emit the full payload at
+    ///    that pts. The consumer is expected to drop frames whose
+    ///    timestamps fall below `next_pts`, taking the
+    ///    predictor-state-glitch tail as documented in this crate's
+    ///    README.
+    ///
+    /// Returns the actual pts seeked to (which may differ from
+    /// `pts` by up to one indexed-stride's worth of samples).
+    fn seek_to(&mut self, stream_index: u32, pts: i64) -> CoreResult<i64> {
+        if stream_index != 0 {
+            return Err(CoreError::invalid(format!(
+                "oxideav-shorten: stream index {stream_index} out of range (only stream 0 exists)"
+            )));
+        }
+        let target = pts.max(0);
+
+        // Build the index lazily.
+        let entries = self.ensure_index()?;
+
+        // Determine the landing pts. If the index is empty (degenerate
+        // single-block stream) we always land at 0. Otherwise binary-
+        // search for the largest entry with pts <= target.
+        let landed = if entries.is_empty() {
+            0
+        } else {
+            // `partition_point` returns the first index whose
+            // predicate is false; the candidate is the entry just
+            // before it.
+            let idx = entries.partition_point(|e| e.pts <= target);
+            if idx == 0 {
+                // Target before the first indexed pts — land at 0.
+                0
+            } else {
+                entries[idx - 1].pts
             }
-            None => Err(CoreError::Eof),
+        };
+
+        self.next_pts = landed;
+        self.emitted = false;
+        Ok(landed)
+    }
+}
+
+// ───────────────────────── Frame-index scan ─────────────────────────
+
+/// Walk the FN command stream from byte 5 (immediately past magic +
+/// version) through `BLOCK_FN_QUIT`, recording one
+/// [`FrameIndexEntry`] every `stride` per-channel block-rounds.
+///
+/// A "per-channel block-round" is `n_channels` consecutive
+/// sample-producing blocks (`DIFF0..3` / `QLPC` / `ZERO`) — exactly
+/// one block per channel under the encoder's round-robin commit
+/// (see [`crate::encoder::encode`]). Each round advances the
+/// per-channel sample-pts cursor by the **block size in effect at
+/// round start** (which a `BLOCK_FN_BLOCKSIZE` command may have
+/// changed between rounds).
+///
+/// The byte offset recorded for each entry is the file-relative byte
+/// containing the bit at which the indexed block-round begins (i.e.
+/// `5 + bit_pos / 8` where `bit_pos` is the BitReader's cursor at
+/// round start). This is informational only in round 8 — the seek
+/// path does not slice on it, since the per-block predictor state
+/// cannot be reconstructed from a mid-stream cut.
+fn build_frame_index(file_bytes: &[u8], stride: u64) -> crate::Result<Vec<FrameIndexEntry>> {
+    use crate::bitreader::BitReader;
+    use crate::decoder::fn_code;
+    use crate::varint::{
+        read_svar, read_ulong, read_uvar, BITSHIFTSIZE, ENERGYSIZE, FNSIZE, LPCQSIZE, LPCQUANT,
+        RESIDUAL_WIDTH_CAP, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE,
+    };
+
+    let header = crate::parse_header(file_bytes)?;
+    let nch = header.channels as usize;
+    if nch == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut br = BitReader::new(&file_bytes[5..]);
+    // Advance past the parameter block.
+    while br.bit_pos() < header.header_end_bit {
+        let remaining = header.header_end_bit - br.bit_pos();
+        let chunk = remaining.min(32) as u32;
+        let _ = br.read_bits(chunk)?;
+    }
+
+    let mut entries: Vec<FrameIndexEntry> = Vec::new();
+    // Always include the start of the block stream as the first
+    // indexed entry — seek-to-zero relies on this anchor.
+    entries.push(FrameIndexEntry {
+        pts: 0,
+        byte_offset: 5 + (br.bit_pos() as u64 / 8),
+    });
+
+    let mut current_block_size: u32 = header.blocksize;
+    let mut channel_cursor: usize = 0;
+    // Per-channel sample-pts (cumulative). All channels advance in
+    // lockstep — channel 0's count is the canonical pts.
+    let mut samples_per_channel: i64 = 0;
+    let mut rounds_since_index: u64 = 0;
+
+    loop {
+        let fn_code = read_uvar(&mut br, FNSIZE)?;
+        match fn_code {
+            fn_code::DIFF0 | fn_code::DIFF1 | fn_code::DIFF2 | fn_code::DIFF3 => {
+                // Skip the residual payload of one DIFF block: an
+                // ENERGYSIZE-width energy field then `bs`
+                // svar(width)-encoded residuals.
+                let energy = read_uvar(&mut br, ENERGYSIZE)?;
+                let width = energy.checked_add(1).unwrap_or(0);
+                if width > RESIDUAL_WIDTH_CAP {
+                    return Err(crate::Error::ResidualWidthOverflow(width));
+                }
+                let bs = current_block_size as usize;
+                for _ in 0..bs {
+                    let _ = read_svar(&mut br, width)?;
+                }
+                // Advance round bookkeeping.
+                channel_cursor = (channel_cursor + 1) % nch;
+                if channel_cursor == 0 {
+                    samples_per_channel += bs as i64;
+                    rounds_since_index += 1;
+                    if rounds_since_index >= stride {
+                        entries.push(FrameIndexEntry {
+                            pts: samples_per_channel,
+                            byte_offset: 5 + (br.bit_pos() as u64 / 8),
+                        });
+                        rounds_since_index = 0;
+                    }
+                }
+            }
+            fn_code::QLPC => {
+                let order = read_uvar(&mut br, LPCQSIZE)?;
+                for _ in 0..order {
+                    let _ = read_svar(&mut br, LPCQUANT)?;
+                }
+                let energy = read_uvar(&mut br, ENERGYSIZE)?;
+                let width = energy.checked_add(1).unwrap_or(0);
+                if width > RESIDUAL_WIDTH_CAP {
+                    return Err(crate::Error::ResidualWidthOverflow(width));
+                }
+                let bs = current_block_size as usize;
+                for _ in 0..bs {
+                    let _ = read_svar(&mut br, width)?;
+                }
+                channel_cursor = (channel_cursor + 1) % nch;
+                if channel_cursor == 0 {
+                    samples_per_channel += bs as i64;
+                    rounds_since_index += 1;
+                    if rounds_since_index >= stride {
+                        entries.push(FrameIndexEntry {
+                            pts: samples_per_channel,
+                            byte_offset: 5 + (br.bit_pos() as u64 / 8),
+                        });
+                        rounds_since_index = 0;
+                    }
+                }
+            }
+            fn_code::ZERO => {
+                // No residual payload — emits `bs` samples = running
+                // mean. Just advance the round bookkeeping.
+                let bs = current_block_size as i64;
+                channel_cursor = (channel_cursor + 1) % nch;
+                if channel_cursor == 0 {
+                    samples_per_channel += bs;
+                    rounds_since_index += 1;
+                    if rounds_since_index >= stride {
+                        entries.push(FrameIndexEntry {
+                            pts: samples_per_channel,
+                            byte_offset: 5 + (br.bit_pos() as u64 / 8),
+                        });
+                        rounds_since_index = 0;
+                    }
+                }
+            }
+            fn_code::BLOCKSIZE => {
+                let new_bs = read_ulong(&mut br)?;
+                if new_bs == 0 || new_bs > crate::MAX_BLOCKSIZE {
+                    return Err(crate::Error::UnsupportedBlockSize(new_bs));
+                }
+                current_block_size = new_bs;
+            }
+            fn_code::BITSHIFT => {
+                let new_shift = read_uvar(&mut br, BITSHIFTSIZE)?;
+                if new_shift >= 32 {
+                    return Err(crate::Error::BitShiftOverflow(new_shift));
+                }
+                // No state we track here cares about bshift — the
+                // residual layout is unaffected.
+            }
+            fn_code::VERBATIM => {
+                let length = read_uvar(&mut br, VERBATIM_CHUNK_SIZE)?;
+                for _ in 0..length {
+                    let _ = read_uvar(&mut br, VERBATIM_BYTE_SIZE)?;
+                }
+            }
+            fn_code::QUIT => {
+                break;
+            }
+            other => return Err(crate::Error::UnknownFunctionCode(other)),
         }
     }
+
+    Ok(entries)
 }
 
 // ───────────────────────── PCM packer ─────────────────────────

@@ -173,6 +173,14 @@ pub use crate::registry::{
     container_register, register, register_codecs, shorten_probe, CODEC_ID_STR, CONTAINER_NAME,
 };
 
+// Doc-hidden test surface — the seek integration test
+// (`tests/seek.rs`) reaches in for the concrete demuxer type so it
+// can inspect the scan-count + cached frame index. Framework
+// consumers must continue to drive the `Demuxer` trait.
+#[cfg(feature = "registry")]
+#[doc(hidden)]
+pub use crate::registry::{__open_demuxer_typed, ShortenDemuxer};
+
 /// Maximum channels accepted by the decoder. The Hydrogenaudio entry
 /// notes Shorten "lacks ... support for multichannel ... and high
 /// sampling rates"; we cap above the realistic 2-channel use case

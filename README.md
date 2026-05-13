@@ -6,7 +6,7 @@ for the
 
 ## Status
 
-**Round 7 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
+**Round 8 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
 v2/v3 wire format pinned in `spec/00..05` (with v1 syntactically
 accepted; no v1 fixture is reachable to confirm the v1 layout).
 Encodes via a predictor-search + energy-width-optimised production
@@ -16,7 +16,10 @@ Round-6 64-bit-reservoir residual unpack lands a 2.13× decode
 speed-up on long blocks; round-7 fused SoA stereo write lands an
 additional 1.16× speed-up on the most common 2-channel shape.
 Mono / stereo / multi-channel PCM I/O across all eleven TR.156
-filetype labels.
+filetype labels. Round 8 adds container-level `seek_to` via a lazy
+`(pts, byte_offset)` frame index — Shorten's stateful predictor
+means the first one to two post-seek blocks may have an audible
+glitch from stale predictor state, but subsequent blocks converge.
 
 | Round | Adds                                                                                   |
 | ----- | -------------------------------------------------------------------------------------- |
@@ -27,6 +30,40 @@ filetype labels.
 | 5     | Bit-budget (`-n N`) / bit-rate (`-r N`) lossy encoder modes; LUT-driven `uvar` prefix decode. |
 | 6     | 64-bit-reservoir residual unpack (`u64::leading_zeros`); 2.13× decode throughput on 4 KB+ blocks. |
 | 7     | Fused SoA stereo decode (strided write, no end-of-stream interleave pass); 1.16× decode throughput on stereo 4 KB+ blocks. |
+| 8     | Container demuxer `seek_to` with a lazy frame index (`FRAME_INDEX_STRIDE = 10` block-rounds, ~58 ms granularity at 44.1 kHz / 256-sample blocks); seek is glitchy on the first 1–2 post-seek blocks (stale predictor state) but converges. |
+
+## What round 8 lands
+
+- **`Demuxer::seek_to` on the Shorten container.** The format has no
+  built-in seek table — TR.156 + the Hydrogenaudio feature row both
+  list "seeking" as a missing capability. The round-8 demuxer walks
+  the FN command stream on the first `seek_to` call, building a
+  `Vec<(pts, byte_offset)>` frame index with one entry every
+  `FRAME_INDEX_STRIDE = 10` per-channel block-rounds. With TR.156's
+  default 256-sample block size this lands an index point every
+  2 560 per-channel samples (~58 ms at 44 100 Hz); on a 5-minute
+  44.1 kHz mono file the cached index is under 1 KB.
+- **Lazy + cached.** The index lives behind `Option<Vec<…>>` on the
+  demuxer; subsequent `seek_to` calls reuse it (assertion-tested via
+  the `scan_count` counter). Binary search is `O(log n)` over the
+  cached entries; the second-and-later seek is essentially free.
+- **Predictor-state glitch.** Shorten's per-channel predictor and
+  carry buffer accumulate from byte 0 of the stream, so a clean
+  mid-stream seek would require either replaying from the start
+  (defeats the purpose) or a key-frame mechanism (not in the wire
+  format). The round-8 implementation accepts a transient glitch on
+  the first one to two blocks after the seek point; on most content
+  the predictor converges within ~256–512 samples. This is an
+  intrinsic cost of seeking a stateful predictor codec without a
+  key-frame mechanism — FLAC's SEEKTABLE pattern is not available
+  here.
+- **8 round-8 seek integration tests** in `tests/seek.rs`: seek-to-
+  zero, exact-boundary landing, mid-block containing-block landing,
+  past-end clamp, negative-pts clamp, invalid-stream rejection,
+  index-cached-on-second-call (the `frame_index_cached_on_second_seek_call`
+  test verifies the scan counter stays at 1 across 3 seeks), and
+  stereo per-channel-sample-pts bookkeeping. The crate ships **172
+  tests total** (up from 164).
 
 ## What round 7 lands
 

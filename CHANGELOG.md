@@ -8,6 +8,28 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-8 container demuxer `seek_to` with a lazy frame index. The
+  Shorten format has no built-in seek table (per the Hydrogenaudio
+  feature row); the demuxer now walks the FN command stream on
+  first `seek_to` call, builds a `Vec<(pts, byte_offset)>` index with
+  one entry every `FRAME_INDEX_STRIDE = 10` per-channel block-rounds
+  (~58 ms at 44 100 Hz on TR.156's default 256-sample block), and
+  binary-searches the cached index on subsequent calls. The seek
+  returns the largest indexed pts `<= target` and clamps below 0 /
+  past end to the boundary entries. Predictor + carry state is not
+  replayed across the cut: the first one to two post-seek blocks
+  decode with stale predictor state and may produce a transient
+  audible glitch on lossless content (this is the intrinsic cost of
+  seeking a stateful predictor codec without a key-frame mechanism;
+  the FLAC SEEKTABLE pattern is not available in Shorten's wire
+  format).
+- 8 round-8 seek integration tests in `tests/seek.rs` covering:
+  seek-to-zero, exact-boundary landing, mid-block containing-block
+  landing, past-end clamp, negative pts clamp, invalid stream
+  rejection, index-cached-on-second-call (scan-count counter), and
+  stereo per-channel-sample-pts bookkeeping. Crate ships **172 tests
+  total** (up from 164).
+
 - Round-7 fused SoA stereo / multi-channel decode path. The decoder
   no longer accumulates per-channel `Vec<i32>` buffers and runs an
   end-of-stream interleave pass; each per-channel block is written
