@@ -6,6 +6,20 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-shorten/releases/tag/v0.0.2) - 2026-05-13
+
+### Other
+
+- round 8 — container demuxer seek_to + lazy frame index
+- round 7 — fused SoA stereo decode (1.16× stereo)
+- round 6 — 64-bit-reservoir residual unpack (2.13× decode)
+- round 5 — bit-budget / bit-rate lossy modes + LUT uvar prefix
+- round 4 — running-mean estimator on encode side
+- round 3 — Levinson-Durbin LPC + lossy bitshift + corpus tests
+- round 2 — production encoder, all 11 filetypes, container demuxer
+- round 1 — clean-room decoder rebuild from docs/audio/shorten/
+- Round 0 — clean-room rebuild scaffold (orphan master)
+
 ### Added
 
 - Round-8 container demuxer `seek_to` with a lazy frame index. The
