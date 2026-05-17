@@ -131,7 +131,33 @@
 //!   speed-up** on this implementer's M-series macOS host (3.05 ms
 //!   → 2.64 ms best-of-5 for 524288 samples).
 //!
-//! ## What's intentionally out (deferred to round 8+)
+//! ## Round 9 additions
+//!
+//! * **64-bit-reservoir encoder `BitWriter64`** ([`crate::bitwriter64`]).
+//!   Symmetric to round 6's decoder reservoir reader. The round-2
+//!   single-bit `BitWriter` shifted into a single-byte accumulator
+//!   one bit at a time even when `write_bits(value, n)` was called
+//!   with `n > 1`; the round-9 reservoir writer keeps the unfinished
+//!   output in a left-justified `u64` accumulator and flushes
+//!   complete 8-byte chunks via `to_be_bytes`. **Throughput delta**:
+//!   stereo 4 KB-block × 64-block × 2-channel encode is **1.38×
+//!   faster** than round-8 master (14.12 ms → 10.27 ms best-of-5,
+//!   M-series macOS host, 524288 samples); the writer itself is
+//!   **2.77× faster** than the round-2 baseline on a 200 000-residual
+//!   `uvar(7)` microbench.
+//! * **DIFF0 ↔ running-mean correctness fix.** Rounds 4–8 had a
+//!   latent bug in `best_predictor_with_mean`: the round-4 mean-aware
+//!   DIFF0 candidate was *added on top* of the round-3 baseline set,
+//!   but the round-3 search's DIFF0 candidate produced residuals as
+//!   `block - 0` regardless of `mean_blocks`. When the round-3
+//!   baseline DIFF0 won the bit-cost race the encoder emitted DIFF0
+//!   with `block` residuals while the decoder's `s = r + mu_chan`
+//!   then offset every decoded sample by `mu_chan`. The round-9 fix
+//!   passes `mu_chan` down into `best_predictor` so its DIFF0
+//!   candidate always subtracts the at-block-start running mean —
+//!   bit-exactly mirroring the decoder.
+//!
+//! ## What's intentionally out (deferred to round 10+)
 //!
 //! * Format-version 1 / 3 wire-format deltas. No v1 or v3 fixture is
 //!   reachable in the docs corpus; v1 is syntactically accepted (per
@@ -155,6 +181,7 @@
 
 mod bitreader;
 mod bitstream64;
+mod bitwriter64;
 mod decoder;
 mod encoder;
 mod error;
@@ -221,3 +248,6 @@ mod round6_tests;
 
 #[cfg(test)]
 mod round7_tests;
+
+#[cfg(test)]
+mod round9_tests;

@@ -91,11 +91,12 @@
 //! * Skip-bytes (`H_skipbytes`). Verbatim-prefix bytes are emitted
 //!   via `BLOCK_FN_VERBATIM` instead.
 
+use crate::bitwriter64::BitWriter64;
 use crate::decoder::fn_code;
 use crate::header::{Filetype, MAGIC};
 use crate::varint::{
-    signed_to_unsigned, BITSHIFTSIZE, ENERGYSIZE, FNSIZE, LPCQSIZE, LPCQUANT, ULONGSIZE,
-    VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE,
+    signed_to_unsigned, BITSHIFTSIZE, ENERGYSIZE, FNSIZE, LPCQSIZE, LPCQUANT, VERBATIM_BYTE_SIZE,
+    VERBATIM_CHUNK_SIZE,
 };
 
 /// Encoder configuration.
@@ -346,7 +347,13 @@ fn measure_bps_for_shift(
             lane.iter().map(|&s| s >> shift).collect()
         };
         let carry = vec![0i32; carry_len];
-        let choice = best_predictor(&shifted, &carry, cfg.max_lpc_order);
+        // The bit-budget probe only evaluates the leading per-channel
+        // block, so the running-mean estimator value at that point is
+        // always 0 (the per-channel ring buffer starts zeroed). Pass
+        // `mu = 0` here; the post-block-1 running-mean drift is
+        // separately accounted for by `compute_effective_bshift`
+        // re-running on each call to `encode`.
+        let choice = best_predictor(&shifted, &carry, cfg.max_lpc_order, 0);
         if !choice.residuals.is_empty() {
             total_bits += cost_of_residuals(&choice.residuals, choice.width);
             total_residuals += choice.residuals.len() as u64;
@@ -438,7 +445,12 @@ pub fn encode(cfg: &EncoderConfig, samples: &[i32]) -> Result<Vec<u8>, EncodeErr
     out.extend_from_slice(&MAGIC);
     out.push(2u8);
 
-    let mut bw = BitWriter::new();
+    // Round-9: switch the production encode path to the 64-bit
+    // reservoir bit writer. Capacity hint based on the per-sample
+    // bit cost ceiling of a 32-bit residual plus modest overhead so
+    // the output `Vec<u8>` rarely re-allocates on long encodes.
+    let est_bytes = (total_per_ch * nch * 5) + 64;
+    let mut bw = BitWriter64::with_capacity(est_bytes);
 
     // Header parameter block.
     bw.write_ulong(cfg.filetype.to_code());
@@ -596,6 +608,17 @@ pub(crate) fn push_block_mean(buf: &mut [i32], mu_blk: i32) {
 /// with the round-4 mean-aware DIFF0 candidate (residual `s - mu_chan`)
 /// and a `BLOCK_FN_ZERO` short-circuit when the entire block equals
 /// `mu_chan`.
+///
+/// **Round-9 correctness fix.** Previous rounds called `best_predictor`
+/// unconditionally and *added* the mean-aware DIFF0 candidate on top.
+/// But `best_predictor`'s DIFF0 candidate computes residuals as
+/// `block - 0` regardless of `mean_blocks`, while the decoder applies
+/// `s = r + mu_chan` on every DIFF0 — so emitting that round-3
+/// DIFF0 with `mean_blocks > 0` produces a decoded stream offset by
+/// `mu_chan`. The fix forces `best_predictor` into "mu = mu_chan"
+/// mode (passing the running-mean value down) and only adds the
+/// DIFF0 candidate with mean-aware residuals, never the round-3
+/// `block - 0` one.
 fn best_predictor_with_mean(
     block: &[i32],
     carry: &[i32],
@@ -617,65 +640,35 @@ fn best_predictor_with_mean(
             residuals: Vec::new(),
         };
     }
-
-    let mut best = best_predictor(block, carry, max_lpc_order);
-
-    // Recompute DIFF0 candidate with the running-mean offset. For
-    // `mean_blocks == 0` `mu_chan` is always 0 and this re-evaluates
-    // to exactly the round-3 DIFF0 candidate; for `mean_blocks > 0`
-    // it may beat the round-3 baseline because the residual stream
-    // is `s - mu_chan` which is centred near zero on DC-active
-    // signals.
-    if mean_blocks > 0 {
-        let residuals: Vec<i32> = block.iter().map(|&s| s.wrapping_sub(mu_chan)).collect();
-        let width = pick_width(&residuals);
-        let cost = cost_of_residuals(&residuals, width);
-        // Match the overhead accounting in `best_predictor`.
-        let overhead = 1 + FNSIZE as u64 + 1 + ENERGYSIZE as u64;
-        let total = cost.saturating_add(overhead);
-        let best_cost = predictor_cost(&best);
-        if total < best_cost {
-            best = PredictorChoice {
-                fn_code: fn_code::DIFF0,
-                lpc_order: 0,
-                lpc_coefs: Vec::new(),
-                width,
-                residuals,
-            };
-        }
-    }
-    best
-}
-
-/// Back-compute a candidate's emission cost — keeps the round-4
-/// short-circuit comparisons honest against the round-3 search's
-/// best.
-fn predictor_cost(choice: &PredictorChoice) -> u64 {
-    if choice.fn_code == fn_code::ZERO {
-        return (1 + FNSIZE) as u64;
-    }
-    let body = cost_of_residuals(&choice.residuals, choice.width);
-    let mut overhead = 1 + FNSIZE as u64 + 1 + ENERGYSIZE as u64;
-    if choice.fn_code == fn_code::QLPC {
-        overhead += 1
-            + LPCQSIZE as u64
-            + choice
-                .lpc_coefs
-                .iter()
-                .map(|&c| svar_cost(c, LPCQUANT))
-                .sum::<u64>();
-    }
-    body.saturating_add(overhead)
+    // Pass `mu_chan` into `best_predictor` so its DIFF0 candidate
+    // produces `block - mu_chan` residuals — matching the decoder's
+    // `s = r + mu_chan` recurrence. For `mean_blocks == 0` `mu_chan`
+    // is always 0 and this reduces to the round-3 behaviour.
+    let mu = if mean_blocks > 0 { mu_chan } else { 0 };
+    best_predictor(block, carry, max_lpc_order, mu)
 }
 
 /// Search for the predictor + width pair that minimises the per-block
 /// bit cost.
-fn best_predictor(block: &[i32], carry: &[i32], max_lpc_order: u32) -> PredictorChoice {
+///
+/// `mu` is the at-block-start running-mean estimator value; for
+/// `mean_blocks == 0` it is always 0 (round-3 wire format). The
+/// **DIFF0** predictor produces residuals as `block - mu` because the
+/// decoder applies `s = r + mu` on DIFF0. The other polynomial
+/// predictors (DIFF1..3) and QLPC do not touch the running mean —
+/// their decoder counterparts ignore `mu`.
+fn best_predictor(block: &[i32], carry: &[i32], max_lpc_order: u32, mu: i32) -> PredictorChoice {
     let mut best: Option<(u64, PredictorChoice)> = None;
 
-    // Polynomial-difference candidates: DIFF0..DIFF3.
+    // Polynomial-difference candidates: DIFF0..DIFF3. DIFF0's
+    // residuals subtract the running mean so the decoder's
+    // `s = r + mu` recurrence round-trips bit-exactly.
     for poly_order in 0u32..=3 {
-        let residuals = compute_diff_residuals(poly_order, carry, block);
+        let residuals = if poly_order == 0 {
+            block.iter().map(|&s| s.wrapping_sub(mu)).collect()
+        } else {
+            compute_diff_residuals(poly_order, carry, block)
+        };
         let width = pick_width(&residuals);
         let cost = cost_of_residuals(&residuals, width);
         // Add a small fixed overhead for the command + energy field
@@ -1008,7 +1001,7 @@ fn cost_of_residuals(residuals: &[i32], n: u32) -> u64 {
 
 /// Emit one predictor block (header + residuals) using the chosen
 /// candidate.
-fn emit_block(bw: &mut BitWriter, choice: &PredictorChoice) {
+fn emit_block(bw: &mut BitWriter64, choice: &PredictorChoice) {
     bw.write_uvar(choice.fn_code, FNSIZE);
     // BLOCK_FN_ZERO is parameter-less — emit just the function code.
     if choice.fn_code == fn_code::ZERO {
@@ -1028,8 +1021,34 @@ fn emit_block(bw: &mut BitWriter, choice: &PredictorChoice) {
     }
 }
 
+/// Bit-sink abstraction so [`write_verbatim`] can target both the
+/// round-9 production [`BitWriter64`] and the round-2 single-bit
+/// `BitWriter` (kept under `#[cfg(test)]` for the byte-by-byte
+/// cross-check in `bitwriter64.rs` + the round-1 `encode_minimal` /
+/// `encode_with_bitshift_and_zero` / `encode_qlpc_block` test
+/// helpers). Only the `uvar` write surface is needed by the helpers
+/// here.
+trait UvarSink {
+    fn write_uvar(&mut self, value: u32, n: u32);
+}
+
+impl UvarSink for BitWriter64 {
+    #[inline]
+    fn write_uvar(&mut self, value: u32, n: u32) {
+        BitWriter64::write_uvar(self, value, n)
+    }
+}
+
+#[cfg(test)]
+impl UvarSink for BitWriter {
+    #[inline]
+    fn write_uvar(&mut self, value: u32, n: u32) {
+        BitWriter::write_uvar(self, value, n)
+    }
+}
+
 /// Append a verbatim chunk to `bw`.
-fn write_verbatim(bw: &mut BitWriter, bytes: &[u8]) {
+fn write_verbatim<W: UvarSink>(bw: &mut W, bytes: &[u8]) {
     let max_chunk = (1u32 << VERBATIM_CHUNK_SIZE) - 1; // mantissa cap; prefix can grow.
                                                        // Even with a wider chunk-length field we keep emission simple by
                                                        // chunking into sub-pieces that fit a moderate prefix budget.
@@ -1068,15 +1087,27 @@ fn update_carry(carry: &mut [i32], block: &[i32]) {
 }
 
 // ───────────────────────── BitWriter ─────────────────────────
+//
+// Round-9: the production encoder uses the 64-bit reservoir
+// [`crate::bitwriter64::BitWriter64`] for its hot path. The round-2
+// single-bit BitWriter survives only as a reference implementation
+// for the cross-check tests in `bitwriter64.rs` (verifying byte-exact
+// equivalence) and as a scaffold for the `#[cfg(test)]`
+// `encode_minimal` / `encode_with_bitshift_and_zero` /
+// `encode_qlpc_block` helpers the round-1 + round-3 test corpora
+// invoke. Hence the entire type is `#[cfg(test)]`-gated.
 
-/// MSB-first bit packer. Public-within-crate so encoder helpers can
-/// reuse it; not exported.
+/// MSB-first bit packer (test-only since round 9). Round-2 production
+/// encoder used this directly; round 9 switched the production hot
+/// path to [`crate::bitwriter64::BitWriter64`].
+#[cfg(test)]
 pub(crate) struct BitWriter {
     bytes: Vec<u8>,
     cur: u8,
     cur_bits: u8,
 }
 
+#[cfg(test)]
 impl BitWriter {
     pub(crate) fn new() -> Self {
         Self {
@@ -1141,7 +1172,7 @@ impl BitWriter {
         if w > 16 {
             w = 16;
         }
-        self.write_uvar(w, ULONGSIZE);
+        self.write_uvar(w, crate::varint::ULONGSIZE);
         self.write_uvar(value, w);
     }
 }

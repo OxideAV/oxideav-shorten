@@ -6,7 +6,7 @@ for the
 
 ## Status
 
-**Round 8 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
+**Round 9 — clean-room rebuild from `docs/audio/shorten/`.** Decodes
 v2/v3 wire format pinned in `spec/00..05` (with v1 syntactically
 accepted; no v1 fixture is reachable to confirm the v1 layout).
 Encodes via a predictor-search + energy-width-optimised production
@@ -15,11 +15,14 @@ estimator, and round-5 bit-budget / bit-rate target lossy modes.
 Round-6 64-bit-reservoir residual unpack lands a 2.13× decode
 speed-up on long blocks; round-7 fused SoA stereo write lands an
 additional 1.16× speed-up on the most common 2-channel shape.
-Mono / stereo / multi-channel PCM I/O across all eleven TR.156
-filetype labels. Round 8 adds container-level `seek_to` via a lazy
-`(pts, byte_offset)` frame index — Shorten's stateful predictor
-means the first one to two post-seek blocks may have an audible
-glitch from stale predictor state, but subsequent blocks converge.
+Round-9 adds a symmetric 64-bit-reservoir **encoder** BitWriter
+(1.38× stereo encode wallclock speed-up; the writer itself is 2.77×
+the round-2 single-bit implementation on a 200 000-residual
+microbench) and fixes a latent DIFF0+running-mean correctness bug
+that mis-offset decoded samples by `mu_chan` whenever the round-3
+DIFF0 baseline candidate won the bit-cost race over the round-4
+mean-aware DIFF0. Mono / stereo / multi-channel PCM I/O across all
+eleven TR.156 filetype labels.
 
 | Round | Adds                                                                                   |
 | ----- | -------------------------------------------------------------------------------------- |
@@ -31,6 +34,54 @@ glitch from stale predictor state, but subsequent blocks converge.
 | 6     | 64-bit-reservoir residual unpack (`u64::leading_zeros`); 2.13× decode throughput on 4 KB+ blocks. |
 | 7     | Fused SoA stereo decode (strided write, no end-of-stream interleave pass); 1.16× decode throughput on stereo 4 KB+ blocks. |
 | 8     | Container demuxer `seek_to` with a lazy frame index (`FRAME_INDEX_STRIDE = 10` block-rounds, ~58 ms granularity at 44.1 kHz / 256-sample blocks); seek is glitchy on the first 1–2 post-seek blocks (stale predictor state) but converges. |
+| 9     | 64-bit-reservoir **encoder** `BitWriter64` (symmetric to round 6's reader); 1.38× stereo encode wallclock (14.12 ms → 10.27 ms best-of-5 for 64×4096 samples); fixes DIFF0+running-mean ±`mu_chan` correctness bug. |
+
+## What round 9 lands
+
+- **64-bit-reservoir encoder `BitWriter64`** — symmetric to round 6's
+  decoder reservoir. The round-2 `BitWriter` shifted into a single-byte
+  accumulator one bit at a time even when `write_bits(value, n)` was
+  called with `n > 1`, paying a per-bit load-mask-store-branch cost on
+  every mantissa bit emitted. The new
+  [`crate::bitwriter64`](src/bitwriter64.rs) `BitWriter64` keeps the
+  unfinished output in a left-justified `u64` accumulator and flushes
+  complete 8-byte chunks via `to_be_bytes`. Long zero prefixes drain in
+  64-bit-zero chunks rather than per-bit.
+- **Throughput delta**: stereo 4 KB-block × 64-block × 2-channel encode
+  is **1.38× faster** than round-8 master (14.12 ms → 10.27 ms
+  best-of-5 on an M-series macOS host for 524288 samples; release).
+  The writer itself, measured on a 200 000-residual `uvar(7)`
+  microbench, is **2.77× faster** than the round-2 single-bit
+  implementation (717 µs → 259 µs). Default-on; no Cargo feature
+  gate.
+- **DIFF0 ↔ running-mean correctness fix.** Rounds 4–8 had a latent
+  bug in `encoder::best_predictor_with_mean`: the round-4 mean-aware
+  DIFF0 candidate (`block - mu_chan`) was *added on top* of the
+  round-3 baseline candidate set, but the round-3 search's DIFF0
+  candidate produced residuals as `block - 0` regardless of
+  `mean_blocks`. When the round-3 baseline DIFF0 won the bit-cost
+  race the encoder emitted DIFF0 with `block` residuals, while the
+  decoder's `s = r + mu_chan` on DIFF0 then offset every decoded
+  sample by `mu_chan`. The round-9 fix passes `mu_chan` down into
+  `best_predictor` so its DIFF0 candidate always subtracts the
+  at-block-start running mean — bit-exactly mirroring the decoder.
+  The bug was masked by the existing corpus because every prior
+  combined-mean+LPC test either had `mu_chan == 0` at the failing
+  block, or used `bshift > 0` (which tightly bounded per-residual
+  cost and stopped the round-3 DIFF0 from ever winning).
+- **14 round-9 tests** covering: 7 BitWriter-swap byte-exact decode
+  equality fixtures (mono S16, stereo S16, mono U8, LPC order 4,
+  bshift lossy, 4 KB long encode, verbatim prefix); 4 DIFF0+mean
+  regression fixtures including a sweep over
+  `mean_blocks ∈ {1,2,4,8,16} × max_lpc_order ∈ {0,2,3,4} × blocksize
+  ∈ {64,128,256} × channels ∈ {1,2}` = 120 round-trips and the
+  specific PRNG seed that surfaced the bug; a 4096-block × 64-block
+  encode throughput floor (asserts < 3 s); a `_print` best-of-5
+  wallclock; and a side-by-side BitWriter64-vs-BitWriter bench with a
+  1.2× speed floor. The cross-check tests in `bitwriter64.rs` add 8
+  more (byte-by-byte writer equivalence across randomised
+  `write_bits` and `write_uvar` matrices). Crate ships **194 tests
+  total** (up from 172).
 
 ## What round 8 lands
 
@@ -202,7 +253,7 @@ glitch from stale predictor state, but subsequent blocks converge.
   demuxer reads the entire input into a single packet — Shorten has no
   internal framing — and lets the codec decoder unpack the bit stream.
 
-## What's not yet implemented (round 8+ candidates)
+## What's not yet implemented (round 10+ candidates)
 
 - **Bit-stream-corpus byte-exact decode** of the public `.shn` fixture
   set. Round 4 closes audit/01 §8.1's ±1 drift in the *internal*

@@ -8,6 +8,62 @@ versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Round-9 64-bit-reservoir encoder `BitWriter64` (symmetric to round
+  6's decoder `Bitstream64`). The round-2 single-bit `BitWriter` is
+  retired from the production encode path and lives only under
+  `#[cfg(test)]` as a byte-by-byte cross-check baseline. The new
+  writer keeps the unfinished output in a left-justified `u64`
+  accumulator and flushes complete 8-byte chunks via
+  `to_be_bytes` — `write_bits(value, n)` and `write_uvar(value, n)`
+  emit `n` mantissa bits + 1 terminator in a single combined write
+  on the common short-prefix path; long zero prefixes drain whole
+  8-byte zero chunks. **Throughput delta**: stereo 4 KB-block ×
+  64-block × 2-channel encode is **1.38× faster** than round-8
+  master (14.12 ms → 10.27 ms best-of-5, M-series macOS host,
+  release, 524288 samples); the writer itself is **2.77× faster**
+  than the round-2 single-bit baseline on a 200 000-residual
+  `uvar(7)` microbench (717 µs → 259 µs). Default-on; no Cargo
+  feature gate.
+- 14 round-9 tests: 7 BitWriter-swap byte-exact decode equality
+  fixtures (mono S16 lossless, stereo S16 lossless, mono U8, LPC
+  order 4, bshift=4 lossy, 4 KB-block × 8-block × stereo long
+  encode, verbatim prefix); 4 DIFF0+mean regression fixtures (mono
+  lpc=3 bs=128 PRNG-reproduced bug seed, stereo lpc=3 bs=128, full
+  `mean_blocks × lpc_order × blocksize × channels` matrix sweep
+  = 120 inner round-trips, and DIFF0+mean composition with
+  `with_bshift`); throughput floor (< 3 s for 524288 samples) and
+  `_print` best-of-5 wallclock; and a side-by-side
+  BitWriter64-vs-BitWriter bench with a 1.2× speed floor. The
+  cross-check tests in `bitwriter64.rs` add 8 more (byte-by-byte
+  writer equivalence across randomised `write_bits` and
+  `write_uvar` matrices, plus round-trip via the production
+  `BitReader`). Crate ships **194 tests total** (up from 172).
+
+### Fixed
+
+- **Round-9 DIFF0 ↔ running-mean correctness fix.** Master
+  rounds 4–8 had a latent bug in
+  `encoder::best_predictor_with_mean`: the round-4 mean-aware DIFF0
+  candidate (`block - mu_chan`) was *added on top* of the round-3
+  baseline candidate set, but the round-3 search's DIFF0 candidate
+  produced residuals as `block - 0` regardless of `mean_blocks`.
+  When the round-3 baseline DIFF0 won the bit-cost race the encoder
+  emitted DIFF0 with `block` residuals, while the decoder's
+  `s = r + mu_chan` on DIFF0 then offset every decoded sample by
+  `mu_chan` from that block forward. The round-9 fix passes
+  `mu_chan` into `best_predictor` so its DIFF0 candidate always
+  subtracts the at-block-start running mean — bit-exactly mirroring
+  the decoder; the duplicate mean-aware DIFF0 in
+  `best_predictor_with_mean` is removed (it now reduces to a
+  `BLOCK_FN_ZERO` short-circuit + a delegating call into the
+  mu-aware `best_predictor`). The bug was masked by the round-4
+  corpus because every prior combined-mean+LPC test either had
+  `mu_chan == 0` at the failing block or used `bshift > 0`
+  (tight per-residual cost bound that prevented the round-3 DIFF0
+  from winning). The new
+  `round9_diff0_mean_correctness_matrix` sweeps 120 combinations
+  to pin the fix.
+
 - Round-8 container demuxer `seek_to` with a lazy frame index. The
   Shorten format has no built-in seek table (per the Hydrogenaudio
   feature row); the demuxer now walks the FN command stream on
