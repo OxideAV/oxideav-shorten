@@ -1,0 +1,15 @@
+# release-plz config — https://release-plz.dev/docs/config
+
+[workspace]
+changelog_path = "./CHANGELOG.md"
+allow_dirty = false
+
+git_tag_name = "v{{ version }}"
+git_release_name = "v{{ version }}"
+
+# Stay on the 0.0.x train. The Shorten decoder is brand-new and the
+# public surface is deliberately thin (decoder factory + register());
+# round-by-round work will keep churning the internals. Skip the
+# semver-driven bump so release-plz acts only on conventional-commit
+# hints (fix: → patch). When the API stabilises, drop this line.
+semver_check = false
