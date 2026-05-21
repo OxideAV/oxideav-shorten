@@ -27,6 +27,18 @@ pub enum Error {
     /// of this magnitude — `spec/01` §3's six header fields are all
     /// small integers in practice.
     OverflowingUvar,
+    /// The per-block command stream named a function code outside the
+    /// 0..=9 set pinned in `spec/03` §3 / `spec/04`. v2/v3 encoders
+    /// never emit codes outside that set; receiving one is either
+    /// stream corruption or an out-of-scope format-version feature.
+    UnknownFunctionCode(u32),
+    /// Round 2 lands the verbatim and quit commands of `spec/03`; the
+    /// predictor and LPC commands (codes 0..3, 7) plus the
+    /// housekeeping commands (5, 6, 8) are not yet decoded. The block
+    /// reader surfaces this error when one of the not-yet-implemented
+    /// codes is encountered so the caller knows the stream needs a
+    /// later round's command set.
+    BlockCommandNotImplemented(u32),
     /// Round 1 does not decode the per-block command stream that
     /// follows the parameter block. Returned from any non-header API
     /// surface that the orphan-rebuild scaffold has not wired up yet.
@@ -44,6 +56,13 @@ impl core::fmt::Display for Error {
             Error::OverflowingUvar => {
                 f.write_str("oxideav-shorten: header uvar prefix exceeded safety cap")
             }
+            Error::UnknownFunctionCode(c) => {
+                write!(f, "oxideav-shorten: unknown per-block function code {c}")
+            }
+            Error::BlockCommandNotImplemented(c) => write!(
+                f,
+                "oxideav-shorten: per-block function code {c} not implemented in this round"
+            ),
             Error::NotImplemented => f.write_str(
                 "oxideav-shorten: feature not implemented in this round (file-header parser only)",
             ),

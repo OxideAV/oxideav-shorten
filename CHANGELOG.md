@@ -8,6 +8,33 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 2 clean-room rebuild.** Per-block command stream — first
+  slice — landed against `docs/audio/shorten/spec/02` §2.2 / §4.1 /
+  §4.5 + `spec/03` §3.8 / §3.10 + `spec/04` §2:
+  - `BitReader::read_svar(n)` — signed variable-length reader using
+    the one's-complement folding pinned in `spec/02` §2.2 (even
+    unsigned → non-negative, odd unsigned → negative). Verified
+    against the §2.2 example sequence and the n=0/n=2 boundary
+    cases.
+  - `FunctionCode` enum naming all ten v2/v3 codes 0..=9
+    (`BLOCK_FN_DIFF0..3`, `BLOCK_FN_QUIT`, `BLOCK_FN_BLOCKSIZE`,
+    `BLOCK_FN_BITSHIFT`, `BLOCK_FN_QLPC`, `BLOCK_FN_ZERO`,
+    `BLOCK_FN_VERBATIM`) + `advances_channel_cursor()` matching the
+    `spec/03` §3 per-command clauses.
+  - `read_function_code()` reads + classifies one command-header
+    field (`uvar(FNSIZE = 2)`).
+  - `read_verbatim_payload()` — full payload decode for
+    `BLOCK_FN_VERBATIM`: length `uvar(VERBATIM_CHUNK_SIZE = 5)` +
+    `length × uvar(VERBATIM_BYTE_SIZE = 8)` opaque bytes. Embeds
+    fixture `F1`'s 44-byte verbatim payload as a structural anchor
+    (the spec/02 §4.1 / §4.5 `T6` decode) and round-trips it.
+  - `Error::UnknownFunctionCode` / `Error::BlockCommandNotImplemented`
+    surface for out-of-range or not-yet-implemented codes.
+  - One integration test (`tests/header_then_verbatim.rs`)
+    composing the header parse + post-header bit-alignment +
+    VERBATIM + QUIT command sequence end-to-end.
+  - Total test count: 13 → 26 (25 unit + 1 integration).
+
 - **Round 1 clean-room rebuild.** File-header parser landed against
   `docs/audio/shorten/spec/01-stream-header.md` + `spec/02`:
   - `parse_stream_header(bytes)` returns the parsed
@@ -38,8 +65,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Next
 
-- `svar(n)` signed reader + per-block command stream (`spec/03`).
-- Function-code resolution against the nine-fixture corpus
-  (`spec/04`).
-- Predictor + Rice residual decode (`spec/03` + `spec/05`).
+- Predictor commands `BLOCK_FN_DIFF0..3` + Rice residual decode
+  (`spec/03` §3.1..3.4 + `spec/05` §3).
+- Per-channel sample-history carry (`spec/03` §3.11 / `spec/05` §1)
+  and running mean estimator (`spec/03` §3.12 / `spec/05` §2).
+- `BLOCK_FN_QLPC` quantised LPC predictor (`spec/03` §3.5).
+- Housekeeping commands `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT`
+  / `BLOCK_FN_ZERO` payload state mutation (`spec/03` §3.6 / §3.7 /
+  §3.9).
 - `oxideav-core` `Decoder` / `Encoder` integration (registry wiring).

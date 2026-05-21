@@ -9,7 +9,7 @@
 //! at file offset `0x05` onward — the header parser handles the
 //! byte-aligned magic + version field separately.
 //!
-//! Round 1 implements the three primitives the file-header parser
+//! Round 1 implemented the three primitives the file-header parser
 //! needs:
 //!
 //! * [`BitReader::read_bit`] — one bit, MSB-first.
@@ -24,8 +24,11 @@
 //!   value `v = uvar(w)`. `ULONGSIZE = 2` is the wire constant
 //!   pinned in spec/02 §3 + §5.
 //!
-//! Signed `svar` and the per-block primitives are out of round-1
-//! scope and will be added when the per-block command stream lands.
+//! Round 2 adds:
+//!
+//! * [`BitReader::read_svar`] — the signed `svar(n)` form of
+//!   spec/02 §2.2 (one's-complement folding: even unsigned -> non-
+//!   negative `s = u >> 1`, odd unsigned -> negative `s = !(u >> 1)`).
 
 use crate::error::{Error, Result};
 
@@ -179,6 +182,32 @@ impl<'a> BitReader<'a> {
         }
         self.read_uvar(w)
     }
+
+    /// `svar(n)` per spec/02 §2.2: read an unsigned `uvar(n)` value
+    /// `u` then unfold it back to a signed integer.
+    ///
+    /// The folding spec/02 §2.2 pins (verified byte-exact on fixture
+    /// `F1`'s verbatim-prefix recovery) is:
+    ///
+    /// * If `u` is even: `s = u >> 1` (non-negative).
+    /// * If `u` is odd:  `s = !(u >> 1)` (negative; equals
+    ///   `-((u >> 1) + 1)`).
+    ///
+    /// The folded `u` can occupy any value `u32` admits; the signed
+    /// `s` is widened to `i64` so that `u = u32::MAX` (which maps to
+    /// `s = -(2^31)`) does not lose precision against an `i32`
+    /// surface. Per-block residuals and quantised LPC coefficients of
+    /// spec/03 will narrow to `i32` at the predictor boundary; this
+    /// reader only undoes the folding.
+    pub fn read_svar(&mut self, n: u32) -> Result<i64> {
+        let u = self.read_uvar(n)?;
+        let mag = (u >> 1) as i64;
+        if u & 1 == 0 {
+            Ok(mag)
+        } else {
+            Ok(!mag)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +296,94 @@ mod tests {
         let bytes2 = [0b0000_0100];
         let mut r2 = BitReader::new(&bytes2);
         assert_eq!(r2.read_uvar(0).unwrap(), 5);
+    }
+
+    #[test]
+    fn read_svar_unfolds_one_complement_per_spec02_2_2() {
+        // spec/02 §2.2 — the one's-complement folding:
+        //   u = 0 -> s =  0
+        //   u = 1 -> s = -1
+        //   u = 2 -> s =  1
+        //   u = 3 -> s = -2
+        //   u = 4 -> s =  2
+        //   u = 5 -> s = -3
+        //
+        // Build a buffer of consecutive `uvar(0)` codes (each = unary
+        // count + terminator), then read them back as `svar(0)`. The
+        // n=0 form is the smallest-width case and the easiest to
+        // hand-pack:
+        //   u = 0 -> bits "1"
+        //   u = 1 -> bits "01"
+        //   u = 2 -> bits "001"
+        //   u = 3 -> bits "0001"
+        //   u = 4 -> bits "00001"
+        //   u = 5 -> bits "000001"
+        //
+        // Concatenated: 1 01 001 0001 00001 000001 = 21 bits, packed
+        // MSB-first into 3 bytes.
+        let bits = [
+            1, // u=0
+            0, 1, // u=1
+            0, 0, 1, // u=2
+            0, 0, 0, 1, // u=3
+            0, 0, 0, 0, 1, // u=4
+            0, 0, 0, 0, 0, 1, // u=5
+        ];
+        let mut buf = Vec::new();
+        let mut byte = 0u8;
+        let mut n = 0u32;
+        for &b in &bits {
+            byte = (byte << 1) | (b as u8);
+            n += 1;
+            if n == 8 {
+                buf.push(byte);
+                byte = 0;
+                n = 0;
+            }
+        }
+        if n > 0 {
+            buf.push(byte << (8 - n));
+        }
+        let mut r = BitReader::new(&buf);
+        for &expected in &[0i64, -1, 1, -2, 2, -3] {
+            assert_eq!(r.read_svar(0).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn read_svar_n2_examples() {
+        // Pack uvar(2) codes for u = 0..=4, decode as svar(2):
+        //   u=0 -> "1 00" -> s = 0
+        //   u=1 -> "1 01" -> s = -1
+        //   u=2 -> "1 10" -> s = 1
+        //   u=3 -> "1 11" -> s = -2
+        //   u=4 -> "0 1 00" -> s = 2
+        let bits = [
+            1, 0, 0, // u=0
+            1, 0, 1, // u=1
+            1, 1, 0, // u=2
+            1, 1, 1, // u=3
+            0, 1, 0, 0, // u=4
+        ];
+        let mut buf = Vec::new();
+        let mut byte = 0u8;
+        let mut n = 0u32;
+        for &b in &bits {
+            byte = (byte << 1) | (b as u8);
+            n += 1;
+            if n == 8 {
+                buf.push(byte);
+                byte = 0;
+                n = 0;
+            }
+        }
+        if n > 0 {
+            buf.push(byte << (8 - n));
+        }
+        let mut r = BitReader::new(&buf);
+        for &expected in &[0i64, -1, 1, -2, 2] {
+            assert_eq!(r.read_svar(2).unwrap(), expected);
+        }
     }
 
     #[test]
