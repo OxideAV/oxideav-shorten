@@ -33,12 +33,30 @@ pub enum Error {
     /// stream corruption or an out-of-scope format-version feature.
     UnknownFunctionCode(u32),
     /// Round 2 lands the verbatim and quit commands of `spec/03`; the
-    /// predictor and LPC commands (codes 0..3, 7) plus the
-    /// housekeeping commands (5, 6, 8) are not yet decoded. The block
-    /// reader surfaces this error when one of the not-yet-implemented
-    /// codes is encountered so the caller knows the stream needs a
-    /// later round's command set.
+    /// LPC predictor (code 7) and the housekeeping commands that
+    /// mutate per-stream state (`BLOCK_FN_BLOCKSIZE = 5`,
+    /// `BLOCK_FN_BITSHIFT = 6`, `BLOCK_FN_ZERO = 8`) are not yet
+    /// decoded. Round 3 closes the polynomial-difference predictors
+    /// (codes 0..3); the other commands still surface this error.
     BlockCommandNotImplemented(u32),
+    /// A `BLOCK_FN_DIFFn` / `BLOCK_FN_QLPC` energy parameter decoded
+    /// to a value whose `+1`-adjusted residual mantissa width would
+    /// exceed the implementation's safety cap. `spec/02` §4.2 pins
+    /// the field as `uvar(ENERGYSIZE = 3)` and `spec/05` §3 pins the
+    /// `+1` adjustment; legitimate encoder choices produce widths well
+    /// below the cap.
+    EnergyTooLarge(u32),
+    /// A per-block sample count exceeded the implementation's safety
+    /// cap. `H_blocksize` in TR.156's reference encoder defaults to 256
+    /// and is bounded by the encoder side; an over-cap value indicates
+    /// either stream corruption or a sub-block-size override outside
+    /// the cap.
+    BlockTooLarge(u32),
+    /// A reconstructed predictor sample fell outside the `i32` range
+    /// the carry buffer stores. Reachable only for pathological inputs
+    /// (the `i64`-headroom reconstruction intermediate guards against
+    /// the recurrence's worst-case intermediates).
+    SampleOverflow,
     /// Round 1 does not decode the per-block command stream that
     /// follows the parameter block. Returned from any non-header API
     /// surface that the orphan-rebuild scaffold has not wired up yet.
@@ -63,6 +81,17 @@ impl core::fmt::Display for Error {
                 f,
                 "oxideav-shorten: per-block function code {c} not implemented in this round"
             ),
+            Error::EnergyTooLarge(e) => write!(
+                f,
+                "oxideav-shorten: residual mantissa width derived from energy {e} exceeds safety cap"
+            ),
+            Error::BlockTooLarge(bs) => write!(
+                f,
+                "oxideav-shorten: per-block sample count {bs} exceeds safety cap"
+            ),
+            Error::SampleOverflow => {
+                f.write_str("oxideav-shorten: reconstructed sample fell outside i32 range")
+            }
             Error::NotImplemented => f.write_str(
                 "oxideav-shorten: feature not implemented in this round (file-header parser only)",
             ),
