@@ -29,7 +29,7 @@
 
 use oxideav_shorten::{
     decode_diff_block, parse_stream_header, read_function_code, BitReader, ChannelCarry,
-    FunctionCode, PolyOrder, ENERGYSIZE, FNSIZE, MAGIC,
+    FunctionCode, MeanEstimator, PolyOrder, ENERGYSIZE, FNSIZE, MAGIC,
 };
 
 fn pack_bits_msb_first(bits: &[u32]) -> Vec<u8> {
@@ -155,24 +155,30 @@ fn header_then_diff1_blocks_round_trip_with_channel_cursor() {
     let mut carries: Vec<ChannelCarry> = (0..parsed.header.channels)
         .map(|_| ChannelCarry::new(parsed.header.sample_history_carry_len() as usize))
         .collect();
+    let mut means: Vec<MeanEstimator> = (0..parsed.header.channels)
+        .map(|_| MeanEstimator::new(parsed.header.meanblocks))
+        .collect();
     let mut cursor: usize = 0;
     let bs = parsed.header.blocksize.min(4); // override locally to 4
                                              // for test fixtures.
 
     // We override `bs` here rather than emitting a BLOCK_FN_BLOCKSIZE
-    // command (that command's payload-state mutation isn't wired up in
-    // round 3); the integration test deliberately exercises only the
-    // DIFFn kernel + the per-channel cursor.
+    // command (that command's payload-state mutation isn't wired up
+    // yet); the integration test deliberately exercises only the
+    // DIFFn kernel + the per-channel cursor + the mean-estimator
+    // hand-off.
     let mut decoded: Vec<Vec<i32>> = Vec::new();
     let mut decoded_channels: Vec<usize> = Vec::new();
     for _ in 0..3 {
         let fc = read_function_code(&mut reader).expect("command code must classify");
         assert_eq!(fc, FunctionCode::Diff1);
         let order = PolyOrder::from_function_code(fc).expect("Diff1 maps to order 1");
-        let block = decode_diff_block(&mut reader, order, bs, &carries[cursor])
+        let mu_chan = means[cursor].mu_chan();
+        let block = decode_diff_block(&mut reader, order, bs, &carries[cursor], mu_chan)
             .expect("DIFFn payload must decode");
         assert_eq!(block.len(), bs as usize);
         carries[cursor].update_after_block(&block);
+        means[cursor].record_block(&block);
         decoded.push(block);
         decoded_channels.push(cursor);
         cursor = (cursor + 1) % (parsed.header.channels as usize);

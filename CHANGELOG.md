@@ -8,6 +8,36 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 4 clean-room rebuild.** Per-channel running mean estimator
+  landed against `docs/audio/shorten/spec/05-state-and-quirks.md` §2 +
+  §2.5 + §2.3 + §2.4:
+  - `MeanEstimator` — sliding-window per-channel mean buffer of length
+    `H_meanblocks`, zero-initialised at construction per `spec/05`
+    §2.1; `record_block(&block)` appends per-block mean and evicts the
+    oldest slot; `mu_chan()` returns the running mean of all slots.
+    Both per-block mean and running mean use the validation-corrected
+    arithmetic of `spec/05` §2.5 — `trunc_div(numerator + divisor/2,
+    divisor)` with C-semantics truncation toward zero and the
+    always-positive `+ divisor/2` bias regardless of numerator sign.
+  - `H_meanblocks = 0` disabled branch — `mu_chan()` always returns
+    zero, `record_block()` is a no-op (`spec/01` §3.5 / `spec/05`
+    §2.1).
+  - `decode_diff_block()` now takes a `mu_chan: i64` parameter,
+    consumed by `PolyOrder::Order0` per `spec/05` §2.3
+    (`s(t) = e₀(t) + mu_chan`) and ignored by the mean-invariant
+    orders 1..3 per `spec/05` §2 introductory paragraph.
+  - `fill_zero_block(bs, mu_chan)` — `BLOCK_FN_ZERO` payload helper
+    per `spec/05` §2.4: emits `bs` samples all equal to `mu_chan`.
+    The command carries no further wire bits after its function-code
+    field; the helper is called directly by the dispatch layer.
+  - New integration test (`tests/mean_estimator_pipeline.rs`)
+    exercising a single-channel DIFF0-ZERO-DIFF0-QUIT sequence with
+    `H_meanblocks = 4` and verifying that the running mean after each
+    block (6, then 8 after DIFF0+ZERO) drives the subsequent block's
+    samples bit-exactly.
+  - Total test count: 41 → 55 (52 unit + 3 integration; +13 unit +1
+    integration relative to round 3).
+
 - **Round 3 clean-room rebuild.** Polynomial-difference predictor
   kernels of orders 0..3 landed against
   `docs/audio/shorten/spec/03-block-and-predictor.md` §3.1..§3.4 +
@@ -103,14 +133,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Next
 
-- Running mean estimator sliding-window update (`spec/03` §3.12 /
-  `spec/05` §2.5) — required for the DIFF0 reconstruction to match
-  streams whose later DIFF0 blocks need a non-zero `mu_chan`.
 - `BLOCK_FN_QLPC` quantised LPC predictor (`spec/03` §3.5) — order +
   coefficients (`svar(LPCQUANT = 2)` × `order`) + energy + residuals.
 - Housekeeping commands `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT`
-  / `BLOCK_FN_ZERO` payload state mutation (`spec/03` §3.6 / §3.7 /
-  §3.9).
+  payload state mutation (`spec/03` §3.6 / §3.7). (`BLOCK_FN_ZERO`
+  payload is now wired in round 4 via `fill_zero_block`.)
 - Full per-fixture decode driver (header + block-stream loop +
   channel cursor + bit-shift sample reformatting + verbatim-prefix
   emission) → an `oxideav-core` `Decoder` impl + `register(ctx)`

@@ -35,9 +35,11 @@ pub enum Error {
     /// Round 2 lands the verbatim and quit commands of `spec/03`; the
     /// LPC predictor (code 7) and the housekeeping commands that
     /// mutate per-stream state (`BLOCK_FN_BLOCKSIZE = 5`,
-    /// `BLOCK_FN_BITSHIFT = 6`, `BLOCK_FN_ZERO = 8`) are not yet
-    /// decoded. Round 3 closes the polynomial-difference predictors
-    /// (codes 0..3); the other commands still surface this error.
+    /// `BLOCK_FN_BITSHIFT = 6`) are not yet decoded. Round 3 closes
+    /// the polynomial-difference predictors (codes 0..3); round 4
+    /// closes `BLOCK_FN_ZERO = 8` (via `fill_zero_block` + the round
+    /// 4 running-mean estimator). The remaining commands still
+    /// surface this error.
     BlockCommandNotImplemented(u32),
     /// A `BLOCK_FN_DIFFn` / `BLOCK_FN_QLPC` energy parameter decoded
     /// to a value whose `+1`-adjusted residual mantissa width would

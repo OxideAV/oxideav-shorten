@@ -1,12 +1,13 @@
 //! # oxideav-shorten
 //!
-//! **Status:** clean-room rebuild — round 3.
+//! **Status:** clean-room rebuild — round 4.
 //!
 //! The crate was orphan-rebuilt after the 2026-05-18 audit. Rounds
-//! 1+2+3 land the **file-header parser**, the per-block command
-//! dispatch, and the polynomial-difference predictor kernels of the
-//! integer-PCM decode path documented in
-//! `docs/audio/shorten/spec/01-stream-header.md` through `spec/05`:
+//! 1+2+3+4 land the **file-header parser**, the per-block command
+//! dispatch, the polynomial-difference predictor kernels, and the
+//! per-channel running mean estimator of the integer-PCM decode path
+//! documented in `docs/audio/shorten/spec/01-stream-header.md` through
+//! `spec/05`:
 //!
 //! * Round 1 — byte-aligned `ajkg` magic + one-byte format version
 //!   (`spec/01` §1), the six variable-length-integer parameter-block
@@ -25,26 +26,31 @@
 //!   carry (`spec/03` §3.11 / `spec/05` §1), the Rice-coded residual
 //!   decode with the `+1`-adjusted mantissa width (`spec/05` §3 / T15),
 //!   and the [`decode_diff_block`] entry point that ties them together.
-//!   The running mean estimator of `spec/05` §2 / §2.5 is **not**
-//!   wired up yet — DIFF0 reconstruction is `s(t) = e₀(t) + 0`, which
-//!   is byte-exact for the very first block of each channel since
-//!   `mu_chan` is initialised to zero per §2.1.
+//! * Round 4 — the per-channel running mean estimator
+//!   ([`MeanEstimator`]) of `spec/05` §2 + §2.5 with the
+//!   validation-corrected truncate-toward-zero `+ divisor/2` arithmetic
+//!   for both the per-block mean and the channel-wide running mean.
+//!   `decode_diff_block` now takes a `mu_chan: i64` parameter, consumed
+//!   by `PolyOrder::Order0` per `spec/05` §2.3 and ignored (mean-
+//!   invariant) by orders 1..3 per `spec/05` §2 introductory paragraph.
+//!   The new [`fill_zero_block`] helper emits `BLOCK_FN_ZERO`'s
+//!   payload — `bs` samples all equal to `mu_chan` per `spec/05` §2.4.
 //!
-//! Still pending beyond round 3: the running mean estimator
-//! (`spec/05` §2.5), the `BLOCK_FN_QLPC` predictor (`spec/03` §3.5),
-//! and the housekeeping commands `BLOCK_FN_BLOCKSIZE`,
-//! `BLOCK_FN_BITSHIFT`, `BLOCK_FN_ZERO` (`spec/03` §3.6 / §3.7 /
-//! §3.9).
+//! Still pending beyond round 4: the `BLOCK_FN_QLPC` predictor
+//! (`spec/03` §3.5) and the housekeeping commands `BLOCK_FN_BLOCKSIZE`
+//! / `BLOCK_FN_BITSHIFT` (`spec/03` §3.6 / §3.7). After those land
+//! a full-fixture decode driver + `oxideav-core` `Decoder` impl can
+//! be wired into `register(ctx)`.
 //!
 //! The public entry points are [`parse_stream_header`],
-//! [`read_function_code`], [`read_verbatim_payload`], and
-//! [`decode_diff_block`]. The [`Error::NotImplemented`] sentinel
-//! remains available for any API the orphan-rebuild scaffold has not
-//! yet wired up.
+//! [`read_function_code`], [`read_verbatim_payload`],
+//! [`decode_diff_block`], [`fill_zero_block`], and [`MeanEstimator`].
+//! The [`Error::NotImplemented`] sentinel remains available for any
+//! API the orphan-rebuild scaffold has not yet wired up.
 //!
 //! ## Clean-room provenance
 //!
-//! Rounds 1+2+3 were implemented strictly from
+//! Rounds 1+2+3+4 were implemented strictly from
 //! `docs/audio/shorten/spec/00-scope.md` through `spec/05-…md`. No
 //! external library source, no FFmpeg shorten source, no Tony
 //! Robinson reference encoder source, no archived `old` branch of
@@ -54,8 +60,10 @@
 //! behavioural anchors driving the test suite (fixture `F1`'s
 //! header field values + end-of-header bit position; the post-header
 //! `BLOCK_FN_VERBATIM`'s 44-byte WAV-preamble recovery; the per-
-//! channel carry indexing convention) come from `spec/02` §6 + §4.1
-//! + §4.5 and `spec/03` §3 + `spec/05` §1 + §3.
+//! channel carry indexing convention; the mean estimator's
+//! validation-corrected `+ divisor/2` always-positive bias) come
+//! from `spec/02` §6 + §4.1 + §4.5, `spec/03` §3, and `spec/05` §1 +
+//! §2.5 + §3.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -76,16 +84,18 @@ pub use crate::header::{
     parse_stream_header, ParsedHeader, ShortenStreamHeader, MAGIC, MIN_HEADER_BYTES,
 };
 pub use crate::predictor::{
-    decode_diff_block, ChannelCarry, PolyOrder, CARRY_LEN_FLOOR, ENERGYSIZE,
+    decode_diff_block, fill_zero_block, ChannelCarry, MeanEstimator, PolyOrder, CARRY_LEN_FLOOR,
+    ENERGYSIZE,
 };
 
-/// No-op codec registration — rounds 1+2 land the file-header parser
-/// plus the verbatim / quit slice of the per-block stream, but no
-/// `oxideav-core` `Decoder` / `Encoder` is wired up yet. The
-/// framework callback intentionally registers nothing into the
-/// runtime context; a later round will add the Decoder/Encoder impls
-/// once the predictor and Rice residual decode of `spec/03` §3.1..3.5
-/// land.
+/// No-op codec registration — rounds 1+2+3+4 land the file-header
+/// parser, the per-block command dispatch, the polynomial-difference
+/// predictor kernels, and the running mean estimator, but no
+/// `oxideav-core` `Decoder` / `Encoder` is wired up yet. The framework
+/// callback intentionally registers nothing into the runtime context;
+/// a later round will add the Decoder/Encoder impls once the
+/// housekeeping commands of `spec/03` §3.5..§3.7 and the QLPC predictor
+/// land alongside a full-fixture decode driver.
 #[cfg(feature = "registry")]
 pub fn register(_ctx: &mut oxideav_core::RuntimeContext) {}
 

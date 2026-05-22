@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 3 (2026-05-22).** The crate was
+**Clean-room rebuild — round 4 (2026-05-22).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -14,9 +14,10 @@ TR.156-anchored chapter set `spec/00..05` and the tables it pins.
 
 ### What's wired up
 
-Rounds 1+2+3 land the **file-header parser**, the **per-block command
-dispatch**, and the **polynomial-difference predictor kernels** of the
-integer-PCM decode path:
+Rounds 1+2+3+4 land the **file-header parser**, the **per-block
+command dispatch**, the **polynomial-difference predictor kernels**,
+and the **per-channel running mean estimator** of the integer-PCM
+decode path:
 
 * Round 1 (`spec/01` + `spec/02`):
   * `ajkg` magic + one-byte format version at file offsets
@@ -53,33 +54,47 @@ integer-PCM decode path:
     the order-`n` polynomial-difference reconstruction recurrence
     (`spec/03` §3.1..§3.4 / TR.156 equations 3..10) in `i64` with
     `SampleOverflow` narrowing checks on the `i64 -> i32` boundary.
-  * The running mean estimator of `spec/05` §2 / §2.5 is **not**
-    wired up yet — DIFF0 reconstruction is `s(t) = e₀(t) + 0`, which
-    is byte-exact for the very first block of each channel since
-    `mu_chan` is initialised to zero per §2.1.
+* Round 4 (`spec/05` §2 + §2.4 + §2.5):
+  * `MeanEstimator` — per-channel sliding-window mean estimator of
+    length `H_meanblocks`, zero-initialised per `spec/05` §2.1.
+    `mu_chan()` returns the channel-wide running mean and
+    `record_block(&block)` slides one per-block mean into the window,
+    both using the validation-corrected arithmetic of `spec/05` §2.5:
+    `mu_blk = trunc_div(sum + bs/2, bs)` and
+    `mu_chan = trunc_div(sum_of_slots + H_meanblocks/2, H_meanblocks)`
+    with truncation toward zero (C semantics) and the always-positive
+    `+ divisor/2` bias regardless of numerator sign.
+  * `decode_diff_block()` now takes a `mu_chan: i64` parameter,
+    consumed by `PolyOrder::Order0` per `spec/05` §2.3 (`s(t) =
+    e₀(t) + mu_chan`) and ignored by the mean-invariant orders 1..3.
+  * `fill_zero_block(bs, mu_chan)` — synthesises the `BLOCK_FN_ZERO`
+    payload of `spec/05` §2.4: `bs` samples all equal to `mu_chan`.
+    The dispatch layer routes the `FunctionCode::Zero` command into
+    this helper (no wire payload follows the function-code field).
+  * `H_meanblocks = 0` disabled branch: the estimator's `mu_chan()`
+    stays at zero and `record_block()` is a no-op, reducing DIFF0
+    to `s(t) = e₀(t)` as `spec/01` §3.5 specifies.
 
-The combined surface is exercised by **41 tests** (39 unit + 2
-integration). The two integration tests compose the header parse with
-the per-block dispatch: one verifies the VERBATIM-then-QUIT path
-(round 2), the other verifies a multi-channel DIFF1-DIFF1-DIFF1-QUIT
-sequence with the round-robin channel cursor of `spec/03` §2 and the
-per-channel carry hand-off between consecutive same-channel blocks
-(round 3).
+The combined surface is exercised by **55 tests** (52 unit + 3
+integration). The three integration tests compose the header parse
+with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
+channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
+`spec/03` §2 (round 3), and DIFF0-ZERO-DIFF0-QUIT exercising the
+running-mean estimator's sliding-window update + `BLOCK_FN_ZERO`'s
+`mu_chan` fill (round 4).
 
 ### What's not yet here
 
-* Running mean estimator (`spec/05` §2.5) — required for the DIFF0
-  predictor to match streams whose first-of-channel block is not a
-  DIFF0 block (since later DIFF0 blocks need a non-zero `mu_chan`).
 * `BLOCK_FN_QLPC` quantised LPC predictor (`spec/03` §3.5) — the
   command-code dispatch surfaces it as
   `Error::BlockCommandNotImplemented`.
-* Housekeeping commands `BLOCK_FN_BLOCKSIZE`, `BLOCK_FN_BITSHIFT`,
-  `BLOCK_FN_ZERO` payload state mutation (`spec/03` §3.6 / §3.7 /
-  §3.9). The function-code classification surfaces them as
-  `Error::BlockCommandNotImplemented` for now.
+* Housekeeping commands `BLOCK_FN_BLOCKSIZE`, `BLOCK_FN_BITSHIFT`
+  payload state mutation (`spec/03` §3.6 / §3.7). The function-code
+  classification surfaces them as
+  `Error::BlockCommandNotImplemented` for now. (`BLOCK_FN_ZERO`'s
+  payload is now wired in round 4 via `fill_zero_block`.)
 * `oxideav-core` `Decoder` / `Encoder` integration — `register(ctx)`
-  remains a no-op until the housekeeping commands + mean estimator
+  remains a no-op until the housekeeping commands + QLPC predictor
   land and a real full-fixture decode pipeline is wired up.
 
 ## License
