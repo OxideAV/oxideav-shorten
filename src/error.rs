@@ -37,10 +37,13 @@ pub enum Error {
     /// 0..3); round 4 closes `BLOCK_FN_ZERO = 8` (via `fill_zero_block`
     /// plus the round 4 running-mean estimator); round 5 closes the
     /// quantised-LPC predictor `BLOCK_FN_QLPC = 7` (via
-    /// `decode_qlpc_block`). The housekeeping commands that mutate
-    /// per-stream state (`BLOCK_FN_BLOCKSIZE = 5`,
-    /// `BLOCK_FN_BITSHIFT = 6`) are not yet decoded and still surface
-    /// this error.
+    /// `decode_qlpc_block`); round 6 closes the housekeeping commands
+    /// `BLOCK_FN_BLOCKSIZE = 5` (via `read_blocksize_payload`) and
+    /// `BLOCK_FN_BITSHIFT = 6` (via `read_bitshift_payload`). With
+    /// rounds 1..=6 every code 0..=9 has a payload decoder, so this
+    /// variant is retained only as a forward-compatibility sentinel
+    /// for any future per-block command a later format-version delta
+    /// (`spec/05` §7) might introduce.
     BlockCommandNotImplemented(u32),
     /// A `BLOCK_FN_DIFFn` / `BLOCK_FN_QLPC` energy parameter decoded
     /// to a value whose `+1`-adjusted residual mantissa width would
@@ -69,6 +72,19 @@ pub enum Error {
     /// corrupt or the decoder's carry was allocated against a header
     /// with a smaller `H_maxlpcorder` than the block requests.
     LpcOrderTooLarge { order: u32, carry_len: u32 },
+    /// A `BLOCK_FN_BLOCKSIZE` command carried a zero `new_bs` parameter.
+    /// `spec/03` §3.6 describes the override as "the size of subsequent
+    /// blocks" — a zero-sample block leaves the predictor's residual
+    /// loop empty and defeats the override's purpose, so the encoder
+    /// never emits this value.
+    ZeroBlockSize,
+    /// A `BLOCK_FN_BITSHIFT` command carried a `bshift` value exceeding
+    /// the implementation safety cap (`BITSHIFT_MAX`, 31 positions).
+    /// `spec/02` §4.6 notes encoder-side shifts above ~16 are not
+    /// encountered for 16-bit audio; typical `-q N` invocations are in
+    /// `1..=12`. A larger value is either stream corruption or an
+    /// out-of-scope format-version feature.
+    BitshiftTooLarge(u32),
     /// Round 1 does not decode the per-block command stream that
     /// follows the parameter block. Returned from any non-header API
     /// surface that the orphan-rebuild scaffold has not wired up yet.
@@ -107,6 +123,13 @@ impl core::fmt::Display for Error {
             Error::LpcOrderTooLarge { order, carry_len } => write!(
                 f,
                 "oxideav-shorten: QLPC block order {order} exceeds sample-history carry length {carry_len}"
+            ),
+            Error::ZeroBlockSize => f.write_str(
+                "oxideav-shorten: BLOCKSIZE command carried zero new_bs (encoder never emits)",
+            ),
+            Error::BitshiftTooLarge(b) => write!(
+                f,
+                "oxideav-shorten: BITSHIFT command bshift {b} exceeds safety cap"
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-shorten: feature not implemented in this round (file-header parser only)",

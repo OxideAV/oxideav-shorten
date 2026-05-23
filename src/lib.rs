@@ -1,11 +1,13 @@
 //! # oxideav-shorten
 //!
-//! **Status:** clean-room rebuild — round 5.
+//! **Status:** clean-room rebuild — round 6.
 //!
 //! The crate was orphan-rebuilt after the 2026-05-18 audit. Rounds
-//! 1+2+3+4+5 land the **file-header parser**, the per-block command
-//! dispatch, the polynomial-difference predictor kernels, the
-//! per-channel running mean estimator, and the quantised-LPC predictor
+//! 1+2+3+4+5+6 land the **file-header parser**, the per-block command
+//! dispatch (every code 0..=9 has a payload decoder), the
+//! polynomial-difference predictor kernels, the per-channel running
+//! mean estimator, the quantised-LPC predictor, and the
+//! `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` housekeeping commands
 //! of the integer-PCM decode path documented in
 //! `docs/audio/shorten/spec/01-stream-header.md` through `spec/05`:
 //!
@@ -45,14 +47,27 @@
 //!   (`spec/03` §3.12), reads its history window from the per-channel
 //!   carry (`spec/05` §1), and feeds each just-emitted sample back as
 //!   the next prediction's most-recent past sample.
+//! * Round 6 — the two housekeeping commands that mutate per-stream
+//!   decoder state without producing samples:
+//!   [`read_blocksize_payload`] decodes `BLOCK_FN_BLOCKSIZE`'s
+//!   `new_bs` (`ulong()`) sub-block-size override (`spec/03` §3.6 /
+//!   `spec/04` §4), and [`read_bitshift_payload`] decodes
+//!   `BLOCK_FN_BITSHIFT`'s `bshift` (`uvar(BITSHIFTSIZE = 2)`)
+//!   per-stream bit-shift amount (`spec/02` §4.6 + `spec/03` §3.7 /
+//!   `spec/04` §3). Neither command advances the channel cursor; the
+//!   higher-level driver swaps the returned value into its running
+//!   sub-block-size or bit-shift state and continues per-channel
+//!   dispatch on the same channel.
 //!
-//! Still pending beyond round 5: the housekeeping commands
-//! `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` (`spec/03` §3.6 / §3.7).
-//! After those land a full-fixture decode driver + `oxideav-core`
-//! `Decoder` impl can be wired into `register(ctx)`.
+//! With round 6 every per-block command 0..=9 has a payload decoder.
+//! The next step is a full-fixture decode driver (round-robin channel
+//! cursor + running sub-block-size + running bit-shift + carry +
+//! mean-estimator state across the entire block stream) → an
+//! `oxideav-core` `Decoder` impl wired into `register(ctx)`.
 //!
 //! The public entry points are [`parse_stream_header`],
 //! [`read_function_code`], [`read_verbatim_payload`],
+//! [`read_blocksize_payload`], [`read_bitshift_payload`],
 //! [`decode_diff_block`], [`decode_qlpc_block`], [`fill_zero_block`],
 //! and [`MeanEstimator`]. The [`Error::NotImplemented`] sentinel
 //! remains available for any API the orphan-rebuild scaffold has not
@@ -60,7 +75,7 @@
 //!
 //! ## Clean-room provenance
 //!
-//! Rounds 1+2+3+4+5 were implemented strictly from
+//! Rounds 1+2+3+4+5+6 were implemented strictly from
 //! `docs/audio/shorten/spec/00-scope.md` through `spec/05-…md`. No
 //! external library source, no FFmpeg shorten source, no Tony
 //! Robinson reference encoder source, no archived `old` branch of
@@ -71,9 +86,12 @@
 //! header field values + end-of-header bit position; the post-header
 //! `BLOCK_FN_VERBATIM`'s 44-byte WAV-preamble recovery; the per-
 //! channel carry indexing convention; the mean estimator's
-//! validation-corrected `+ divisor/2` always-positive bias) come
-//! from `spec/02` §6 + §4.1 + §4.5, `spec/03` §3, and `spec/05` §1 +
-//! §2.5 + §3.
+//! validation-corrected `+ divisor/2` always-positive bias; the
+//! `F2` `BLOCK_FN_BLOCKSIZE` tail-block override at command 11,377
+//! with `new_bs = 155`; the `F5..F8` `BLOCK_FN_BITSHIFT` parameter
+//! values 1/4/8/12 matching the encoder's `-q N` invocation) come
+//! from `spec/02` §6 + §4.1 + §4.5 + §4.6, `spec/03` §3, `spec/04`
+//! §3 + §4, and `spec/05` §1 + §2.5 + §3.
 
 #![forbid(unsafe_code)]
 #![warn(missing_debug_implementations)]
@@ -86,7 +104,8 @@ mod predictor;
 
 pub use crate::bitreader::{BitReader, ULONGSIZE};
 pub use crate::block::{
-    read_function_code, read_verbatim_payload, FunctionCode, VerbatimChunk, FNSIZE,
+    read_bitshift_payload, read_blocksize_payload, read_function_code, read_verbatim_payload,
+    FunctionCode, VerbatimChunk, BITSHIFTSIZE, BITSHIFT_MAX, BLOCKSIZE_MAX, FNSIZE,
     VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE, VERBATIM_MAX_LEN,
 };
 pub use crate::error::{Error, Result};
@@ -98,14 +117,17 @@ pub use crate::predictor::{
     CARRY_LEN_FLOOR, ENERGYSIZE, LPCQSIZE, LPCQUANT,
 };
 
-/// No-op codec registration — rounds 1+2+3+4+5 land the file-header
-/// parser, the per-block command dispatch, the polynomial-difference
-/// predictor kernels, the running mean estimator, and the quantised-LPC
-/// predictor, but no `oxideav-core` `Decoder` / `Encoder` is wired up
-/// yet. The framework callback intentionally registers nothing into the
-/// runtime context; a later round will add the Decoder/Encoder impls
-/// once the housekeeping commands of `spec/03` §3.6/§3.7 land alongside
-/// a full-fixture decode driver.
+/// No-op codec registration — rounds 1+2+3+4+5+6 land the file-header
+/// parser, the per-block command dispatch (every code 0..=9 now has a
+/// payload decoder), the polynomial-difference predictor kernels, the
+/// running mean estimator, the quantised-LPC predictor, and the
+/// `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` housekeeping commands.
+/// What still needs to land before this becomes a real
+/// `oxideav-core::Decoder` is the orchestration layer: a full-stream
+/// decode driver carrying the round-robin channel cursor, the running
+/// sub-block size, the running bit-shift, the per-channel carries, and
+/// the per-channel mean estimators across the entire block stream until
+/// `BLOCK_FN_QUIT`.
 #[cfg(feature = "registry")]
 pub fn register(_ctx: &mut oxideav_core::RuntimeContext) {}
 

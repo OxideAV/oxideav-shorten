@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 5 (2026-05-24).** The crate was
+**Clean-room rebuild — round 6 (2026-05-24).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -14,10 +14,12 @@ TR.156-anchored chapter set `spec/00..05` and the tables it pins.
 
 ### What's wired up
 
-Rounds 1+2+3+4+5 land the **file-header parser**, the **per-block
-command dispatch**, the **polynomial-difference predictor kernels**,
-the **per-channel running mean estimator**, and the **quantised-LPC
-predictor** of the integer-PCM decode path:
+Rounds 1+2+3+4+5+6 land the **file-header parser**, the **per-block
+command dispatch** (every code 0..=9 now has a payload decoder), the
+**polynomial-difference predictor kernels**, the **per-channel running
+mean estimator**, the **quantised-LPC predictor**, and the
+**`BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` housekeeping commands**
+of the integer-PCM decode path:
 
 * Round 1 (`spec/01` + `spec/02`):
   * `ajkg` magic + one-byte format version at file offsets
@@ -98,28 +100,54 @@ predictor** of the integer-PCM decode path:
     `max(3, H_maxlpcorder)` and §3.5 bounds the order at
     `H_maxlpcorder`, so a well-formed stream always satisfies
     `order ≤ carry.len()`.
+* Round 6 (`spec/03` §3.6 + §3.7 + `spec/02` §4.6 + `spec/04` §3 + §4):
+  * `BITSHIFTSIZE = 2` exposed — the per-stream bit-shift field width
+    pinned in `spec/02` §4.6.
+  * `BITSHIFT_MAX = 31` / `BLOCKSIZE_MAX = 1 MiB` — implementation
+    safety caps; the housekeeping decoders surface
+    `Error::BitshiftTooLarge` / `Error::BlockTooLarge` for over-cap
+    parameters and `Error::ZeroBlockSize` for the degenerate
+    `new_bs = 0` case the encoder never emits.
+  * `read_blocksize_payload()` — full payload decode for
+    `BLOCK_FN_BLOCKSIZE`: a single `ulong()`-encoded `new_bs` that
+    the higher-level driver swaps into its running sub-block-size
+    state per `spec/03` §3.6 (`F2`'s tail-block override at command
+    11,377 carries `new_bs = 155` per `T12`).
+  * `read_bitshift_payload()` — full payload decode for
+    `BLOCK_FN_BITSHIFT`: a single `uvar(BITSHIFTSIZE)` bit-shift
+    amount that the higher-level driver swaps into its running
+    per-stream bit-shift state per `spec/03` §3.7 (`F5..F8`'s first
+    `BLOCK_FN_BITSHIFT` parameter values are 1/4/8/12, matching the
+    encoder's `-q N` invocation per `T10`). The carry stays in
+    pre-shift form per `spec/05` §1.4; the driver applies the shift
+    on emission, not into the carry.
+  * Neither housekeeping command advances the channel cursor; the
+    per-channel dispatch resumes on the same channel after the state
+    update.
 
-The combined surface is exercised by **68 tests** (64 unit + 4
-integration). The four integration tests compose the header parse
+The combined surface is exercised by **81 tests** (76 unit + 5
+integration). The five integration tests compose the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
 `spec/03` §2 (round 3), DIFF0-ZERO-DIFF0-QUIT exercising the
 running-mean estimator's sliding-window update + `BLOCK_FN_ZERO`'s
-`mu_chan` fill (round 4), and QLPC-QLPC-QUIT exercising an order-2
-LPC predictor with the per-channel carry hand-off across two blocks
-(round 5).
+`mu_chan` fill (round 4), QLPC-QLPC-QUIT exercising an order-2 LPC
+predictor with the per-channel carry hand-off across two blocks
+(round 5), and BITSHIFT-DIFF1-BLOCKSIZE-DIFF1-QUIT exercising the
+two housekeeping commands' state updates plus the carry hand-off
+across the BLOCKSIZE-override boundary (round 6).
 
 ### What's not yet here
 
-* Housekeeping commands `BLOCK_FN_BLOCKSIZE`, `BLOCK_FN_BITSHIFT`
-  payload state mutation (`spec/03` §3.6 / §3.7). The function-code
-  classification surfaces them as
-  `Error::BlockCommandNotImplemented` for now. (`BLOCK_FN_ZERO`'s
-  payload is wired in round 4 via `fill_zero_block`; `BLOCK_FN_QLPC`
-  is wired in round 5 via `decode_qlpc_block`.)
+* Full-fixture decode driver (header + post-header bit alignment +
+  block-stream loop carrying the round-robin channel cursor + running
+  sub-block-size + running bit-shift + per-channel carries + per-
+  channel mean estimators across the entire block stream until
+  `BLOCK_FN_QUIT`).
 * `oxideav-core` `Decoder` / `Encoder` integration — `register(ctx)`
-  remains a no-op until the housekeeping commands land and a real
-  full-fixture decode pipeline is wired up.
+  remains a no-op until that decode driver lands; every per-block
+  command 0..=9 now has a payload decoder, so the missing piece is
+  the orchestration loop, not any individual command's parser.
 
 ## License
 

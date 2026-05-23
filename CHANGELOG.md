@@ -8,6 +8,58 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 6 clean-room rebuild.** Housekeeping commands
+  `BLOCK_FN_BLOCKSIZE` and `BLOCK_FN_BITSHIFT` landed against
+  `docs/audio/shorten/spec/03-block-and-predictor.md` §3.6 + §3.7 +
+  `spec/02-variable-length-coding.md` §4.6 +
+  `spec/04-function-code-resolution.md` §3 + §4:
+  - `BITSHIFTSIZE = 2` (per-stream bit-shift field width, `spec/02`
+    §4.6), `BITSHIFT_MAX = 31` and `BLOCKSIZE_MAX = 1 MiB`
+    (implementation safety caps) exposed as public constants.
+    Compile-time `const _: () = assert!(...)` bounds keep the caps in
+    sync with the housekeeping decoders' assumptions.
+  - `read_blocksize_payload()` — full payload decode for
+    `BLOCK_FN_BLOCKSIZE`: a single `ulong()`-encoded `new_bs` per
+    `spec/03` §3.6. The driver swaps the returned value into its
+    running sub-block-size state; subsequent predictor commands
+    produce blocks of `new_bs` samples per channel until another
+    `BLOCK_FN_BLOCKSIZE` or end of stream. Surfaces
+    `Error::ZeroBlockSize` for `new_bs == 0` (the encoder never emits
+    this) and `Error::BlockTooLarge` for over-cap values. `F2`'s
+    tail-block override at command 11,377 carrying `new_bs = 155`
+    (per `T12`) is the behavioural anchor.
+  - `read_bitshift_payload()` — full payload decode for
+    `BLOCK_FN_BITSHIFT`: a single `uvar(BITSHIFTSIZE)` per-stream
+    bit-shift amount per `spec/03` §3.7. The driver swaps the
+    returned value into its running bit-shift state; subsequent
+    samples emitted by predictor commands are left-shifted by this
+    amount before delivery to the PCM sink. Surfaces
+    `Error::BitshiftTooLarge` for over-cap values. The per-channel
+    carry stores the pre-shift form per `spec/05` §1.4 so the
+    predictor recurrences continue to see the same integer
+    relationships across the BITSHIFT boundary. `F5..F8`'s first
+    `BLOCK_FN_BITSHIFT` parameter values 1/4/8/12 matching the
+    encoder's `-q N` invocation (per `T10`) are the behavioural
+    anchors.
+  - Neither housekeeping command advances the channel cursor
+    (`FunctionCode::advances_channel_cursor()` already returns
+    `false` for both per round 2); the per-channel dispatch resumes
+    on the same channel after the state update.
+  - `Error::ZeroBlockSize` and `Error::BitshiftTooLarge(u32)` —
+    new variants surfacing the two payload-rejection cases above.
+  - New integration test (`tests/housekeeping_pipeline.rs`)
+    composing the header parse with a five-command sequence:
+    `BITSHIFT(bshift=4)` → `DIFF1` (default `H_blocksize = 8`,
+    cumulative sum from zero carry) → `BLOCKSIZE(new_bs=4)` →
+    `DIFF1` (4 samples at the new sub-block size, with predictor
+    history supplied by the prior block's carry) → `QUIT`. Verifies
+    the running sub-block-size + running bit-shift state cells, the
+    cursor non-advancement of the housekeeping commands, and the
+    carry hand-off across the BLOCKSIZE-override boundary.
+  - Total test count: 68 -> 81 (76 unit + 5 integration; +12 unit +1
+    integration relative to round 5). With round 6 every per-block
+    command 0..=9 has a payload decoder.
+
 - **Round 5 clean-room rebuild.** Quantised-LPC predictor landed
   against `docs/audio/shorten/spec/03-block-and-predictor.md` §3.5 +
   `spec/02-variable-length-coding.md` §4.3 / §4.4 +
@@ -168,11 +220,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Next
 
-- Housekeeping commands `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT`
-  payload state mutation (`spec/03` §3.6 / §3.7). (`BLOCK_FN_ZERO`
-  payload is wired in round 4 via `fill_zero_block`; `BLOCK_FN_QLPC`
-  is wired in round 5 via `decode_qlpc_block`.)
 - Full per-fixture decode driver (header + block-stream loop +
-  channel cursor + bit-shift sample reformatting + verbatim-prefix
-  emission) → an `oxideav-core` `Decoder` impl + `register(ctx)`
-  registry wiring.
+  round-robin channel cursor across `H_channels` channels + running
+  sub-block-size + running bit-shift + per-channel carries + per-
+  channel mean estimators + verbatim-prefix emission) → an
+  `oxideav-core` `Decoder` impl + `register(ctx)` registry wiring.
+  Every per-block command 0..=9 now has a payload decoder; the
+  remaining gap is the orchestration loop, not any individual
+  command's parser.

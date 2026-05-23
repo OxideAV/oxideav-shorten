@@ -21,12 +21,29 @@
 //!   - [`BLOCK_FN_QUIT`][FunctionCode::Quit] — bare sentinel
 //!     (`spec/03` §3.8 / `spec/04` §2).
 //!
-//! The predictor commands (`DIFF0..3`, `QLPC`) and the housekeeping
-//! commands that mutate per-stream state (`BLOCKSIZE`, `BITSHIFT`,
-//! `ZERO`) parse their function-code field correctly but return
-//! [`Error::BlockCommandNotImplemented`] for the payload — those land
-//! in later rounds along with the per-channel sample-history carry,
-//! the Rice residual decode, and the running mean estimator.
+//! Round 6 adds the two housekeeping commands that mutate per-stream
+//! decoder state without producing samples:
+//!
+//! * [`BLOCK_FN_BLOCKSIZE`][FunctionCode::Blocksize] — `new_bs`
+//!   (`ulong()`) updates the sub-block size applied to subsequent
+//!   predictor commands (`spec/03` §3.6 / `spec/04` §4).
+//!   [`read_blocksize_payload`] returns the new value as a `u32`; the
+//!   higher-level driver swaps it into the running block-size state.
+//! * [`BLOCK_FN_BITSHIFT`][FunctionCode::Bitshift] — `bshift`
+//!   (`uvar(BITSHIFTSIZE = 2)`) sets the per-stream bit-shift amount
+//!   (`spec/02` §4.6 + `spec/03` §3.7 / `spec/04` §3).
+//!   [`read_bitshift_payload`] returns the new shift as a `u32`; the
+//!   higher-level driver left-shifts subsequent emitted samples by
+//!   this amount per `spec/05` §1.4 (the carry stores pre-shift form).
+//!
+//! Neither housekeeping command advances the channel cursor — the
+//! per-channel block dispatch resumes on the same channel after the
+//! command completes.
+//!
+//! The predictor commands (`DIFF0..3`, `QLPC`) and `BLOCK_FN_ZERO` are
+//! handled by the predictor module; their payload decoders live in
+//! [`crate::decode_diff_block`], [`crate::decode_qlpc_block`], and
+//! [`crate::fill_zero_block`].
 //!
 //! The clean-room provenance for the function-code numeric assignment
 //! is the verification table in `spec/04` (which pins codes 4..=8
@@ -57,6 +74,34 @@ pub const VERBATIM_BYTE_SIZE: u32 = 8;
 /// corruption or pathological encoder behaviour. The cap is generous
 /// (64 KiB) so that any plausible host-format header fits.
 pub const VERBATIM_MAX_LEN: u32 = 64 * 1024;
+
+/// Width of the `bshift` field carried by a `BLOCK_FN_BITSHIFT`
+/// command. Pinned by `spec/02` §4.6 (`BITSHIFTSIZE = 2`); the field
+/// is read as `uvar(BITSHIFTSIZE)`.
+pub const BITSHIFTSIZE: u32 = 2;
+
+/// Implementation-side safety cap on the shift amount carried by a
+/// `BLOCK_FN_BITSHIFT` command. `spec/02` §4.6 notes shifts above ~16
+/// are not encountered for 16-bit audio; the field is encoded as
+/// `uvar(2)` so larger values are admitted in principle through the
+/// prefix-zeros mechanism. We cap at 31 so the shift cannot exceed
+/// what a single 32-bit sample slot can absorb without overflowing the
+/// `i32` storage type.
+pub const BITSHIFT_MAX: u32 = 31;
+
+/// Implementation-side safety cap on the new block size carried by a
+/// `BLOCK_FN_BLOCKSIZE` command. Mirrors the predictor-side
+/// `MAX_BLOCK_SAMPLES` (1 MiB samples) so a malformed wire-stream
+/// `ulong()` cannot drive `Vec::with_capacity` for an absurd
+/// allocation downstream.
+pub const BLOCKSIZE_MAX: u32 = 1024 * 1024;
+
+// Compile-time sanity bounds on the implementation caps. Failing
+// either of these means a future change to the cap constant has broken
+// the assumptions the housekeeping-command decoders make about the
+// values they will return.
+const _: () = assert!(BITSHIFT_MAX <= 31);
+const _: () = assert!(BLOCKSIZE_MAX >= 1024 * 1024);
 
 /// The ten per-block function codes enumerated by `spec/03` §3 /
 /// `spec/04`. Codes outside 0..=9 are not emitted by any v2/v3
@@ -194,6 +239,84 @@ pub fn read_verbatim_payload(reader: &mut BitReader<'_>) -> Result<VerbatimChunk
         bytes.push(b as u8);
     }
     Ok(VerbatimChunk { bytes })
+}
+
+/// Read the payload of a `BLOCK_FN_BLOCKSIZE` command after its
+/// function-code field has already been consumed. The layout
+/// (`spec/03` §3.6 + `spec/04` §4) is:
+///
+/// ```text
+/// new_bs: ulong()    (two-stage `uvar(ULONGSIZE = 2)` + `uvar(w)` per spec/02 §3)
+/// ```
+///
+/// The decoder caller installs the returned value as its running
+/// sub-block size; subsequent predictor commands (`DIFF0..3` / `QLPC` /
+/// `ZERO`) produce blocks of `new_bs` samples per channel until the
+/// next `BLOCK_FN_BLOCKSIZE` command or the end of the stream
+/// (`spec/03` §3.6).
+///
+/// Returns the new block size as a `u32`. This command does **not**
+/// advance the channel cursor; the per-channel dispatch resumes on the
+/// same channel after the override takes effect.
+///
+/// Rejects:
+///
+/// * `new_bs == 0` ([`Error::ZeroBlockSize`]) — a zero-sample block
+///   makes no sense for a predictor command (the residual loop would
+///   be empty, defeating the override's purpose), and the encoder
+///   never emits `BLOCK_FN_BLOCKSIZE` with a zero parameter per
+///   `spec/03` §3.6.
+/// * `new_bs > BLOCKSIZE_MAX` ([`Error::BlockTooLarge`]) — the
+///   implementation safety cap mirrors the predictor-side cap so a
+///   malformed stream cannot drive a multi-gigabyte allocation
+///   downstream when the override is consumed by the next predictor
+///   command.
+/// * Bit-stream truncation mid-`ulong` decode ([`Error::Truncated`]).
+pub fn read_blocksize_payload(reader: &mut BitReader<'_>) -> Result<u32> {
+    let new_bs = reader.read_ulong()?;
+    if new_bs == 0 {
+        return Err(Error::ZeroBlockSize);
+    }
+    if new_bs > BLOCKSIZE_MAX {
+        return Err(Error::BlockTooLarge(new_bs));
+    }
+    Ok(new_bs)
+}
+
+/// Read the payload of a `BLOCK_FN_BITSHIFT` command after its
+/// function-code field has already been consumed. The layout
+/// (`spec/03` §3.7 + `spec/02` §4.6 + `spec/04` §3) is:
+///
+/// ```text
+/// bshift: uvar(BITSHIFTSIZE = 2)
+/// ```
+///
+/// The decoder caller installs the returned value as its running
+/// per-stream bit-shift; subsequent samples emitted by predictor
+/// commands are left-shifted by this amount before being delivered to
+/// the PCM sink (`spec/03` §3.7). The per-channel sample-history carry
+/// stores the pre-shift form so the predictor recurrences continue to
+/// see the same integer relationships as they did before the BITSHIFT
+/// command (`spec/05` §1.4).
+///
+/// Returns the new shift as a `u32`. This command does **not** advance
+/// the channel cursor; the per-channel dispatch resumes on the same
+/// channel after the shift takes effect.
+///
+/// Rejects:
+///
+/// * `bshift > BITSHIFT_MAX` ([`Error::BitshiftTooLarge`]) — the
+///   implementation safety cap (31 positions) is the most a single
+///   `i32` sample slot can absorb without overflowing on emission;
+///   `spec/02` §4.6 notes encoders never approach this cap for 16-bit
+///   audio (the typical `-q N` range is `1..=12`).
+/// * Bit-stream truncation mid-`uvar` decode ([`Error::Truncated`]).
+pub fn read_bitshift_payload(reader: &mut BitReader<'_>) -> Result<u32> {
+    let bshift = reader.read_uvar(BITSHIFTSIZE)?;
+    if bshift > BITSHIFT_MAX {
+        return Err(Error::BitshiftTooLarge(bshift));
+    }
+    Ok(bshift)
 }
 
 #[cfg(test)]
@@ -417,5 +540,168 @@ mod tests {
         let buf = pack_bits_msb_first(&bits);
         let mut r = BitReader::new(&buf);
         assert_eq!(read_function_code(&mut r).unwrap(), FunctionCode::Quit);
+    }
+
+    // -------------------------------------------------------------
+    // Housekeeping commands — `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT`
+    // (round 6 — spec/03 §3.6 / §3.7 + spec/02 §4.6 + spec/04 §3 / §4).
+    // -------------------------------------------------------------
+
+    /// `ulong()` encoder: width = `uvar(2) = w`, then value = `uvar(w)`.
+    fn encode_ulong(value: u32, w: u32) -> Vec<u32> {
+        let mut bits = Vec::new();
+        bits.extend(encode_uvar(w, 2));
+        bits.extend(encode_uvar(value, w));
+        bits
+    }
+
+    #[test]
+    fn bitshift_constants_match_spec02_section_4_6() {
+        // spec/02 §4.6: BITSHIFTSIZE = 2. The shift-amount cap is an
+        // implementation safety bound, not a spec-pinned constant; the
+        // sanity bounds on it (BITSHIFT_MAX <= 31, BLOCKSIZE_MAX >=
+        // 1024*1024) are checked as `const` assertions at compile time
+        // — see the `const _: () = assert!(...)` block in `src/block.rs`.
+        assert_eq!(BITSHIFTSIZE, 2);
+    }
+
+    #[test]
+    fn read_blocksize_payload_decodes_typical_overrides() {
+        // spec/04 §4 / T12: F2's tail-block override at command 11,377
+        // carries `new_bs = 155`. The wire form is `ulong()` —
+        // `uvar(2)` for w, then `uvar(w)` for the value. 155 = 0x9B
+        // needs 8 bits (the smallest power-of-two >= log2(156)) so the
+        // encoder picks w = 8 here.
+        let bits = encode_ulong(155, 8);
+        let buf = pack_bits_msb_first(&bits);
+        let mut r = BitReader::new(&buf);
+        let new_bs = read_blocksize_payload(&mut r).expect("blocksize payload decodes");
+        assert_eq!(new_bs, 155);
+    }
+
+    #[test]
+    fn read_blocksize_payload_decodes_small_block_size() {
+        // A small non-default block size — e.g. 1 (degenerate single-
+        // sample blocks). spec/03 §3.6 does not bound `new_bs` from
+        // above; the implementation cap is BLOCKSIZE_MAX.
+        let bits = encode_ulong(1, 1);
+        let buf = pack_bits_msb_first(&bits);
+        let mut r = BitReader::new(&buf);
+        let new_bs = read_blocksize_payload(&mut r).expect("small new_bs decodes");
+        assert_eq!(new_bs, 1);
+    }
+
+    #[test]
+    fn read_blocksize_payload_decodes_default_h_blocksize() {
+        // The default H_blocksize of 256 — round-trip the same `ulong()`
+        // form spec/02 §6.3 walks for fixture F1.
+        let bits = encode_ulong(256, 9);
+        let buf = pack_bits_msb_first(&bits);
+        let mut r = BitReader::new(&buf);
+        let new_bs = read_blocksize_payload(&mut r).expect("default-size override decodes");
+        assert_eq!(new_bs, 256);
+    }
+
+    #[test]
+    fn read_blocksize_payload_rejects_zero_new_bs() {
+        // spec/03 §3.6 — encoder never emits a zero-sample block;
+        // BLOCKSIZE with new_bs == 0 surfaces ZeroBlockSize.
+        let bits = encode_ulong(0, 0);
+        let buf = pack_bits_msb_first(&bits);
+        let mut r = BitReader::new(&buf);
+        assert_eq!(read_blocksize_payload(&mut r), Err(Error::ZeroBlockSize));
+    }
+
+    #[test]
+    fn read_blocksize_payload_rejects_oversized_new_bs() {
+        // A new_bs above the implementation safety cap (1 MiB samples)
+        // surfaces BlockTooLarge. The cap is independent of the spec —
+        // a defensive bound to prevent a malformed stream from driving
+        // a multi-gigabyte allocation downstream.
+        let oversized = BLOCKSIZE_MAX + 1;
+        // 1 MiB + 1 = 0x100001 needs 21 bits; encode with w = 21.
+        let bits = encode_ulong(oversized, 21);
+        let buf = pack_bits_msb_first(&bits);
+        let mut r = BitReader::new(&buf);
+        assert_eq!(
+            read_blocksize_payload(&mut r),
+            Err(Error::BlockTooLarge(oversized))
+        );
+    }
+
+    #[test]
+    fn read_blocksize_payload_truncation_returns_truncated() {
+        // Provide the width field but no value bits.
+        let bits = encode_uvar(8, 2); // w = 8 only, no `uvar(8)` follows
+        let buf = pack_bits_msb_first(&bits);
+        let mut r = BitReader::new(&buf);
+        assert_eq!(read_blocksize_payload(&mut r), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn read_bitshift_payload_decodes_typical_q_values() {
+        // spec/04 §3 / T10: F5..F8 emit `bshift` values 1, 4, 8, 12 —
+        // the exact `-q N` values the encoder was invoked with. Verify
+        // the uvar(2) decoder reproduces each.
+        for &bshift in &[0u32, 1, 4, 7, 8, 12] {
+            let bits = encode_uvar(bshift, BITSHIFTSIZE);
+            let buf = pack_bits_msb_first(&bits);
+            let mut r = BitReader::new(&buf);
+            let got = read_bitshift_payload(&mut r).expect("bshift decodes");
+            assert_eq!(got, bshift, "bshift round-trip for {bshift}");
+        }
+    }
+
+    #[test]
+    fn read_bitshift_payload_rejects_oversized_bshift() {
+        // BITSHIFT_MAX + 1 must surface BitshiftTooLarge.
+        let oversized = BITSHIFT_MAX + 1;
+        let bits = encode_uvar(oversized, BITSHIFTSIZE);
+        let buf = pack_bits_msb_first(&bits);
+        let mut r = BitReader::new(&buf);
+        assert_eq!(
+            read_bitshift_payload(&mut r),
+            Err(Error::BitshiftTooLarge(oversized))
+        );
+    }
+
+    #[test]
+    fn read_bitshift_payload_truncation_returns_truncated() {
+        // An empty bit buffer should exhaust on the first read_uvar bit.
+        let buf: Vec<u8> = Vec::new();
+        let mut r = BitReader::new(&buf);
+        assert_eq!(read_bitshift_payload(&mut r), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn read_function_code_then_blocksize_payload_round_trips() {
+        // End-to-end: dispatch the BLOCKSIZE command via the
+        // function-code reader, then decode its `ulong()` payload.
+        let mut bits = Vec::new();
+        bits.extend(encode_uvar(5, FNSIZE)); // BLOCKSIZE = 5
+        bits.extend(encode_ulong(64, 7));
+        let buf = pack_bits_msb_first(&bits);
+        let mut r = BitReader::new(&buf);
+        let fc = read_function_code(&mut r).expect("function code classifies");
+        assert_eq!(fc, FunctionCode::Blocksize);
+        assert!(!fc.advances_channel_cursor(), "BLOCKSIZE is housekeeping");
+        let new_bs = read_blocksize_payload(&mut r).expect("BLOCKSIZE payload decodes");
+        assert_eq!(new_bs, 64);
+    }
+
+    #[test]
+    fn read_function_code_then_bitshift_payload_round_trips() {
+        // End-to-end: dispatch the BITSHIFT command via the
+        // function-code reader, then decode its `uvar(2)` payload.
+        let mut bits = Vec::new();
+        bits.extend(encode_uvar(6, FNSIZE)); // BITSHIFT = 6
+        bits.extend(encode_uvar(7, BITSHIFTSIZE)); // F2 anchor: bshift = 7
+        let buf = pack_bits_msb_first(&bits);
+        let mut r = BitReader::new(&buf);
+        let fc = read_function_code(&mut r).expect("function code classifies");
+        assert_eq!(fc, FunctionCode::Bitshift);
+        assert!(!fc.advances_channel_cursor(), "BITSHIFT is housekeeping");
+        let bshift = read_bitshift_payload(&mut r).expect("BITSHIFT payload decodes");
+        assert_eq!(bshift, 7);
     }
 }
