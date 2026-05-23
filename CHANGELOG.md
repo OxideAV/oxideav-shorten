@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 5 clean-room rebuild.** Quantised-LPC predictor landed
+  against `docs/audio/shorten/spec/03-block-and-predictor.md` §3.5 +
+  `spec/02-variable-length-coding.md` §4.3 / §4.4 +
+  `spec/05-state-and-quirks.md` §3.2:
+  - `LPCQSIZE = 2` (per-block LPC-order field width, `spec/02` §4.3)
+    and `LPCQUANT = 2` (signed quantised-coefficient width, `spec/02`
+    §4.4) exposed as public constants.
+  - `decode_qlpc_block()` — full payload decode for `BLOCK_FN_QLPC`:
+    order (`uvar(LPCQSIZE)`) + `order` quantised coefficients
+    (`svar(LPCQUANT)`) + energy (`uvar(ENERGYSIZE)`) + `bs ×
+    svar(energy + 1)` residuals, applying the general LPC
+    reconstruction `s(t) = Σᵢ aᵢ·s(t-i) + e(t)` of `spec/03` §3.5
+    (TR.156 §3.2 eq. 1/2) in `i64` headroom with `SampleOverflow`
+    narrowing on the `i64 -> i32` boundary. Coefficients are applied
+    **without scaling** per `spec/03` §3.5 (each `coef` is a small
+    signed integer the decoder uses directly). The history window
+    `s(t-1)..s(t-order)` is read from the per-channel carry
+    (`spec/05` §1) for the leading block samples and each just-emitted
+    sample feeds back as the next prediction's most-recent past
+    sample. The predictor is mean-invariant (`spec/03` §3.12 /
+    `spec/05` §2), so `decode_qlpc_block` takes no `mu_chan` argument.
+  - `Error::LpcOrderTooLarge { order, carry_len }` — surfaces when a
+    per-block order exceeds the carry length (the carry cannot supply
+    the required history) or the implementation cap. `spec/03` §3.11
+    pins the carry length at `max(3, H_maxlpcorder)` and §3.5 bounds
+    the per-block order at `H_maxlpcorder`, so a well-formed stream
+    always satisfies `order <= carry.len()`.
+  - New integration test (`tests/qlpc_block_pipeline.rs`) exercising a
+    single-channel QLPC-QLPC-QUIT sequence with `H_maxlpcorder = 2`,
+    an order-2 predictor (`a1 = 2, a2 = -1`, mirroring the DIFF2
+    line-fit), and verifying the per-channel carry hands the first
+    block's tail samples into the second block's predictor history.
+  - Total test count: 55 -> 68 (64 unit + 4 integration; +12 unit +1
+    integration relative to round 4).
+
 - **Round 4 clean-room rebuild.** Per-channel running mean estimator
   landed against `docs/audio/shorten/spec/05-state-and-quirks.md` §2 +
   §2.5 + §2.3 + §2.4:
@@ -133,11 +168,10 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Next
 
-- `BLOCK_FN_QLPC` quantised LPC predictor (`spec/03` §3.5) — order +
-  coefficients (`svar(LPCQUANT = 2)` × `order`) + energy + residuals.
 - Housekeeping commands `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT`
   payload state mutation (`spec/03` §3.6 / §3.7). (`BLOCK_FN_ZERO`
-  payload is now wired in round 4 via `fill_zero_block`.)
+  payload is wired in round 4 via `fill_zero_block`; `BLOCK_FN_QLPC`
+  is wired in round 5 via `decode_qlpc_block`.)
 - Full per-fixture decode driver (header + block-stream loop +
   channel cursor + bit-shift sample reformatting + verbatim-prefix
   emission) → an `oxideav-core` `Decoder` impl + `register(ctx)`

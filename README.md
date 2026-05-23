@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 4 (2026-05-22).** The crate was
+**Clean-room rebuild — round 5 (2026-05-24).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -14,10 +14,10 @@ TR.156-anchored chapter set `spec/00..05` and the tables it pins.
 
 ### What's wired up
 
-Rounds 1+2+3+4 land the **file-header parser**, the **per-block
+Rounds 1+2+3+4+5 land the **file-header parser**, the **per-block
 command dispatch**, the **polynomial-difference predictor kernels**,
-and the **per-channel running mean estimator** of the integer-PCM
-decode path:
+the **per-channel running mean estimator**, and the **quantised-LPC
+predictor** of the integer-PCM decode path:
 
 * Round 1 (`spec/01` + `spec/02`):
   * `ajkg` magic + one-byte format version at file offsets
@@ -74,28 +74,52 @@ decode path:
   * `H_meanblocks = 0` disabled branch: the estimator's `mu_chan()`
     stays at zero and `record_block()` is a no-op, reducing DIFF0
     to `s(t) = e₀(t)` as `spec/01` §3.5 specifies.
+* Round 5 (`spec/03` §3.5 + `spec/02` §4.3/§4.4 + `spec/05` §3.2):
+  * `LPCQSIZE = 2` / `LPCQUANT = 2` exposed — the per-block LPC-order
+    field width and the signed quantised-coefficient width pinned in
+    `spec/02` §4.3 / §4.4.
+  * `decode_qlpc_block()` — full payload decode for `BLOCK_FN_QLPC`:
+    order (`uvar(2)`) + `order` quantised coefficients (`svar(2)`) +
+    energy (`uvar(3)`) + `bs × svar(energy + 1)` residuals; applies
+    the general LPC reconstruction `s(t) = Σᵢ aᵢ·s(t-i) + e(t)` of
+    `spec/03` §3.5 (TR.156 §3.2 eq. 1/2) in `i64` headroom with
+    `SampleOverflow` narrowing on the `i64 -> i32` boundary.
+    Coefficients are applied **without scaling** per `spec/03` §3.5;
+    the predictor reads its `s(t-1)..s(t-order)` history from the
+    per-channel carry (`spec/05` §1) for the leading samples and
+    feeds each just-emitted sample back as the next prediction's
+    most-recent past sample.
+  * QLPC is **mean-invariant** (`spec/03` §3.12 / `spec/05` §2): its
+    prediction is a linear function of past samples that already carry
+    the channel mean, so `decode_qlpc_block` takes no `mu_chan`
+    argument.
+  * `Error::LpcOrderTooLarge` surfaces when a per-block order exceeds
+    the carry length — `spec/03` §3.11 pins the carry at
+    `max(3, H_maxlpcorder)` and §3.5 bounds the order at
+    `H_maxlpcorder`, so a well-formed stream always satisfies
+    `order ≤ carry.len()`.
 
-The combined surface is exercised by **55 tests** (52 unit + 3
-integration). The three integration tests compose the header parse
+The combined surface is exercised by **68 tests** (64 unit + 4
+integration). The four integration tests compose the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
-`spec/03` §2 (round 3), and DIFF0-ZERO-DIFF0-QUIT exercising the
+`spec/03` §2 (round 3), DIFF0-ZERO-DIFF0-QUIT exercising the
 running-mean estimator's sliding-window update + `BLOCK_FN_ZERO`'s
-`mu_chan` fill (round 4).
+`mu_chan` fill (round 4), and QLPC-QLPC-QUIT exercising an order-2
+LPC predictor with the per-channel carry hand-off across two blocks
+(round 5).
 
 ### What's not yet here
 
-* `BLOCK_FN_QLPC` quantised LPC predictor (`spec/03` §3.5) — the
-  command-code dispatch surfaces it as
-  `Error::BlockCommandNotImplemented`.
 * Housekeeping commands `BLOCK_FN_BLOCKSIZE`, `BLOCK_FN_BITSHIFT`
   payload state mutation (`spec/03` §3.6 / §3.7). The function-code
   classification surfaces them as
   `Error::BlockCommandNotImplemented` for now. (`BLOCK_FN_ZERO`'s
-  payload is now wired in round 4 via `fill_zero_block`.)
+  payload is wired in round 4 via `fill_zero_block`; `BLOCK_FN_QLPC`
+  is wired in round 5 via `decode_qlpc_block`.)
 * `oxideav-core` `Decoder` / `Encoder` integration — `register(ctx)`
-  remains a no-op until the housekeeping commands + QLPC predictor
-  land and a real full-fixture decode pipeline is wired up.
+  remains a no-op until the housekeeping commands land and a real
+  full-fixture decode pipeline is wired up.
 
 ## License
 

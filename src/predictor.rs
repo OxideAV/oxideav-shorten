@@ -97,6 +97,26 @@ use crate::error::{Error, Result};
 /// `spec/02` §4.2 (`ENERGYSIZE = 3`).
 pub const ENERGYSIZE: u32 = 3;
 
+/// Width of the per-block LPC-order field carried by a `BLOCK_FN_QLPC`
+/// command. Pinned by `spec/02` §4.3 (`LPCQSIZE = 2`); the order is
+/// read as `uvar(LPCQSIZE)`.
+pub const LPCQSIZE: u32 = 2;
+
+/// Signed-coefficient width for the quantised LPC coefficients carried
+/// by a `BLOCK_FN_QLPC` command. Pinned by `spec/02` §4.4
+/// (`LPCQUANT = 2`); each coefficient is read as `svar(LPCQUANT)`.
+pub const LPCQUANT: u32 = 2;
+
+/// Implementation-side safety cap on the per-block LPC order. The
+/// per-block order is `uvar(LPCQSIZE = 2)` (so small values dominate)
+/// and `spec/03` §3.5 bounds it by the header's `H_maxlpcorder`. The
+/// `BitReader` admits arbitrarily large prefix-zero values, so a
+/// malformed stream could request a huge order; we cap it before
+/// allocating the coefficient vector. The cap is generous (1024)
+/// relative to any plausible LPC order while preventing a multi-
+/// gigabyte allocation from a corrupt prefix.
+const MAX_LPC_ORDER: u32 = 1024;
+
 /// Minimum sample-history carry buffer length. `spec/05` §1 / `spec/03`
 /// §3.11 pin `CARRY_LEN = max(3, H_maxlpcorder)`; for streams with
 /// `H_maxlpcorder = 0` (every fixture observed against real predictor
@@ -458,6 +478,141 @@ pub fn decode_diff_block(
         s_m3 = s_m2;
         s_m2 = s_m1;
         s_m1 = s;
+    }
+    Ok(out)
+}
+
+/// Read a `BLOCK_FN_QLPC` payload after its function-code field has
+/// already been consumed and reconstruct the channel block.
+///
+/// Layout per `spec/03` §3.5 (TR.156 §3.2 first equation):
+///
+/// ```text
+/// <QLPC block> ::= <order> <coef>×order <energy> <residual>×bs
+///   order:    uvar(LPCQSIZE = 2)
+///   coef:     svar(LPCQUANT = 2)
+///   energy:   uvar(ENERGYSIZE = 3)            (encoded value e = n - 1)
+///   residual: svar(e + 1)                       (mantissa width = e + 1)
+/// ```
+///
+/// Reconstruction applies the general LPC predictor
+///
+/// ```text
+/// ŝ_QLPC(t) = Σᵢ₌₁..order  aᵢ · s(t − i)
+/// s(t)       = ŝ_QLPC(t) + e_QLPC(t)
+/// ```
+///
+/// where the coefficients `a₁..a_order` are read in transmission
+/// order (`coef[0] = a₁`, `coef[1] = a₂`, …) and applied **without
+/// scaling** per `spec/03` §3.5 ("each `coef` is a small signed
+/// integer that the decoder applies in the predictor recurrence
+/// without scaling"). The past samples `s(t-1)..s(t-order)` are
+/// supplied by `carry` (`spec/05` §1) for the leading samples of the
+/// block and by the samples generated earlier in this same block for
+/// the trailing samples.
+///
+/// The QLPC predictor is **mean-invariant** per `spec/03` §3.12 /
+/// `spec/05` §2 (its prediction is a linear function of past *samples*
+/// which already incorporate the channel mean), so this function takes
+/// no `mu_chan` argument.
+///
+/// `bs` is the current sub-block size (default `H_blocksize`, may be
+/// overridden per `spec/03` §3.6 — not yet wired up). As with
+/// [`decode_diff_block`] the caller owns the post-block state-update
+/// step (`carry.update_after_block(&block)` and
+/// `mean.record_block(&block)`); this function does not mutate `carry`
+/// or any mean estimator.
+///
+/// Returns the decoded block as `Vec<i32>` of length exactly `bs`.
+///
+/// Errors:
+///
+/// * [`Error::LpcOrderTooLarge`] — the per-block order exceeds the
+///   carry length (the carry cannot supply the required history) or
+///   the implementation cap [`MAX_LPC_ORDER`].
+/// * [`Error::EnergyTooLarge`] — the encoded energy plus one exceeds
+///   the implementation cap [`MAX_RESIDUAL_WIDTH`].
+/// * [`Error::BlockTooLarge`] — `bs` exceeds the implementation
+///   safety cap.
+/// * [`Error::SampleOverflow`] — a reconstructed sample fell outside
+///   `i32` range.
+/// * [`Error::Truncated`] / [`Error::OverflowingUvar`] — bit-stream
+///   exhaustion or pathological `uvar` prefix.
+pub fn decode_qlpc_block(
+    reader: &mut BitReader<'_>,
+    bs: u32,
+    carry: &ChannelCarry,
+) -> Result<Vec<i32>> {
+    if bs > MAX_BLOCK_SAMPLES {
+        return Err(Error::BlockTooLarge(bs));
+    }
+
+    // Per-block LPC order: uvar(LPCQSIZE).
+    let order = reader.read_uvar(LPCQSIZE)?;
+    if order > MAX_LPC_ORDER {
+        return Err(Error::LpcOrderTooLarge {
+            order,
+            carry_len: carry.len() as u32,
+        });
+    }
+    // The carry must supply `order` past samples for the first block
+    // sample's prediction (`s(t-1)..s(t-order)`). spec/03 §3.11 pins the
+    // carry length at `max(3, H_maxlpcorder)` and §3.5 bounds the order
+    // at `H_maxlpcorder`, so a well-formed stream always satisfies
+    // `order <= carry.len()`.
+    if order as usize > carry.len() {
+        return Err(Error::LpcOrderTooLarge {
+            order,
+            carry_len: carry.len() as u32,
+        });
+    }
+
+    // The `order` quantised coefficients, in transmission order:
+    // coef[0] = a₁ (applies to s(t-1)), coef[1] = a₂ (s(t-2)), ...
+    let mut coef: Vec<i64> = Vec::with_capacity(order as usize);
+    for _ in 0..order {
+        coef.push(reader.read_svar(LPCQUANT)?);
+    }
+
+    // Energy field + the `+1` residual-width adjustment of spec/05 §3
+    // (spec/05 §3.2 confirms QLPC follows the same convention).
+    let energy_encoded = reader.read_uvar(ENERGYSIZE)?;
+    let width = energy_encoded
+        .checked_add(1)
+        .ok_or(Error::EnergyTooLarge(energy_encoded))?;
+    if width > MAX_RESIDUAL_WIDTH {
+        return Err(Error::EnergyTooLarge(energy_encoded));
+    }
+
+    // History window in i64. `hist[0] = s(t-1)`, `hist[1] = s(t-2)`,
+    // …, most-recent-first, matching the carry's indexing convention.
+    // Seeded from the carry; updated in-place as block samples emit.
+    let order_usize = order as usize;
+    let mut hist: Vec<i64> = (0..order_usize).map(|i| carry.at(i) as i64).collect();
+
+    let mut out: Vec<i32> = Vec::with_capacity(bs as usize);
+    for _ in 0..bs {
+        let residual: i64 = reader.read_svar(width)?;
+        // ŝ_QLPC(t) = Σᵢ aᵢ · s(t-i); coef[i] pairs with hist[i] =
+        // s(t-1-i). Accumulate in i64 headroom.
+        let mut predicted: i64 = 0;
+        for (c, h) in coef.iter().zip(hist.iter()) {
+            let term = c.checked_mul(*h).ok_or(Error::SampleOverflow)?;
+            predicted = predicted.checked_add(term).ok_or(Error::SampleOverflow)?;
+        }
+        let s = predicted
+            .checked_add(residual)
+            .ok_or(Error::SampleOverflow)?;
+        let s_i32: i32 = s.try_into().map_err(|_| Error::SampleOverflow)?;
+        out.push(s_i32);
+        // Slide the history window: the just-emitted sample becomes the
+        // new most-recent past sample.
+        if order_usize > 0 {
+            for i in (1..order_usize).rev() {
+                hist[i] = hist[i - 1];
+            }
+            hist[0] = s;
+        }
     }
     Ok(out)
 }
@@ -1007,6 +1162,221 @@ mod tests {
         let blk_b = decode_diff_block(&mut r_b, PolyOrder::Order0, bs, &carry, estimator.mu_chan())
             .expect("DIFF0 block B");
         assert_eq!(blk_b, vec![30, 31, 29, 32, 28]);
+    }
+
+    // -------------------------------------------------------------
+    // Quantised-LPC predictor tests (round 5 — spec/03 §3.5).
+    // -------------------------------------------------------------
+
+    /// Assemble a synthetic `BLOCK_FN_QLPC` payload (function-code-
+    /// already-consumed): order (`uvar(LPCQSIZE)`) + `order`
+    /// coefficients (`svar(LPCQUANT)`) + energy (`uvar(ENERGYSIZE)`) +
+    /// `residuals.len()` residuals (`svar(energy_encoded + 1)`).
+    fn synth_qlpc_payload(coefs: &[i64], energy_encoded: u32, residuals: &[i64]) -> Vec<u8> {
+        let width = energy_encoded + 1;
+        let mut bits = Vec::new();
+        bits.extend(encode_uvar(coefs.len() as u32, LPCQSIZE));
+        for &c in coefs {
+            bits.extend(encode_svar(c, LPCQUANT));
+        }
+        bits.extend(encode_uvar(energy_encoded, ENERGYSIZE));
+        for &r in residuals {
+            bits.extend(encode_svar(r, width));
+        }
+        pack_bits_msb_first(&bits)
+    }
+
+    #[test]
+    fn qlpc_constants_match_spec02_section_4_3_and_4_4() {
+        // spec/02 §4.3: LPCQSIZE = 2; §4.4: LPCQUANT = 2.
+        assert_eq!(LPCQSIZE, 2);
+        assert_eq!(LPCQUANT, 2);
+    }
+
+    #[test]
+    fn decode_qlpc_order0_reduces_to_residual_stream() {
+        // spec/03 §3.5: order 0 means no coefficients and the predictor
+        // sum is empty -> s(t) = e(t). The TR.156 man-page note that
+        // "for version 2 and above, the search is started at zero order"
+        // makes order 0 a legitimate per-block choice.
+        let residuals: Vec<i64> = vec![0, 1, -1, 7, -7, 3];
+        let buf = synth_qlpc_payload(&[], 3, &residuals); // width 4
+        let mut r = BitReader::new(&buf);
+        let carry = ChannelCarry::new(3);
+        let block = decode_qlpc_block(&mut r, residuals.len() as u32, &carry)
+            .expect("QLPC order 0 decodes");
+        let expected: Vec<i32> = residuals.iter().map(|&x| x as i32).collect();
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn decode_qlpc_order1_applies_single_coefficient_without_scaling() {
+        // spec/03 §3.5: s(t) = a1 * s(t-1) + e(t), coefficients applied
+        // without scaling. With a1 = 1 the predictor is identical to
+        // DIFF1 (cumulative sum) from a zero carry.
+        //   r = [5, 3, -2, 4]:
+        //     s0 = 1*0 + 5 = 5
+        //     s1 = 1*5 + 3 = 8
+        //     s2 = 1*8 - 2 = 6
+        //     s3 = 1*6 + 4 = 10
+        let residuals: Vec<i64> = vec![5, 3, -2, 4];
+        let expected: Vec<i32> = vec![5, 8, 6, 10];
+        let buf = synth_qlpc_payload(&[1], 3, &residuals); // width 4
+        let mut r = BitReader::new(&buf);
+        let carry = ChannelCarry::new(3);
+        let block = decode_qlpc_block(&mut r, residuals.len() as u32, &carry)
+            .expect("QLPC order 1 decodes");
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn decode_qlpc_order1_with_coefficient_two() {
+        // a1 = 2, no scaling: s(t) = 2*s(t-1) + e(t), zero carry.
+        //   r = [1, 0, 0, 0]:
+        //     s0 = 2*0 + 1 = 1
+        //     s1 = 2*1 + 0 = 2
+        //     s2 = 2*2 + 0 = 4
+        //     s3 = 2*4 + 0 = 8
+        let residuals: Vec<i64> = vec![1, 0, 0, 0];
+        let expected: Vec<i32> = vec![1, 2, 4, 8];
+        let buf = synth_qlpc_payload(&[2], 2, &residuals); // width 3
+        let mut r = BitReader::new(&buf);
+        let carry = ChannelCarry::new(3);
+        let block = decode_qlpc_block(&mut r, residuals.len() as u32, &carry)
+            .expect("QLPC a1=2 must decode");
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn decode_qlpc_order2_applies_two_coefficients_in_transmission_order() {
+        // spec/03 §3.5: ŝ(t) = a1*s(t-1) + a2*s(t-2). coef[0]=a1 pairs
+        // with s(t-1); coef[1]=a2 pairs with s(t-2).
+        // With a1 = 2, a2 = -1 the predictor mimics DIFF2's line-fit
+        // (2*s(t-1) - s(t-2)), zero carry:
+        //   r = [1, 0, 0, 0, 0]:
+        //     s0 = 2*0 - 1*0 + 1 = 1
+        //     s1 = 2*1 - 1*0 + 0 = 2
+        //     s2 = 2*2 - 1*1 + 0 = 3
+        //     s3 = 2*3 - 1*2 + 0 = 4
+        //     s4 = 2*4 - 1*3 + 0 = 5
+        let residuals: Vec<i64> = vec![1, 0, 0, 0, 0];
+        let expected: Vec<i32> = vec![1, 2, 3, 4, 5];
+        let buf = synth_qlpc_payload(&[2, -1], 2, &residuals); // width 3
+        let mut r = BitReader::new(&buf);
+        let carry = ChannelCarry::new(3);
+        let block = decode_qlpc_block(&mut r, residuals.len() as u32, &carry)
+            .expect("QLPC order 2 must decode");
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn decode_qlpc_reads_history_from_carry() {
+        // The first samples of the block use the carry-supplied history.
+        // carry = [10, 20, 30] (s(t-1)=10, s(t-2)=20, s(t-3)=30).
+        // order 1, a1 = 1, r = [5, -3]:
+        //   s0 = 1*10 + 5 = 15
+        //   s1 = 1*15 - 3 = 12
+        let residuals: Vec<i64> = vec![5, -3];
+        let expected: Vec<i32> = vec![15, 12];
+        let buf = synth_qlpc_payload(&[1], 3, &residuals); // width 4
+        let mut r = BitReader::new(&buf);
+        let mut carry = ChannelCarry::new(3);
+        carry.samples = vec![10, 20, 30];
+        let block = decode_qlpc_block(&mut r, residuals.len() as u32, &carry)
+            .expect("QLPC with carry must decode");
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn decode_qlpc_order2_reads_two_history_samples_from_carry() {
+        // carry = [10, 20, 30]. order 2, a1=2, a2=-1, r = [0, 0]:
+        //   s0 = 2*10 - 1*20 + 0 = 0
+        //   s1 = 2*0  - 1*10 + 0 = -10   (s(t-1)=s0=0, s(t-2)=10)
+        let residuals: Vec<i64> = vec![0, 0];
+        let expected: Vec<i32> = vec![0, -10];
+        let buf = synth_qlpc_payload(&[2, -1], 0, &residuals); // width 1
+        let mut r = BitReader::new(&buf);
+        let mut carry = ChannelCarry::new(3);
+        carry.samples = vec![10, 20, 30];
+        let block = decode_qlpc_block(&mut r, residuals.len() as u32, &carry)
+            .expect("QLPC order 2 with carry must decode");
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn decode_qlpc_rejects_order_exceeding_carry_length() {
+        // A carry of length 3 cannot supply history for an order-4
+        // predictor. The order field is uvar(2) = 4 (one leading zero +
+        // terminator + mantissa "00").
+        let buf = synth_qlpc_payload(&[1, 1, 1, 1], 0, &[0, 0, 0, 0]);
+        let mut r = BitReader::new(&buf);
+        let carry = ChannelCarry::new(3);
+        let result = decode_qlpc_block(&mut r, 4, &carry);
+        assert_eq!(
+            result,
+            Err(Error::LpcOrderTooLarge {
+                order: 4,
+                carry_len: 3
+            })
+        );
+    }
+
+    #[test]
+    fn decode_qlpc_accepts_order_up_to_carry_length() {
+        // A carry of length 4 (H_maxlpcorder = 4) admits an order-4
+        // predictor. coef = [1,0,0,0] reduces to s(t) = s(t-1) + e(t).
+        let residuals: Vec<i64> = vec![3, 4, 5];
+        let expected: Vec<i32> = vec![3, 7, 12];
+        let buf = synth_qlpc_payload(&[1, 0, 0, 0], 3, &residuals); // width 4
+        let mut r = BitReader::new(&buf);
+        let carry = ChannelCarry::new(4);
+        let block = decode_qlpc_block(&mut r, residuals.len() as u32, &carry)
+            .expect("QLPC order 4 with len-4 carry must decode");
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn decode_qlpc_rejects_oversized_block() {
+        let buf = synth_qlpc_payload(&[1], 0, &[0]);
+        let mut r = BitReader::new(&buf);
+        let carry = ChannelCarry::new(3);
+        let result = decode_qlpc_block(&mut r, MAX_BLOCK_SAMPLES + 1, &carry);
+        assert_eq!(result, Err(Error::BlockTooLarge(MAX_BLOCK_SAMPLES + 1)));
+    }
+
+    #[test]
+    fn decode_qlpc_truncated_input_returns_truncated() {
+        // Order + coefficients present but the energy / residual reads
+        // run past the buffer.
+        let mut bits = Vec::new();
+        bits.extend(encode_uvar(1, LPCQSIZE));
+        bits.extend(encode_svar(1, LPCQUANT));
+        // No energy field — the read_uvar(ENERGYSIZE) exhausts the buffer
+        // once the cache is drained.
+        let buf = pack_bits_msb_first(&bits);
+        let mut r = BitReader::new(&buf);
+        let carry = ChannelCarry::new(3);
+        let result = decode_qlpc_block(&mut r, 4, &carry);
+        assert_eq!(result, Err(Error::Truncated));
+    }
+
+    #[test]
+    fn decode_qlpc_negative_coefficients_unfold_correctly() {
+        // Verify the svar one's-complement folding round-trips through
+        // the coefficient reads: a1 = -1 means s(t) = -s(t-1) + e(t).
+        // carry zero, r = [5, 0, 0, 0]:
+        //   s0 = -1*0 + 5 = 5
+        //   s1 = -1*5 + 0 = -5
+        //   s2 = -1*(-5) + 0 = 5
+        //   s3 = -1*5 + 0 = -5
+        let residuals: Vec<i64> = vec![5, 0, 0, 0];
+        let expected: Vec<i32> = vec![5, -5, 5, -5];
+        let buf = synth_qlpc_payload(&[-1], 3, &residuals); // width 4
+        let mut r = BitReader::new(&buf);
+        let carry = ChannelCarry::new(3);
+        let block = decode_qlpc_block(&mut r, residuals.len() as u32, &carry)
+            .expect("QLPC a1=-1 must decode");
+        assert_eq!(block, expected);
     }
 
     #[test]
