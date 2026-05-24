@@ -6,6 +6,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/OxideAV/oxideav-shorten/releases/tag/v0.0.2) - 2026-05-24
+
+### Other
+
+- round 7: full-stream decode driver (decode_stream)
+- round 6 — Implementer: BLOCK_FN_BLOCKSIZE + BLOCK_FN_BITSHIFT
+- round 5 — Implementer: BLOCK_FN_QLPC quantised-LPC predictor
+- round 4 clean-room rebuild: running mean estimator + DIFF0 / ZERO mu_chan consumers
+- round 3 clean-room rebuild: DIFFn predictors + Rice residuals + per-channel carry
+- round 2 clean-room rebuild: svar reader + per-block command dispatch (verbatim + quit)
+- round 1 clean-room rebuild: file-header parser
+- orphan rebuild: clean-room scaffold post 2026-05-18 audit
+
 ### Added
 
 - **Round 7 clean-room rebuild.** Full-stream decode driver landed
