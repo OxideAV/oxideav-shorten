@@ -142,6 +142,22 @@ impl<'a> BitReader<'a> {
         Ok(v)
     }
 
+    /// Skip `n` bits MSB-first without surfacing their value, draining
+    /// the bit stream by exactly `n` positions. Unlike [`Self::read_bits`]
+    /// the count is unbounded — the driver uses it to seek past the
+    /// variable-length header parameter block (whose total width can
+    /// exceed 32 bits) to the first per-block command. Returns
+    /// [`Error::Truncated`] if the stream exhausts before `n` bits are
+    /// drained.
+    pub fn skip_bits(&mut self, mut n: u32) -> Result<()> {
+        while n > 0 {
+            let take = n.min(32);
+            self.read_bits(take)?;
+            n -= take;
+        }
+        Ok(())
+    }
+
     /// `uvar(n)` per spec/02 §2.1: count zero bits to a terminating
     /// one, then read `n` mantissa bits. Returns `(k << n) + m` where
     /// `k` is the leading-zero count and `m` is the mantissa.
@@ -236,6 +252,38 @@ mod tests {
         assert_eq!(r.read_bits(12).unwrap(), 0xFBB);
         // Remaining 4 bits = 0b0001.
         assert_eq!(r.read_bits(4).unwrap(), 0b0001);
+    }
+
+    #[test]
+    fn skip_bits_drains_exact_count_including_over_32() {
+        // 0xFB 0xB1 0x70 0x09 0xF9 = 40 bits. Skip 12, then the next
+        // 4 bits should be 0b0001 (matching read_bits_crosses_byte_boundary),
+        // then skip the remaining 24 to exhaustion.
+        let bytes = [0xFB, 0xB1, 0x70, 0x09, 0xF9];
+        let mut r = BitReader::new(&bytes);
+        r.skip_bits(12).unwrap();
+        assert_eq!(r.read_bits(4).unwrap(), 0b0001);
+        // Skip past the 32-bit single-call cap: 24 remaining bits in one
+        // call routes through the chunked loop.
+        r.skip_bits(24).unwrap();
+        // Stream is exhausted; one more bit is Truncated.
+        assert!(matches!(r.read_bit(), Err(Error::Truncated)));
+    }
+
+    #[test]
+    fn skip_bits_zero_is_a_noop() {
+        let bytes = [0xAB];
+        let mut r = BitReader::new(&bytes);
+        r.skip_bits(0).unwrap();
+        // Still reads the first bit (MSB of 0xAB = 1).
+        assert_eq!(r.read_bit().unwrap(), 1);
+    }
+
+    #[test]
+    fn skip_bits_past_end_is_truncated() {
+        let bytes = [0xAB];
+        let mut r = BitReader::new(&bytes);
+        assert!(matches!(r.skip_bits(9), Err(Error::Truncated)));
     }
 
     #[test]

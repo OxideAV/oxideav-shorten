@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 6 (2026-05-24).** The crate was
+**Clean-room rebuild — round 7 (2026-05-24).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -19,7 +19,8 @@ command dispatch** (every code 0..=9 now has a payload decoder), the
 **polynomial-difference predictor kernels**, the **per-channel running
 mean estimator**, the **quantised-LPC predictor**, and the
 **`BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` housekeeping commands**
-of the integer-PCM decode path:
+of the integer-PCM decode path. Round 7 ties them together into the
+**full-stream decode driver** ([`decode_stream`]):
 
 * Round 1 (`spec/01` + `spec/02`):
   * `ajkg` magic + one-byte format version at file offsets
@@ -124,30 +125,58 @@ of the integer-PCM decode path:
   * Neither housekeeping command advances the channel cursor; the
     per-channel dispatch resumes on the same channel after the state
     update.
+* Round 7 (`spec/03` §2 + §3.6/§3.7 + §3.8 + `spec/05` §1 + §1.4 + §2):
+  * `decode_stream(bytes)` — the full-stream decode driver. Parses the
+    header, seeks a fresh `BitReader` past the byte-aligned magic +
+    version prefix and the variable-length parameter block (via the new
+    `BitReader::skip_bits`), then runs the per-block command loop until
+    `BLOCK_FN_QUIT`. It carries the round-robin **channel cursor**
+    (`spec/03` §2; advanced modulo `H_channels` by the sample-producing
+    commands, left unchanged by housekeeping commands), the running
+    **sub-block size** (default `H_blocksize`, overridden by
+    `BLOCK_FN_BLOCKSIZE`), the running **bit-shift** (set by
+    `BLOCK_FN_BITSHIFT`), the per-channel **sample-history carries**,
+    and the per-channel **running mean estimators** across the whole
+    stream.
+  * `DecodedStream` — the driver's output: the parsed `header`, the
+    `verbatim` byte prefix (collected from `BLOCK_FN_VERBATIM` in
+    encounter order), and `channels: Vec<Vec<i32>>` (one time-ordered
+    sample vector per channel). Per `spec/05` §1.4 the per-channel
+    carry stores the **pre-shift** sample form so the predictor
+    recurrences stay bit-shift invariant; the driver applies the
+    left-shift on **emission** only, guarding the `i64 -> i32` boundary
+    with `SampleOverflow`.
+  * `BitReader::skip_bits(n)` — unbounded MSB-first bit-skip (chunked
+    past the 32-bit `read_bits` cap) used to position the driver's
+    reader at the first per-block command.
+  * `MAX_COMMANDS` — a generous command-count safety cap (~1 billion,
+    vs. fixture `F2`'s 11,380-command stream) that bounds a malformed
+    never-terminating stream.
 
-The combined surface is exercised by **81 tests** (76 unit + 5
-integration). The five integration tests compose the header parse
+The combined surface is exercised by **94 tests** (88 unit + 6
+integration). The six integration tests compose the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
 `spec/03` §2 (round 3), DIFF0-ZERO-DIFF0-QUIT exercising the
 running-mean estimator's sliding-window update + `BLOCK_FN_ZERO`'s
 `mu_chan` fill (round 4), QLPC-QLPC-QUIT exercising an order-2 LPC
 predictor with the per-channel carry hand-off across two blocks
-(round 5), and BITSHIFT-DIFF1-BLOCKSIZE-DIFF1-QUIT exercising the
+(round 5), BITSHIFT-DIFF1-BLOCKSIZE-DIFF1-QUIT exercising the
 two housekeeping commands' state updates plus the carry hand-off
-across the BLOCKSIZE-override boundary (round 6).
+across the BLOCKSIZE-override boundary (round 6), and a full
+VERBATIM-BITSHIFT-DIFF1-DIFF0-BLOCKSIZE-DIFF1-QUIT stream decoded
+end-to-end through the public `decode_stream` driver (round 7).
 
 ### What's not yet here
 
-* Full-fixture decode driver (header + post-header bit alignment +
-  block-stream loop carrying the round-robin channel cursor + running
-  sub-block-size + running bit-shift + per-channel carries + per-
-  channel mean estimators across the entire block stream until
-  `BLOCK_FN_QUIT`).
 * `oxideav-core` `Decoder` / `Encoder` integration — `register(ctx)`
-  remains a no-op until that decode driver lands; every per-block
-  command 0..=9 now has a payload decoder, so the missing piece is
-  the orchestration loop, not any individual command's parser.
+  remains a no-op. The orchestration loop now lands as `decode_stream`,
+  so the remaining piece is the sample-format byte-packing layer (the
+  `spec/05` §6 file-type table mapping the reconstructed `i32` channel
+  samples + the verbatim host-format envelope into the container the
+  registry expects) plus the `Decoder` trait wiring itself.
+* DIFFn / QLPC **encoder** path (the crate description advertises a
+  "DIFFn encoder"); only the decode direction exists so far.
 
 ## License
 

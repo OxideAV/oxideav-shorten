@@ -1,14 +1,15 @@
 //! # oxideav-shorten
 //!
-//! **Status:** clean-room rebuild — round 6.
+//! **Status:** clean-room rebuild — round 7.
 //!
 //! The crate was orphan-rebuilt after the 2026-05-18 audit. Rounds
 //! 1+2+3+4+5+6 land the **file-header parser**, the per-block command
 //! dispatch (every code 0..=9 has a payload decoder), the
 //! polynomial-difference predictor kernels, the per-channel running
 //! mean estimator, the quantised-LPC predictor, and the
-//! `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` housekeeping commands
-//! of the integer-PCM decode path documented in
+//! `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` housekeeping commands.
+//! Round 7 ties them together with the **full-stream decode driver**
+//! ([`decode_stream`]) of the integer-PCM decode path documented in
 //! `docs/audio/shorten/spec/01-stream-header.md` through `spec/05`:
 //!
 //! * Round 1 — byte-aligned `ajkg` magic + one-byte format version
@@ -59,13 +60,24 @@
 //!   sub-block-size or bit-shift state and continues per-channel
 //!   dispatch on the same channel.
 //!
-//! With round 6 every per-block command 0..=9 has a payload decoder.
-//! The next step is a full-fixture decode driver (round-robin channel
-//! cursor + running sub-block-size + running bit-shift + carry +
-//! mean-estimator state across the entire block stream) → an
-//! `oxideav-core` `Decoder` impl wired into `register(ctx)`.
+//! * Round 7 — the full-stream decode driver [`decode_stream`]
+//!   (`spec/03` §2 + §3.6/§3.7 + §3.8 + `spec/05` §1 + §1.4 + §2):
+//!   parses the header, seeks past it, and runs the per-block command
+//!   loop, carrying the round-robin channel cursor, the running
+//!   sub-block size, the running bit-shift, the per-channel carries,
+//!   and the per-channel mean estimators across the entire stream
+//!   until `BLOCK_FN_QUIT`. Returns a [`DecodedStream`] holding the
+//!   verbatim prefix plus per-channel `Vec<i32>` sample vectors. The
+//!   per-channel carry stores pre-shift samples (`spec/05` §1.4); the
+//!   driver applies the bit-shift on emission only.
 //!
-//! The public entry points are [`parse_stream_header`],
+//! With round 7 the integer-PCM decode path is end-to-end: every
+//! per-block command 0..=9 is dispatched by the driver. The next step
+//! is the `oxideav-core` `Decoder` impl wired into `register(ctx)`
+//! (sample-format byte packing per the `spec/05` §6 file-type table,
+//! and the host-format envelope emission from the verbatim prefix).
+//!
+//! The public entry points are [`decode_stream`], [`parse_stream_header`],
 //! [`read_function_code`], [`read_verbatim_payload`],
 //! [`read_blocksize_payload`], [`read_bitshift_payload`],
 //! [`decode_diff_block`], [`decode_qlpc_block`], [`fill_zero_block`],
@@ -98,6 +110,7 @@
 
 mod bitreader;
 mod block;
+mod driver;
 mod error;
 mod header;
 mod predictor;
@@ -108,6 +121,7 @@ pub use crate::block::{
     FunctionCode, VerbatimChunk, BITSHIFTSIZE, BITSHIFT_MAX, BLOCKSIZE_MAX, FNSIZE,
     VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE, VERBATIM_MAX_LEN,
 };
+pub use crate::driver::{decode_stream, DecodedStream, MAX_COMMANDS};
 pub use crate::error::{Error, Result};
 pub use crate::header::{
     parse_stream_header, ParsedHeader, ShortenStreamHeader, MAGIC, MIN_HEADER_BYTES,
@@ -117,17 +131,18 @@ pub use crate::predictor::{
     CARRY_LEN_FLOOR, ENERGYSIZE, LPCQSIZE, LPCQUANT,
 };
 
-/// No-op codec registration — rounds 1+2+3+4+5+6 land the file-header
-/// parser, the per-block command dispatch (every code 0..=9 now has a
+/// No-op codec registration — rounds 1..=7 land the file-header
+/// parser, the per-block command dispatch (every code 0..=9 has a
 /// payload decoder), the polynomial-difference predictor kernels, the
-/// running mean estimator, the quantised-LPC predictor, and the
-/// `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` housekeeping commands.
+/// running mean estimator, the quantised-LPC predictor, the
+/// `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` housekeeping commands,
+/// and the full-stream decode driver [`decode_stream`] that
+/// orchestrates them into per-channel `Vec<i32>` sample streams.
 /// What still needs to land before this becomes a real
-/// `oxideav-core::Decoder` is the orchestration layer: a full-stream
-/// decode driver carrying the round-robin channel cursor, the running
-/// sub-block size, the running bit-shift, the per-channel carries, and
-/// the per-channel mean estimators across the entire block stream until
-/// `BLOCK_FN_QUIT`.
+/// `oxideav-core::Decoder` is the sample-format byte-packing layer (the
+/// `spec/05` §6 file-type table mapping the reconstructed `i32`
+/// channel samples + the verbatim host-format envelope into the
+/// container the registry expects).
 #[cfg(feature = "registry")]
 pub fn register(_ctx: &mut oxideav_core::RuntimeContext) {}
 

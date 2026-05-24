@@ -8,6 +8,57 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 7 clean-room rebuild.** Full-stream decode driver landed
+  against `docs/audio/shorten/spec/03-block-and-predictor.md` §2 +
+  §3.6 + §3.7 + §3.8 + `spec/05-state-and-quirks.md` §1 + §1.4 + §2 +
+  `spec/01-stream-header.md`:
+  - `decode_stream(bytes) -> Result<DecodedStream>` — the orchestration
+    loop the prior six rounds were building toward. Parses the header,
+    seeks a fresh `BitReader` past the byte-aligned magic + version
+    prefix and the variable-length parameter block, then dispatches
+    per-block commands until `BLOCK_FN_QUIT`. It carries the
+    round-robin channel cursor (`spec/03` §2; advanced modulo
+    `H_channels` by sample-producing commands, unchanged by
+    housekeeping commands), the running sub-block size (default
+    `H_blocksize`, overridden by `BLOCK_FN_BLOCKSIZE` per §3.6), the
+    running per-stream bit-shift (set by `BLOCK_FN_BITSHIFT` per §3.7),
+    the per-channel sample-history carries (`spec/05` §1), and the
+    per-channel running mean estimators (`spec/05` §2) across the whole
+    stream.
+  - `DecodedStream` — the driver's output struct: the parsed `header`,
+    the `verbatim` byte prefix (`BLOCK_FN_VERBATIM` payloads in
+    encounter order, `spec/03` §3.10), and `channels: Vec<Vec<i32>>`
+    (one time-ordered sample vector per channel). A `channel_len`
+    accessor is provided. Per `spec/05` §1.4 the per-channel carry
+    stores the pre-shift sample form (so the predictor recurrences stay
+    bit-shift invariant) and the driver applies the left-shift on
+    emission only, guarding the `i64 -> i32` boundary with
+    `SampleOverflow`.
+  - `BitReader::skip_bits(n)` — unbounded MSB-first bit-skip that loops
+    past the 32-bit `read_bits` single-call cap; used to position the
+    driver's reader at the first per-block command after the header.
+  - `MAX_COMMANDS` (~1 billion) — a command-count safety cap that
+    bounds a malformed never-terminating stream; well below it sits
+    fixture `F2`'s entire 11,380-command stream, so no realistic stream
+    is rejected. Reaching the cap surfaces
+    `BlockCommandNotImplemented`.
+  - A zero-channel header is rejected (`Error::Truncated`) — the
+    round-robin cursor is undefined for `H_channels = 0`.
+  - New integration test (`tests/decode_stream_driver.rs`) decoding a
+    single stereo v2 stream end-to-end through the public driver:
+    `VERBATIM` (4-byte prefix) → `BITSHIFT(bshift=2)` → `DIFF1` ch0 →
+    `DIFF0` ch1 → `BLOCKSIZE(new_bs=2)` → `DIFF1` ch0 (bs=2) → `QUIT`.
+    It asserts the verbatim collection, the two-channel interleave, the
+    bit-shift-on-emission / pre-shift-carry split, and the
+    blocksize-override length change. Nine driver unit tests plus three
+    `skip_bits` unit tests cover the per-command driver paths and edge
+    cases (empty `QUIT`-only stream, truncated block stream, zero
+    channels).
+  - Total test count: 81 -> 94 (88 unit + 6 integration; +12 unit +1
+    integration relative to round 6). With round 7 the integer-PCM
+    decode path is end-to-end — every per-block command 0..=9 is
+    dispatched by the driver.
+
 - **Round 6 clean-room rebuild.** Housekeeping commands
   `BLOCK_FN_BLOCKSIZE` and `BLOCK_FN_BITSHIFT` landed against
   `docs/audio/shorten/spec/03-block-and-predictor.md` §3.6 + §3.7 +
@@ -220,11 +271,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Next
 
-- Full per-fixture decode driver (header + block-stream loop +
-  round-robin channel cursor across `H_channels` channels + running
-  sub-block-size + running bit-shift + per-channel carries + per-
-  channel mean estimators + verbatim-prefix emission) → an
-  `oxideav-core` `Decoder` impl + `register(ctx)` registry wiring.
-  Every per-block command 0..=9 now has a payload decoder; the
-  remaining gap is the orchestration loop, not any individual
-  command's parser.
+- `oxideav-core` `Decoder` impl + `register(ctx)` registry wiring. The
+  full-stream decode driver (`decode_stream`) landed in round 7, so the
+  remaining gap is the sample-format byte-packing layer (the `spec/05`
+  §6 file-type table mapping the reconstructed `i32` channel samples +
+  the verbatim host-format envelope into the container the registry
+  expects) and the `Decoder` trait surface itself.
+- DIFFn / QLPC encoder path (the crate description advertises a
+  "DIFFn encoder"); only the decode direction exists so far.
