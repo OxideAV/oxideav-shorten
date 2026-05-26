@@ -71,19 +71,32 @@
 //!   per-channel carry stores pre-shift samples (`spec/05` §1.4); the
 //!   driver applies the bit-shift on emission only.
 //!
-//! With round 7 the integer-PCM decode path is end-to-end: every
-//! per-block command 0..=9 is dispatched by the driver. The next step
-//! is the `oxideav-core` `Decoder` impl wired into `register(ctx)`
-//! (sample-format byte packing per the `spec/05` §6 file-type table,
-//! and the host-format envelope emission from the verbatim prefix).
+//! * Round 8 — the [`oxideav_core::Decoder`] trait wrapper
+//!   [`ShortenDecoder`] (`spec/05` §6 file-type table). Adapts the
+//!   round-7 whole-stream driver into the framework's packet-in /
+//!   frame-out shape: `send_packet` buffers bytes until
+//!   [`decode_stream`] returns successfully, then emits one
+//!   [`oxideav_core::AudioFrame`] holding planar PCM packed per the
+//!   `H_filetype` byte-order table (filetype `2`/`u8` → 1 byte,
+//!   `3`/`s16hl` → big-endian `i16`, `5`/`s16lh` → little-endian
+//!   `i16`). [`make_decoder`] / [`register_codecs`] expose the
+//!   factory under the codec id `"shorten"`; [`register`] now wires
+//!   it into a `RuntimeContext`'s codec registry. The encoder side
+//!   stays unimplemented — that's the remaining README "lacks" tail.
+//!
+//! With round 7 the integer-PCM decode path is end-to-end; round 8
+//! ties it into the framework's resolver. Every per-block command
+//! 0..=9 is dispatched by the driver, and a `RuntimeContext` can now
+//! resolve a Shorten decoder by codec id.
 //!
 //! The public entry points are [`decode_stream`], [`parse_stream_header`],
 //! [`read_function_code`], [`read_verbatim_payload`],
 //! [`read_blocksize_payload`], [`read_bitshift_payload`],
 //! [`decode_diff_block`], [`decode_qlpc_block`], [`fill_zero_block`],
-//! and [`MeanEstimator`]. The [`Error::NotImplemented`] sentinel
-//! remains available for any API the orphan-rebuild scaffold has not
-//! yet wired up.
+//! [`MeanEstimator`], plus the round-8 trait wiring [`ShortenDecoder`]
+//! / [`make_decoder`] / [`register_codecs`]. The
+//! [`Error::NotImplemented`] sentinel remains available for any API
+//! the orphan-rebuild scaffold has not yet wired up.
 //!
 //! ## Clean-room provenance
 //!
@@ -110,6 +123,8 @@
 
 mod bitreader;
 mod block;
+#[cfg(feature = "registry")]
+mod codec;
 mod driver;
 mod error;
 mod header;
@@ -121,6 +136,11 @@ pub use crate::block::{
     FunctionCode, VerbatimChunk, BITSHIFTSIZE, BITSHIFT_MAX, BLOCKSIZE_MAX, FNSIZE,
     VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE, VERBATIM_MAX_LEN,
 };
+#[cfg(feature = "registry")]
+pub use crate::codec::{
+    make_decoder, register_codecs, ShortenDecoder, CODEC_ID_STR, FILETYPE_S16HL, FILETYPE_S16LH,
+    FILETYPE_U8,
+};
 pub use crate::driver::{decode_stream, DecodedStream, MAX_COMMANDS};
 pub use crate::error::{Error, Result};
 pub use crate::header::{
@@ -131,20 +151,15 @@ pub use crate::predictor::{
     CARRY_LEN_FLOOR, ENERGYSIZE, LPCQSIZE, LPCQUANT,
 };
 
-/// No-op codec registration — rounds 1..=7 land the file-header
-/// parser, the per-block command dispatch (every code 0..=9 has a
-/// payload decoder), the polynomial-difference predictor kernels, the
-/// running mean estimator, the quantised-LPC predictor, the
-/// `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` housekeeping commands,
-/// and the full-stream decode driver [`decode_stream`] that
-/// orchestrates them into per-channel `Vec<i32>` sample streams.
-/// What still needs to land before this becomes a real
-/// `oxideav-core::Decoder` is the sample-format byte-packing layer (the
-/// `spec/05` §6 file-type table mapping the reconstructed `i32`
-/// channel samples + the verbatim host-format envelope into the
-/// container the registry expects).
+/// Install the Shorten decoder factory into the runtime context's
+/// codec registry. Round 8 (paired with the round-7 whole-stream
+/// driver [`decode_stream`]) wires [`ShortenDecoder`] in as the
+/// `oxideav_core::Decoder` implementation for codec id `"shorten"`.
+/// The encoder side stays unimplemented per the README "lacks" tail.
 #[cfg(feature = "registry")]
-pub fn register(_ctx: &mut oxideav_core::RuntimeContext) {}
+pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
+    codec::register_codecs(&mut ctx.codecs);
+}
 
 #[cfg(feature = "registry")]
 oxideav_core::register!("shorten", register);

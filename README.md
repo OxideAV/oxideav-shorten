@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 7 (2026-05-24).** The crate was
+**Clean-room rebuild — round 8 (2026-05-26).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -20,7 +20,9 @@ command dispatch** (every code 0..=9 now has a payload decoder), the
 mean estimator**, the **quantised-LPC predictor**, and the
 **`BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` housekeeping commands**
 of the integer-PCM decode path. Round 7 ties them together into the
-**full-stream decode driver** ([`decode_stream`]):
+**full-stream decode driver** ([`decode_stream`]). Round 8 wires the
+driver into the framework's [`oxideav_core::Decoder`] trait via the
+**[`ShortenDecoder`]** adaptor + **`register_codecs`** factory:
 
 * Round 1 (`spec/01` + `spec/02`):
   * `ajkg` magic + one-byte format version at file offsets
@@ -153,8 +155,29 @@ of the integer-PCM decode path. Round 7 ties them together into the
     vs. fixture `F2`'s 11,380-command stream) that bounds a malformed
     never-terminating stream.
 
-The combined surface is exercised by **94 tests** (88 unit + 6
-integration). The six integration tests compose the header parse
+* Round 8 (`spec/05` §6 + `spec/03` §3.10 + `oxideav-core`
+  `Decoder` trait):
+  * `ShortenDecoder` — packet-in / frame-out adaptor that buffers
+    incoming `Packet` bytes, runs `decode_stream` once enough bytes
+    are present, and emits one planar `AudioFrame` packed per the
+    `H_filetype` byte-order rule of `spec/05` §6. Filetype `2`
+    (`u8`) packs as `U8P` (one byte per sample); filetype `3`
+    (`s16hl`) packs as `S16P` big-endian; filetype `5` (`s16lh`)
+    packs as `S16P` little-endian. The eight unpinned TR.156 labels
+    surface `Error::Unsupported`.
+  * `verbatim_prefix()` accessor on the concrete `ShortenDecoder`
+    type exposes the host-format envelope bytes collected from
+    `BLOCK_FN_VERBATIM` commands.
+  * `make_decoder` / `register_codecs` — the historical direct
+    factory shape plus the `CodecRegistry` installer. The crate's
+    `register(ctx)` entry point now wires the decoder factory into a
+    `RuntimeContext`'s codec registry under codec id `"shorten"`.
+  * Split-packet streaming: a caller may deliver the `.shn` file in
+    arbitrary slices across multiple `send_packet` calls; the
+    wrapper buffers until `decode_stream` produces a frame.
+
+The combined surface is exercised by **107 tests** (100 unit + 7
+integration). The seven integration tests compose the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
 `spec/03` §2 (round 3), DIFF0-ZERO-DIFF0-QUIT exercising the
@@ -163,20 +186,23 @@ running-mean estimator's sliding-window update + `BLOCK_FN_ZERO`'s
 predictor with the per-channel carry hand-off across two blocks
 (round 5), BITSHIFT-DIFF1-BLOCKSIZE-DIFF1-QUIT exercising the
 two housekeeping commands' state updates plus the carry hand-off
-across the BLOCKSIZE-override boundary (round 6), and a full
+across the BLOCKSIZE-override boundary (round 6), a full
 VERBATIM-BITSHIFT-DIFF1-DIFF0-BLOCKSIZE-DIFF1-QUIT stream decoded
-end-to-end through the public `decode_stream` driver (round 7).
+end-to-end through the public `decode_stream` driver (round 7), and
+a trait-driven decode of a synthetic two-channel `s16lh` stream
+resolved out of `CodecRegistry::first_decoder` whose `AudioFrame`
+plane bytes match the direct `decode_stream` output byte-for-byte
+(round 8).
 
 ### What's not yet here
 
-* `oxideav-core` `Decoder` / `Encoder` integration — `register(ctx)`
-  remains a no-op. The orchestration loop now lands as `decode_stream`,
-  so the remaining piece is the sample-format byte-packing layer (the
-  `spec/05` §6 file-type table mapping the reconstructed `i32` channel
-  samples + the verbatim host-format envelope into the container the
-  registry expects) plus the `Decoder` trait wiring itself.
 * DIFFn / QLPC **encoder** path (the crate description advertises a
   "DIFFn encoder"); only the decode direction exists so far.
+* Sample-format byte-packing for the eight TR.156 labels that
+  `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
+  `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking
+  requires either additional fixtures or the reference encoder's
+  output observed under each `-t` invocation.
 
 ## License
 

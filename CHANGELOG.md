@@ -21,6 +21,61 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 8 clean-room rebuild.** `oxideav_core::Decoder` trait
+  wiring landed against `docs/audio/shorten/spec/05-state-and-quirks.md`
+  §6 (file-type-code numeric mapping), `spec/03` §3.10 (verbatim
+  prefix collection), and the public `oxideav-core` `Decoder` trait
+  contract:
+  - `ShortenDecoder` — packet-in / frame-out adaptor wrapping the
+    round-7 `decode_stream` driver. `send_packet` appends incoming
+    `Packet` bytes to an internal buffer and eagerly tries
+    `decode_stream`; on `Truncated` (or a short-buffer `InvalidMagic`
+    before the 5-byte prefix has arrived) the wrapper leaves the
+    buffer in place so the caller can deliver more bytes; on success
+    it queues exactly one `AudioFrame` and sets EOF.
+  - `pack_decoded_stream_to_frame` (internal) — sample-format byte
+    packing per `spec/05` §6: filetype `2`/`u8` packs each `i32`
+    channel sample as one `u8` per plane byte; filetype `3`/`s16hl`
+    packs as 16-bit signed big-endian; filetype `5`/`s16lh` packs as
+    16-bit signed little-endian. The eight unpinned TR.156 labels
+    (`ulaw`, `s8`, `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`)
+    surface `oxideav_core::Error::Unsupported`.
+  - `verbatim_prefix()` accessor on the concrete `ShortenDecoder`
+    type exposes the host-format envelope bytes collected from
+    `BLOCK_FN_VERBATIM` commands; the boxed-trait surface returns
+    only `AudioFrame`.
+  - `make_decoder(params) -> Result<Box<dyn Decoder>>` and
+    `register_codecs(reg)` exposed at the crate root (gated on the
+    `registry` feature, default-on); the crate's `register(ctx)`
+    entry point now installs the decoder factory into the runtime
+    context's codec registry under codec id `"shorten"`.
+  - Public constants: `CODEC_ID_STR = "shorten"`, `FILETYPE_U8 = 2`,
+    `FILETYPE_S16HL = 3`, `FILETYPE_S16LH = 5` — pinned by
+    `spec/05` §6 against fixtures `F2` / `F3` / `F1` respectively.
+  - Reset semantics: `Decoder::reset` drops the buffer, the queued
+    frame, the verbatim prefix, and the `decoded`/`eof` flags so the
+    next `send_packet` starts as if no prior packets had been
+    processed. `Decoder::flush` makes a final decode attempt against
+    the buffered bytes before setting EOF.
+  - Split-packet streaming: a caller may deliver the `.shn` file in
+    multiple slices across separate `send_packet` calls; the
+    integration test `split_packet_streaming_assembles_to_one_frame`
+    exercises this with a mid-stream split.
+  - New integration test (`tests/decoder_trait_roundtrip.rs`,
+    `registry`-feature-gated) decodes a synthetic two-channel
+    `s16lh` stream through the registered factory resolved out of
+    `CodecRegistry::first_decoder` and asserts the emitted plane
+    bytes match the direct `decode_stream` output byte-for-byte
+    after hand-packing each channel's `i32` samples to little-endian
+    `i16`. A second integration test pins the registration surface
+    independently (`register_codecs` + `has_decoder` +
+    `first_decoder` path).
+  - Total test count: 94 -> 107 (100 unit + 7 integration; +12 unit
+    + 1 integration test file with 2 tests relative to round 7).
+    The README "lacks" tail's `oxideav-core Decoder wiring` item is
+    closed; the remaining tail item is the DIFFn / QLPC encoder
+    path.
+
 - **Round 7 clean-room rebuild.** Full-stream decode driver landed
   against `docs/audio/shorten/spec/03-block-and-predictor.md` §2 +
   §3.6 + §3.7 + §3.8 + `spec/05-state-and-quirks.md` §1 + §1.4 + §2 +
