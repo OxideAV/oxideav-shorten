@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 8 (2026-05-26).** The crate was
+**Clean-room rebuild — round 9 (2026-05-29).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -22,7 +22,12 @@ mean estimator**, the **quantised-LPC predictor**, and the
 of the integer-PCM decode path. Round 7 ties them together into the
 **full-stream decode driver** ([`decode_stream`]). Round 8 wires the
 driver into the framework's [`oxideav_core::Decoder`] trait via the
-**[`ShortenDecoder`]** adaptor + **`register_codecs`** factory:
+**[`ShortenDecoder`]** adaptor + **`register_codecs`** factory. Round 9
+adds the **`SHNAMPSK`-tagged seek-table trailer detector**
+([`detect_shnampsk_trailer`] / [`split_off_shnampsk_trailer`]) so
+callers can separate a publicly-distributed `.shn` file's
+SHN-stream-proper bytes from the non-standard sidecar appended by
+Wayne Stielau's seek-table utility:
 
 * Round 1 (`spec/01` + `spec/02`):
   * `ajkg` magic + one-byte format version at file offsets
@@ -176,8 +181,31 @@ driver into the framework's [`oxideav_core::Decoder`] trait via the
     arbitrary slices across multiple `send_packet` calls; the
     wrapper buffers until `decode_stream` produces a frame.
 
-The combined surface is exercised by **107 tests** (100 unit + 7
-integration). The seven integration tests compose the header parse
+* Round 9 (`spec/05` §5.1 + §5.2 + §5.3):
+  * `detect_shnampsk_trailer(bytes) -> Result<Option<ShnampskTrailer>>`
+    — identifies the 12-byte trailer tail layout pinned by
+    `spec/05` §5.1 (4-byte little-endian `len_u32` sidecar length +
+    8-byte ASCII `SHNAMPSK` signature) and verifies the `SEEK`
+    magic anchor at the computed sidecar-start offset
+    `len(file) − len_u32`. Returns `None` when the signature is
+    absent (matches fixture `F9` / `Choppy.shn` per §5.3);
+    surfaces `Error::MalformedShnampskTrailer` when the signature
+    is present but the `len_u32` field or `SEEK` anchor is
+    inconsistent.
+  * `split_off_shnampsk_trailer(bytes)` — convenience wrapper
+    returning `(shn_proper, sidecar_opt)` so callers can hand the
+    SHN-stream-proper slice directly to `decode_stream` per
+    `spec/05` §5.2 (the wire format itself terminates at
+    `BLOCK_FN_QUIT`'s zero-bit padding; bytes after that are out
+    of scope and the decoder may ignore them).
+  * Public constants `SHNAMPSK_SIGNATURE` (`b"SHNAMPSK"`),
+    `SEEK_MAGIC` (`b"SEEK"`), `TRAILER_TAIL_LEN = 12`,
+    `MIN_SIDECAR_LEN = 16`, and `SIDECAR_LEN_CAP = 16 MiB`
+    (implementation safety cap; the `spec/05` §5 narrative does
+    not pin a numeric cap).
+
+The combined surface is exercised by **127 tests** (118 unit + 9
+integration). The nine integration tests compose the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
 `spec/03` §2 (round 3), DIFF0-ZERO-DIFF0-QUIT exercising the
@@ -188,11 +216,14 @@ predictor with the per-channel carry hand-off across two blocks
 two housekeeping commands' state updates plus the carry hand-off
 across the BLOCKSIZE-override boundary (round 6), a full
 VERBATIM-BITSHIFT-DIFF1-DIFF0-BLOCKSIZE-DIFF1-QUIT stream decoded
-end-to-end through the public `decode_stream` driver (round 7), and
+end-to-end through the public `decode_stream` driver (round 7),
 a trait-driven decode of a synthetic two-channel `s16lh` stream
 resolved out of `CodecRegistry::first_decoder` whose `AudioFrame`
 plane bytes match the direct `decode_stream` output byte-for-byte
-(round 8).
+(round 8), and two SHNAMPSK-trailer composition tests verifying that
+a synthetic `s16lh` stream decodes identically with and without a
+well-formed trailer appended after `BLOCK_FN_QUIT`'s zero-bit
+padding (round 9).
 
 ### What's not yet here
 

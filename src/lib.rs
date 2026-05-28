@@ -71,6 +71,24 @@
 //!   per-channel carry stores pre-shift samples (`spec/05` §1.4); the
 //!   driver applies the bit-shift on emission only.
 //!
+//! * Round 9 — the [`SHNAMPSK`-tagged seek-table trailer detector]
+//!   ([`detect_shnampsk_trailer`] / [`split_off_shnampsk_trailer`])
+//!   per `spec/05` §5.1 + §5.2 + §5.3. Several publicly-distributed
+//!   `.shn` files carry a non-standard sidecar appended after the
+//!   encoder's `BLOCK_FN_QUIT` zero-bit padding (added by Wayne
+//!   Stielau's seek-table utility per `spec/05` §5); the detector
+//!   identifies the trailer's last 12 bytes (4-byte LE `len_u32` +
+//!   8-byte `SHNAMPSK` signature) and the sidecar's `SEEK` magic
+//!   anchor at `len(file) − len_u32` so the caller can either ignore
+//!   the trailer (the default — [`decode_stream`] terminates at
+//!   `BLOCK_FN_QUIT` and never reads into the sidecar) or hand it
+//!   to an external seek-table parser. The detector returns `None`
+//!   when the signature is absent (matches fixture `F9` /
+//!   `Choppy.shn` per `spec/05` §5.3) and surfaces
+//!   [`Error::MalformedShnampskTrailer`] when the signature is
+//!   present but the `len_u32` / `SEEK` anchor pair is structurally
+//!   inconsistent.
+//!
 //! * Round 8 — the [`oxideav_core::Decoder`] trait wrapper
 //!   [`ShortenDecoder`] (`spec/05` §6 file-type table). Adapts the
 //!   round-7 whole-stream driver into the framework's packet-in /
@@ -129,6 +147,7 @@ mod driver;
 mod error;
 mod header;
 mod predictor;
+mod sidecar;
 
 pub use crate::bitreader::{BitReader, ULONGSIZE};
 pub use crate::block::{
@@ -149,6 +168,10 @@ pub use crate::header::{
 pub use crate::predictor::{
     decode_diff_block, decode_qlpc_block, fill_zero_block, ChannelCarry, MeanEstimator, PolyOrder,
     CARRY_LEN_FLOOR, ENERGYSIZE, LPCQSIZE, LPCQUANT,
+};
+pub use crate::sidecar::{
+    detect_shnampsk_trailer, split_off_shnampsk_trailer, ShnampskTrailer, MIN_SIDECAR_LEN,
+    SEEK_MAGIC, SHNAMPSK_SIGNATURE, SIDECAR_LEN_CAP, TRAILER_TAIL_LEN,
 };
 
 /// Install the Shorten decoder factory into the runtime context's

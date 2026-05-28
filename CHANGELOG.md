@@ -6,6 +6,77 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Round 9 clean-room rebuild.** `SHNAMPSK`-tagged seek-table
+  trailer detector landed against
+  `docs/audio/shorten/spec/05-state-and-quirks.md` §5.1
+  (trailer layout), §5.2 (decoder behaviour), §5.3 (fixture
+  verification anchors `F1..F8` carry the trailer; `F9` /
+  `Choppy.shn` do not):
+  - `detect_shnampsk_trailer(bytes) -> Result<Option<ShnampskTrailer>>`
+    — identifies the 12-byte tail layout (4-byte little-endian
+    `len_u32` sidecar length + 8-byte `SHNAMPSK` ASCII signature)
+    pinned by `spec/05` §5.1 and verifies the `SEEK` magic anchor at
+    the computed `len(file) − len_u32` sidecar start. Returns
+    `Ok(None)` when the signature is absent (matches fixture `F9` /
+    `Choppy.shn`); returns `Ok(Some(t))` when both the signature and
+    anchor check pass; surfaces `Error::MalformedShnampskTrailer`
+    when the signature is present but the length field is below
+    `MIN_SIDECAR_LEN`, above the implementation safety cap, or
+    larger than the file itself, or when the bytes at the computed
+    sidecar start do not begin with `SEEK`.
+  - `split_off_shnampsk_trailer(bytes) -> Result<(&[u8],
+    Option<&[u8]>)>` — convenience wrapper that returns
+    `(shn_proper, sidecar_opt)` so callers can hand the
+    SHN-stream-proper slice directly to `decode_stream` without
+    computing the slice indices themselves.
+  - `ShnampskTrailer { sidecar_start, sidecar_len }` — the parsed
+    trailer record. `sidecar_start` is the byte offset within the
+    original file at which the sidecar begins (the `S` of `SEEK`);
+    `sidecar_len` equals `bytes.len() - sidecar_start` for a
+    well-formed trailer.
+  - Public constants: `SHNAMPSK_SIGNATURE` (the 8-byte
+    `b"SHNAMPSK"`), `SEEK_MAGIC` (the 4-byte `b"SEEK"`),
+    `TRAILER_TAIL_LEN = 12` (`spec/05` §5.1), `MIN_SIDECAR_LEN = 16`
+    (sidecar must hold at least the `SEEK` magic and the
+    `TRAILER_TAIL_LEN` tail), and `SIDECAR_LEN_CAP = 16 MiB`
+    (implementation safety cap on the reported sidecar length to
+    avoid mis-interpreting an opaque byte sequence whose tail
+    coincidentally spells `SHNAMPSK`).
+  - `Error::MalformedShnampskTrailer` — new variant surfacing the
+    rejection cases above. Per `spec/05` §5.2 the decoder is free to
+    either ignore or surface the trailer; this crate's detector
+    surfaces it so callers that want the sidecar are told of any
+    structural inconsistency rather than silently receiving "no
+    trailer present".
+  - The detector does not run `decode_stream`; the existing
+    whole-stream driver of `spec/03` §3.8 already terminates at
+    `BLOCK_FN_QUIT`'s zero-bit padding (`spec/05` §4) and so never
+    reads into the trailer. Callers compose the two:
+    `decode_stream(split_off_shnampsk_trailer(bytes)?.0)`.
+  - New integration test (`tests/shnampsk_trailer_strip_then_decode.rs`)
+    exercises the composition end-to-end: a synthetic single-channel
+    `s16lh` stream with `VERBATIM → DIFF0 → QUIT` decodes identically
+    with and without an appended well-formed `SHNAMPSK` trailer; the
+    detector reports the correct `sidecar_start` / `sidecar_len` for
+    the trailer-present case and `None` for the no-trailer case.
+  - 18 unit tests plus 2 integration tests cover the present-trailer
+    path, the absent-trailer path, every rejection case (too-small
+    `len_u32`, too-large `len_u32` vs. file, over-cap `len_u32`,
+    missing `SEEK` anchor at the computed offset), the constant
+    invariants (signature ASCII bytes, magic ASCII bytes, layout
+    arithmetic), `split_off` error propagation, and a coincidental
+    `SHNAMPSK`-at-tail trap (signature present at tail, no `SEEK`
+    anchor — surfaces as malformed rather than silently chopping the
+    "trailer" off).
+  - Total test count: 107 -> 127 (118 unit + 9 integration; +18 unit
+    +1 integration test file with 2 tests relative to round 8). The
+    README "lacks" tail's reference to publicly-distributed sidecar
+    handling is closed; the remaining tail item is the DIFFn / QLPC
+    encoder path.
+
+
 ## [0.0.2](https://github.com/OxideAV/oxideav-shorten/releases/tag/v0.0.2) - 2026-05-24
 
 ### Other

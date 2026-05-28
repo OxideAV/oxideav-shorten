@@ -85,6 +85,17 @@ pub enum Error {
     /// `1..=12`. A larger value is either stream corruption or an
     /// out-of-scope format-version feature.
     BitshiftTooLarge(u32),
+    /// A file's last 8 bytes spell the `SHNAMPSK` signature
+    /// (`spec/05` §5.1 row 2) but the preceding 4-byte little-endian
+    /// `len_u32` sidecar-length field is inconsistent with the file
+    /// layout — either the length is below `MIN_SIDECAR_LEN`, above
+    /// the implementation safety cap, larger than the file itself,
+    /// or the bytes at the computed sidecar-start offset do not
+    /// begin with the 4-byte `SEEK` magic (`spec/05` §5.1
+    /// narrative). The detector surfaces this rather than silently
+    /// reporting "no trailer present" so a caller that wanted the
+    /// trailer is told the structural mismatch.
+    MalformedShnampskTrailer,
     /// Round 1 does not decode the per-block command stream that
     /// follows the parameter block. Returned from any non-header API
     /// surface that the orphan-rebuild scaffold has not wired up yet.
@@ -130,6 +141,9 @@ impl core::fmt::Display for Error {
             Error::BitshiftTooLarge(b) => write!(
                 f,
                 "oxideav-shorten: BITSHIFT command bshift {b} exceeds safety cap"
+            ),
+            Error::MalformedShnampskTrailer => f.write_str(
+                "oxideav-shorten: SHNAMPSK trailer present but len_u32 / SEEK anchor inconsistent",
             ),
             Error::NotImplemented => f.write_str(
                 "oxideav-shorten: feature not implemented in this round (file-header parser only)",
