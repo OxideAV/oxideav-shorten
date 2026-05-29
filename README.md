@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 9 (2026-05-29).** The crate was
+**Clean-room rebuild — round 10 (2026-05-29).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -181,6 +181,45 @@ Wayne Stielau's seek-table utility:
     arbitrary slices across multiple `send_packet` calls; the
     wrapper buffers until `decode_stream` produces a frame.
 
+* Round 10 (`spec/03` §2 + §3.6 + §3.7 + §3.8 + §3.10 +
+  `spec/05` §1.4 + §2):
+  * `StreamDecoder<'a>` — an `Iterator<Item = Result<DecodedBlock>>`
+    surface over the per-block command stream. Parses the file
+    header eagerly at construction; subsequent `next_block` /
+    `next` calls walk the round-robin command loop one block at a
+    time, yielding each sample-producing block (`DIFFn` / `QLPC` /
+    `ZERO`) or `VERBATIM` envelope payload as a [`DecodedBlock`]
+    item. The housekeeping commands `BLOCK_FN_BLOCKSIZE`
+    (`spec/03` §3.6) and `BLOCK_FN_BITSHIFT` (`spec/03` §3.7) are
+    absorbed silently into iterator state; they surface only via
+    the `current_block_size` / `current_bitshift` accessors.
+    `BLOCK_FN_QUIT` (`spec/03` §3.8) returns `None`. Errors are
+    yielded once then exhaust the iterator (standard
+    `Iterator<Item = Result<_, _>>` short-circuit convention).
+  * `DecodedBlock { Samples { channel, samples } | Verbatim
+    { bytes } }` — the per-block item shape, with
+    `sample_count`/`is_samples`/`is_verbatim` accessors. The
+    `Samples::samples` vector carries the **emitted** PCM
+    (left-shifted by the running bit-shift per `spec/05` §1.4);
+    the per-channel carry buffers continue to store the pre-shift
+    form internally so the predictor recurrences stay bit-shift
+    invariant.
+  * `decode_stream_iter(bytes)` — free-function form of
+    `StreamDecoder::new`.
+  * **Memory characteristic:** unlike `decode_stream`, which
+    accumulates every decoded sample into
+    `DecodedStream::channels: Vec<Vec<i32>>` ahead of the caller,
+    the iterator retains only the per-channel carries (`spec/05`
+    §1, `n_channels × max(3, H_maxlpcorder)` samples), the
+    per-channel mean estimators (`spec/05` §2, `n_channels ×
+    H_meanblocks` slots), plus the `BitReader`'s small internal
+    cache across pulls — memory reaches
+    `O(n_channels × max(3, H_maxlpcorder + H_meanblocks))`
+    independent of stream length. This is the load-bearing
+    improvement: a 10.6 MB lossless fixture (the size order of
+    `F1` per `spec/05` §2.5) decoded through the iterator never
+    materialises the full per-channel sample population at once.
+
 * Round 9 (`spec/05` §5.1 + §5.2 + §5.3):
   * `detect_shnampsk_trailer(bytes) -> Result<Option<ShnampskTrailer>>`
     — identifies the 12-byte trailer tail layout pinned by
@@ -204,8 +243,8 @@ Wayne Stielau's seek-table utility:
     (implementation safety cap; the `spec/05` §5 narrative does
     not pin a numeric cap).
 
-The combined surface is exercised by **127 tests** (118 unit + 9
-integration). The nine integration tests compose the header parse
+The combined surface is exercised by **142 tests** (130 unit + 12
+integration). The integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
 `spec/03` §2 (round 3), DIFF0-ZERO-DIFF0-QUIT exercising the
@@ -220,10 +259,16 @@ end-to-end through the public `decode_stream` driver (round 7),
 a trait-driven decode of a synthetic two-channel `s16lh` stream
 resolved out of `CodecRegistry::first_decoder` whose `AudioFrame`
 plane bytes match the direct `decode_stream` output byte-for-byte
-(round 8), and two SHNAMPSK-trailer composition tests verifying that
+(round 8), two SHNAMPSK-trailer composition tests verifying that
 a synthetic `s16lh` stream decodes identically with and without a
 well-formed trailer appended after `BLOCK_FN_QUIT`'s zero-bit
-padding (round 9).
+padding (round 9), and two streaming-iterator pipeline tests that
+(a) feed a multi-command fixture (VERBATIM-BITSHIFT-DIFF1-DIFF0-
+BLOCKSIZE-DIFF1-VERBATIM-QUIT) through both `decode_stream` and
+the new `StreamDecoder` and assert per-channel sample equality +
+concatenated verbatim equality + iterator-state mutation, and
+(b) verify on-demand pulling (decoding the first sample block
+leaves the second block undecoded until the next pull) (round 10).
 
 ### What's not yet here
 
@@ -234,6 +279,10 @@ padding (round 9).
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking
   requires either additional fixtures or the reference encoder's
   output observed under each `-t` invocation.
+* A streaming variant of the `oxideav_core::Decoder` trait wiring
+  built on `StreamDecoder` (round 10's iterator is the pure-rust
+  surface; the framework adaptor in `codec.rs` still buffers the
+  full file before emitting one frame).
 
 ## License
 

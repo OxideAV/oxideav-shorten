@@ -102,9 +102,21 @@
 //!   it into a `RuntimeContext`'s codec registry. The encoder side
 //!   stays unimplemented — that's the remaining README "lacks" tail.
 //!
+//! * Round 10 — the block-by-block streaming decode iterator
+//!   [`StreamDecoder`] / [`DecodedBlock`] / [`decode_stream_iter`]
+//!   (`spec/03` §2 + §3.6/§3.7/§3.8/§3.10 + `spec/05` §1.4 + §2).
+//!   Walks the same per-block command loop as [`decode_stream`] but
+//!   yields each sample-producing block (or `VERBATIM` envelope
+//!   payload) to the caller one at a time and discards it after the
+//!   carry/mean state has been updated — memory bounded by the header
+//!   parameters and independent of stream length, in contrast to
+//!   [`decode_stream`] which accumulates every decoded sample into
+//!   [`DecodedStream::channels`] ahead of the caller.
+//!
 //! With round 7 the integer-PCM decode path is end-to-end; round 8
-//! ties it into the framework's resolver. Every per-block command
-//! 0..=9 is dispatched by the driver, and a `RuntimeContext` can now
+//! ties it into the framework's resolver; round 10 adds an
+//! on-demand iterator surface. Every per-block command 0..=9 is
+//! dispatched by both driver shapes, and a `RuntimeContext` can
 //! resolve a Shorten decoder by codec id.
 //!
 //! The public entry points are [`decode_stream`], [`parse_stream_header`],
@@ -148,6 +160,7 @@ mod error;
 mod header;
 mod predictor;
 mod sidecar;
+mod stream_iter;
 
 pub use crate::bitreader::{BitReader, ULONGSIZE};
 pub use crate::block::{
@@ -173,6 +186,7 @@ pub use crate::sidecar::{
     detect_shnampsk_trailer, split_off_shnampsk_trailer, ShnampskTrailer, MIN_SIDECAR_LEN,
     SEEK_MAGIC, SHNAMPSK_SIGNATURE, SIDECAR_LEN_CAP, TRAILER_TAIL_LEN,
 };
+pub use crate::stream_iter::{decode_stream_iter, DecodedBlock, StreamDecoder};
 
 /// Install the Shorten decoder factory into the runtime context's
 /// codec registry. Round 8 (paired with the round-7 whole-stream

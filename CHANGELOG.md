@@ -8,6 +8,59 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 10 clean-room rebuild.** Block-by-block streaming decode
+  iterator (`docs/audio/shorten/spec/03-block-and-predictor.md` §2 +
+  §3.6/§3.7/§3.8/§3.10 + `spec/05-state-and-quirks.md` §1.4 + §2):
+  - `StreamDecoder<'a>` — a `Iterator<Item = Result<DecodedBlock>>`
+    over the per-block command stream. Parses the file header
+    eagerly at construction (so `header()` / `current_block_size()`
+    / `current_bitshift()` / `current_channel()` are observable
+    before the first pull); subsequent `next_block` / `next` calls
+    walk the round-robin command loop one block at a time, yielding
+    each sample-producing block (`DIFFn` / `QLPC` / `ZERO`) or
+    `VERBATIM` envelope payload as a `DecodedBlock` item. The
+    housekeeping commands `BLOCK_FN_BLOCKSIZE` (§3.6) and
+    `BLOCK_FN_BITSHIFT` (§3.7) are absorbed silently into the
+    iterator's state and surface only through the running-state
+    accessors. The iterator returns `None` after `BLOCK_FN_QUIT`
+    (§3.8) and short-circuits to `None` after yielding any error
+    once (standard `Iterator<Item = Result<_, _>>` convention).
+  - `DecodedBlock { Samples { channel, samples } | Verbatim
+    { bytes } }` — the per-block item shape, with `sample_count`
+    / `is_samples` / `is_verbatim` convenience accessors.
+  - `decode_stream_iter(bytes)` — convenience free function
+    equivalent to `StreamDecoder::new(bytes)`.
+  - Memory characteristic: the iterator retains only the per-channel
+    carries (`spec/05` §1) + mean estimators (`spec/05` §2) + the
+    `BitReader`'s small cache across pulls, so memory reaches
+    `O(n_channels × max(3, H_maxlpcorder + H_meanblocks))`
+    independent of stream length — the load-bearing improvement
+    over the round-7 whole-stream driver `decode_stream`, which
+    accumulates every decoded sample into `DecodedStream::channels`
+    ahead of the caller.
+  - 12 unit tests in `src/stream_iter.rs::tests` cover: single-block
+    Quit termination, VERBATIM-then-samples sequencing, two-channel
+    round-robin cursor rotation, BLOCKSIZE / BITSHIFT housekeeping
+    absorption + observable state mutation, ZERO running-mean
+    emission parity with the round-7 driver, truncated-stream
+    error short-circuit + post-error exhaustion, zero-channel
+    header rejection at construction, multi-block multi-channel
+    equivalence to the whole-stream driver, header-accessor
+    equivalence to `decode_stream`, cursor-advancement guard
+    (housekeeping vs sample-producing), and `decode_stream_iter`
+    free-function wrapper.
+  - 2 integration tests in `tests/streaming_iterator_pipeline.rs`
+    compose every command category (VERBATIM, BITSHIFT, two DIFF1
+    + one DIFF0 block, BLOCKSIZE override, second VERBATIM, QUIT)
+    into one fixture and assert (a) iterator-vs-driver per-channel
+    sample equality + concatenated-verbatim equality + item-count
+    correctness + observable-state mutation, and (b) on-demand
+    decoding (pulling the first sample block doesn't decode the
+    second block's bytes).
+  - No new wire-format behaviour, no new reconstruction
+    recurrences — a pure API re-shaping over the round-7 driver's
+    orchestration loop.
+
 - **Round 9 clean-room rebuild.** `SHNAMPSK`-tagged seek-table
   trailer detector landed against
   `docs/audio/shorten/spec/05-state-and-quirks.md` §5.1
