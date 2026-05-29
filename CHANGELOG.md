@@ -8,6 +8,62 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 11 clean-room rebuild.** Streaming `oxideav_core::Decoder`
+  trait wiring built on the same per-block dispatch as
+  `StreamDecoder` (round 10) — closes the README "lacks" tail
+  "*A streaming variant of the `oxideav_core::Decoder` trait wiring
+  built on `StreamDecoder` (round 10's iterator is the pure-rust
+  surface; the framework adaptor in `codec.rs` still buffers the
+  full file before emitting one frame).*" (`spec/03` §2 + §3.6 +
+  §3.7 + §3.8 + §3.10 + `spec/05` §1.4 + §2 + §6):
+  - `ShortenStreamingDecoder` — `oxideav_core::Decoder`
+    implementation that walks the per-block command loop
+    incrementally and emits **one planar `AudioFrame` per full
+    channel round** (one block per channel packed across all
+    channels), rather than the whole-stream `ShortenDecoder`'s
+    "buffer-the-whole-file, emit one frame" shape. Per `spec/05`
+    §1.4 the per-channel carry stores pre-shift samples; the
+    left-shift is applied on emission only. `BLOCK_FN_VERBATIM`
+    payloads accumulate incrementally onto a
+    `verbatim_prefix()` accessor without producing a frame (the
+    envelope is part of the host-format wrapper, not the sample
+    stream). `BLOCK_FN_BLOCKSIZE` and `BLOCK_FN_BITSHIFT` are
+    absorbed silently per `spec/03` §3.6/§3.7; a mid-round
+    BLOCKSIZE change is surfaced as `Error::invalid` because the
+    planar frame shape requires every plane in a frame to have
+    the same sample count.
+  - `make_streaming_decoder(params)` — factory returning a
+    boxed `Decoder` over the streaming adaptor.
+  - `register_streaming_codecs(reg)` — installs the streaming
+    decoder factory under the new codec id
+    `"shorten-streaming"` (distinct from `"shorten"`, which the
+    whole-stream wrapper continues to claim). A caller picks
+    the emission shape explicitly by codec id.
+  - `STREAMING_CODEC_ID_STR` — public string form of the
+    streaming codec id.
+  - `register(ctx)` — the framework entry now installs **both**
+    factories into the runtime context's registry, so a
+    `RuntimeContext` resolves either shape on demand.
+  - Memory characteristic: `O(buffered_bytes + n_channels ×
+    current_block_size)` plus the per-channel carries / mean
+    estimators the iterator already needs — bounded by the
+    header parameters and independent of stream length, in
+    contrast to the whole-stream wrapper which buffers
+    `O(stream_length)` of decoded samples before emitting.
+  - 10 new unit tests in `src/codec.rs::tests` cover:
+    one-block single-channel emission + EOF, two-channel
+    two-round multi-plane frames, parity with the whole-stream
+    driver on a complex DIFFn / VERBATIM / BITSHIFT / BLOCKSIZE
+    / ZERO fixture, split-packet chop-anywhere streaming
+    equivalence to whole-buffer delivery, verbatim-prefix
+    incremental accumulation across two consecutive
+    `BLOCK_FN_VERBATIM` commands, mid-round BLOCKSIZE rejection
+    as `Error::invalid`, `register_streaming_codecs` isolation
+    from `register_codecs`, `reset()` allowing a fresh
+    redecoding after partial state, on-demand stop-at-frame-
+    boundary pulls, and the framework `register(ctx)` entry
+    installing both decoder shapes into the same registry.
+
 - **Round 10 clean-room rebuild.** Block-by-block streaming decode
   iterator (`docs/audio/shorten/spec/03-block-and-predictor.md` §2 +
   §3.6/§3.7/§3.8/§3.10 + `spec/05-state-and-quirks.md` §1.4 + §2):

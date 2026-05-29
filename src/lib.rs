@@ -170,8 +170,9 @@ pub use crate::block::{
 };
 #[cfg(feature = "registry")]
 pub use crate::codec::{
-    make_decoder, register_codecs, ShortenDecoder, CODEC_ID_STR, FILETYPE_S16HL, FILETYPE_S16LH,
-    FILETYPE_U8,
+    make_decoder, make_streaming_decoder, register_codecs, register_streaming_codecs,
+    ShortenDecoder, ShortenStreamingDecoder, CODEC_ID_STR, FILETYPE_S16HL, FILETYPE_S16LH,
+    FILETYPE_U8, STREAMING_CODEC_ID_STR,
 };
 pub use crate::driver::{decode_stream, DecodedStream, MAX_COMMANDS};
 pub use crate::error::{Error, Result};
@@ -188,14 +189,18 @@ pub use crate::sidecar::{
 };
 pub use crate::stream_iter::{decode_stream_iter, DecodedBlock, StreamDecoder};
 
-/// Install the Shorten decoder factory into the runtime context's
+/// Install the Shorten decoder factories into the runtime context's
 /// codec registry. Round 8 (paired with the round-7 whole-stream
-/// driver [`decode_stream`]) wires [`ShortenDecoder`] in as the
-/// `oxideav_core::Decoder` implementation for codec id `"shorten"`.
-/// The encoder side stays unimplemented per the README "lacks" tail.
+/// driver [`decode_stream`]) wires [`ShortenDecoder`] in under codec
+/// id `"shorten"`; round 11 additionally wires the block-by-block
+/// streaming adaptor [`ShortenStreamingDecoder`] in under codec id
+/// `"shorten-streaming"` so a caller can opt in to the bounded-memory
+/// emission shape explicitly. The encoder side stays unimplemented
+/// per the README "lacks" tail.
 #[cfg(feature = "registry")]
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     codec::register_codecs(&mut ctx.codecs);
+    codec::register_streaming_codecs(&mut ctx.codecs);
 }
 
 #[cfg(feature = "registry")]

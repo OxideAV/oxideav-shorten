@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 10 (2026-05-29).** The crate was
+**Clean-room rebuild — round 11 (2026-05-30).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -220,6 +220,36 @@ Wayne Stielau's seek-table utility:
     `F1` per `spec/05` §2.5) decoded through the iterator never
     materialises the full per-channel sample population at once.
 
+* Round 11 (`spec/03` §2 + §3.6 + §3.7 + §3.8 + §3.10 +
+  `spec/05` §1.4 + §2 + §6):
+  * `ShortenStreamingDecoder` — streaming
+    `oxideav_core::Decoder` adaptor built on the same per-block
+    dispatch as round 10's `StreamDecoder`. Unlike round 8's
+    whole-stream `ShortenDecoder` (which buffers the entire file
+    before emitting a single `AudioFrame`), the streaming wrapper
+    emits **one planar `AudioFrame` per full channel round** —
+    one block per channel packed across all channels per `spec/05`
+    §6's file-type table. `BLOCK_FN_VERBATIM` payloads accumulate
+    incrementally onto `verbatim_prefix()` without producing a
+    frame; `BLOCK_FN_BLOCKSIZE` and `BLOCK_FN_BITSHIFT` are
+    absorbed silently per `spec/03` §3.6/§3.7. Mid-round
+    BLOCKSIZE changes are rejected because the planar frame shape
+    requires per-plane sample counts to match.
+  * `make_streaming_decoder(params)` — factory returning a boxed
+    `Decoder` over the streaming adaptor.
+  * `register_streaming_codecs(reg)` — installs the streaming
+    decoder factory under the new codec id `"shorten-streaming"`
+    (kept distinct from `"shorten"`, which the whole-stream
+    wrapper continues to claim). A caller picks the emission
+    shape explicitly by codec id; `register(ctx)` now installs
+    **both** factories into the runtime context's registry.
+  * Memory characteristic: `O(buffered_bytes + n_channels ×
+    current_block_size)` plus the per-channel carries / mean
+    estimators the iterator already needs — bounded by the
+    header parameters and independent of stream length, in
+    contrast to `ShortenDecoder` which buffers `O(stream_length)`
+    of decoded samples before emitting.
+
 * Round 9 (`spec/05` §5.1 + §5.2 + §5.3):
   * `detect_shnampsk_trailer(bytes) -> Result<Option<ShnampskTrailer>>`
     — identifies the 12-byte trailer tail layout pinned by
@@ -243,7 +273,7 @@ Wayne Stielau's seek-table utility:
     (implementation safety cap; the `spec/05` §5 narrative does
     not pin a numeric cap).
 
-The combined surface is exercised by **142 tests** (130 unit + 12
+The combined surface is exercised by **152 tests** (140 unit + 12
 integration). The integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
@@ -279,10 +309,6 @@ leaves the second block undecoded until the next pull) (round 10).
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking
   requires either additional fixtures or the reference encoder's
   output observed under each `-t` invocation.
-* A streaming variant of the `oxideav_core::Decoder` trait wiring
-  built on `StreamDecoder` (round 10's iterator is the pure-rust
-  surface; the framework adaptor in `codec.rs` still buffers the
-  full file before emitting one frame).
 
 ## License
 
