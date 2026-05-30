@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 11 (2026-05-30).** The crate was
+**Clean-room rebuild — round 12 (2026-05-30).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -273,7 +273,71 @@ Wayne Stielau's seek-table utility:
     (implementation safety cap; the `spec/05` §5 narrative does
     not pin a numeric cap).
 
-The combined surface is exercised by **152 tests** (140 unit + 12
+* Round 12 (`spec/01` §1 + §3 + `spec/02` §1..§3 + `spec/03` §3.8 +
+  §3.10 + `spec/04` §2 + §7 + `spec/05` §4):
+  * `BitWriter` — MSB-first encode-side counterpart of `BitReader`,
+    the bit-level primitive every encoder routine sits on. Exposes
+    `write_bit` / `write_bits` / `write_uvar` / `write_svar` /
+    `write_ulong` (mirroring the read-side methods of `spec/02`
+    §2.1 / §2.2 / §3) plus `pad_to_byte` for the post-`BLOCK_FN_QUIT`
+    zero-padding rule of `spec/05` §4 and `snapshot_bytes` /
+    `into_bytes` finalisers. The roundtrip
+    `read_*(write_*(v)) == v` is verified across a representative
+    spread of widths and values, including TR.156's worked
+    `uvar(2)` examples (0..16 from `spec/02` §2.1).
+  * `natural_ulong_width(v)` — the encoder's minimum-width
+    rule for the `ulong()` two-stage form of `spec/02` §3,
+    returning the smallest `width` such that `v < 2^width` (`0`
+    for `v == 0`).
+  * `encode_envelope_stream(header, verbatim_prefix)` — high-level
+    encoder driver that builds a syntactically-valid Shorten byte
+    stream out of a `(ShortenStreamHeader, &[u8])` pair: byte-
+    aligned magic + version (`spec/01` §1) + the six-field
+    parameter block (`spec/01` §3) + optional `BLOCK_FN_VERBATIM`
+    command (`spec/03` §3.10) + `BLOCK_FN_QUIT` (`spec/03` §3.8 /
+    `spec/04` §2) + zero-pad to the next byte boundary (`spec/05`
+    §4). The output round-trips losslessly through
+    [`decode_stream`]: the recovered header equals the encoded
+    header, the verbatim prefix equals the encoded prefix, and the
+    per-channel sample vectors are empty (no predictor commands
+    were emitted).
+  * `write_byte_aligned_prefix` / `write_stream_header` /
+    `write_parameter_block` / `write_verbatim_block` /
+    `write_quit_command` — the lower-level primitives the high-
+    level driver composes, exposed so callers can build streams
+    with custom per-block command sequences before the predictor
+    encoder lands.
+  * `FN_VERBATIM = 9` / `FN_QUIT = 4` / `ENCODER_VERSION = 2` —
+    the wire-format numeric constants the encoder emits.
+  * `EncodeError` — encoder-side error enum (`UnsupportedVersion`
+    for a header version outside `{1, 2, 3}` per `spec/00`;
+    `VerbatimTooLong` for a payload exceeding
+    `VERBATIM_MAX_LEN` per `spec/02` §4.5).
+  * **Scope.** Round 12 stops at the envelope. The `BLOCK_FN_DIFFn`
+    / `BLOCK_FN_QLPC` / `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` /
+    `BLOCK_FN_ZERO` encoder paths still belong to the next round —
+    `BLOCK_FN_DIFFn` needs encoder-side parameter selection (the
+    Rice-`n` optimisation TR.156 §3.3 derives) and per-block carry
+    sequencing, which are larger surfaces than a single round.
+  * **Spec gap (docs/audio/shorten/spec/04 §2):** the §2 narrative
+    incorrectly describes `BLOCK_FN_QUIT = 4`'s encoding as the
+    5-bit `uvar(2)` pattern `00100`, but per `spec/02` §2.1's
+    worked examples `00100` is the encoding of value 8
+    (`BLOCK_FN_ZERO`), not 4. The encoding of value 4 in `uvar(2)`
+    is the 4-bit pattern `0100` (one leading zero + terminator +
+    2-bit mantissa `00`; `k = 1` per `value = (k << n) + m`). The
+    decoder side (which maps numeric 4 → `Quit` in `block.rs`) is
+    consistent with the new encoder; the spec gap is on the
+    narrative side of §2. Same wording slip likely on `spec/04`
+    §2's F9 / F1 trace-position arithmetic; the F9 "last byte
+    0x20 = 0010 0000" is consistent with a 4-bit QUIT at bit
+    position 4 plus 4 zero padding bits OR a 5-bit ZERO pattern
+    starting at the byte boundary (the parse hinges on whether
+    the preceding command terminated at bit position 0 or bit
+    position 4 of the last byte; the §2 narrative conflates the
+    two cases).
+
+The combined surface is exercised by **189 tests** (168 unit + 21
 integration). The integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
@@ -302,8 +366,13 @@ leaves the second block undecoded until the next pull) (round 10).
 
 ### What's not yet here
 
-* DIFFn / QLPC **encoder** path (the crate description advertises a
-  "DIFFn encoder"); only the decode direction exists so far.
+* DIFFn / QLPC **predictor encoder** path: round 12 lands the
+  envelope encoder (header + verbatim + QUIT) and the bit-level
+  primitives every sample-producing encoder needs, but the per-
+  block predictor encoders themselves — `BLOCK_FN_DIFFn` Rice-
+  parameter selection per TR.156 §3.3, `BLOCK_FN_QLPC` coefficient
+  quantisation per `spec/03` §3.5, the channel-round command
+  sequencer — still belong to the next round.
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking

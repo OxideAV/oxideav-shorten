@@ -8,6 +8,58 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 12 clean-room rebuild.** Encoder-side envelope primitives
+  + `BitWriter` foundation — first encoder-side surface since the
+  2026-05-18 orphan rebuild (`spec/01` §1 + §3 + `spec/02` §1..§3 +
+  `spec/03` §3.8 + §3.10 + `spec/04` §2 + §7 + `spec/05` §4):
+  - `BitWriter` — MSB-first bit writer (encode-side counterpart of
+    `BitReader`). Exposes `write_bit` / `write_bits` / `write_uvar`
+    / `write_svar` / `write_ulong` (mirroring `spec/02` §2.1 / §2.2
+    / §3) plus `pad_to_byte` for the post-QUIT zero-padding rule of
+    `spec/05` §4 and `snapshot_bytes` / `into_bytes` finalisers.
+    The roundtrip `read_*(write_*(v)) == v` is verified across a
+    representative spread of widths and values, including TR.156's
+    worked `uvar(2)` examples (0..16) from `spec/02` §2.1.
+  - `natural_ulong_width(v)` — the encoder's minimum-width rule
+    for the `ulong()` two-stage form of `spec/02` §3.
+  - `encode_envelope_stream(header, verbatim_prefix)` — high-
+    level envelope encoder that builds a syntactically-valid
+    Shorten byte stream out of `(ShortenStreamHeader, &[u8])`:
+    byte-aligned magic + version (`spec/01` §1) + the six-field
+    parameter block (`spec/01` §3) + optional `BLOCK_FN_VERBATIM`
+    (`spec/03` §3.10) + `BLOCK_FN_QUIT` (`spec/03` §3.8 /
+    `spec/04` §2) + zero-pad to next byte boundary (`spec/05` §4).
+    Output round-trips losslessly through `decode_stream`.
+  - `write_byte_aligned_prefix` / `write_stream_header` /
+    `write_parameter_block` / `write_verbatim_block` /
+    `write_quit_command` — lower-level primitives the envelope
+    driver composes, exposed for callers that need finer-grained
+    control over command sequencing.
+  - `FN_VERBATIM = 9` / `FN_QUIT = 4` / `ENCODER_VERSION = 2` —
+    wire-format numeric constants the encoder emits.
+  - `EncodeError` — encoder-side error enum
+    (`UnsupportedVersion`, `VerbatimTooLong`).
+  - 9 new integration tests in
+    `tests/encoder_envelope_roundtrip.rs` exercise header roundtrip
+    across the three pinned `H_filetype` codes, the F1 + F3 + F4
+    verbatim-prefix shapes, the §9.4-candidate extreme-width
+    parameter values, and equivalence between
+    `encode_envelope_stream` and primitive-level composition.
+  - 21 new unit tests in `src/bitwriter.rs` + `src/encoder.rs`
+    cover bit-level primitives, TR.156 `uvar(2)` worked examples,
+    signed/unsigned roundtrip across mantissa widths, header
+    roundtrip via `parse_stream_header`, and version rejection.
+  - Total test count: 189 (168 unit + 21 integration), up from 152
+    in round 11.
+- **Spec gap noted.** `docs/audio/shorten/spec/04-function-code-resolution.md`
+  §2's narrative describes `BLOCK_FN_QUIT = 4` as the 5-bit
+  `uvar(2)` pattern `00100`, but per `spec/02` §2.1's worked
+  examples `00100` is the encoding of value 8 (`BLOCK_FN_ZERO`).
+  The encoding of value 4 in `uvar(2)` is the 4-bit pattern
+  `0100`. The decoder side (which maps numeric 4 → `Quit` in
+  `block.rs`) is consistent with the new encoder; the gap is in
+  §2's narrative.
+
 - **Round 11 clean-room rebuild.** Streaming `oxideav_core::Decoder`
   trait wiring built on the same per-block dispatch as
   `StreamDecoder` (round 10) — closes the README "lacks" tail

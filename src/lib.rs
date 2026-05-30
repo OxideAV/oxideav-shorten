@@ -119,14 +119,31 @@
 //! dispatched by both driver shapes, and a `RuntimeContext` can
 //! resolve a Shorten decoder by codec id.
 //!
+//! * Round 12 — the **encoder side's envelope and bit-level
+//!   primitives** (`spec/01` §1 + §3 + `spec/02` §1..§3 + `spec/03`
+//!   §3.8 + §3.10 + `spec/04` §2 + §7 + `spec/05` §4). The MSB-first
+//!   [`BitWriter`] is the bit-level dual of [`BitReader`];
+//!   [`encode_envelope_stream`] composes a syntactically-valid
+//!   Shorten file from a `(ShortenStreamHeader, &[u8]
+//!   verbatim_prefix)` pair using the header / verbatim / QUIT
+//!   primitives ([`write_stream_header`], [`write_verbatim_block`],
+//!   [`write_quit_command`]). Output round-trips losslessly through
+//!   [`decode_stream`]. The per-block predictor encoders
+//!   (`BLOCK_FN_DIFFn` / `BLOCK_FN_QLPC` + the Rice-parameter
+//!   selection of TR.156 §3.3 + the per-block channel-round
+//!   sequencer) are still pending — round 12 stops at the envelope.
+//!
 //! The public entry points are [`decode_stream`], [`parse_stream_header`],
 //! [`read_function_code`], [`read_verbatim_payload`],
 //! [`read_blocksize_payload`], [`read_bitshift_payload`],
 //! [`decode_diff_block`], [`decode_qlpc_block`], [`fill_zero_block`],
 //! [`MeanEstimator`], plus the round-8 trait wiring [`ShortenDecoder`]
-//! / [`make_decoder`] / [`register_codecs`]. The
-//! [`Error::NotImplemented`] sentinel remains available for any API
-//! the orphan-rebuild scaffold has not yet wired up.
+//! / [`make_decoder`] / [`register_codecs`] and the round-12 encoder
+//! surface [`BitWriter`] / [`encode_envelope_stream`] /
+//! [`write_stream_header`] / [`write_verbatim_block`] /
+//! [`write_quit_command`]. The [`Error::NotImplemented`] sentinel
+//! remains available for any API the orphan-rebuild scaffold has not
+//! yet wired up.
 //!
 //! ## Clean-room provenance
 //!
@@ -152,10 +169,12 @@
 #![warn(missing_debug_implementations)]
 
 mod bitreader;
+mod bitwriter;
 mod block;
 #[cfg(feature = "registry")]
 mod codec;
 mod driver;
+mod encoder;
 mod error;
 mod header;
 mod predictor;
@@ -163,6 +182,7 @@ mod sidecar;
 mod stream_iter;
 
 pub use crate::bitreader::{BitReader, ULONGSIZE};
+pub use crate::bitwriter::{natural_ulong_width, BitWriter};
 pub use crate::block::{
     read_bitshift_payload, read_blocksize_payload, read_function_code, read_verbatim_payload,
     FunctionCode, VerbatimChunk, BITSHIFTSIZE, BITSHIFT_MAX, BLOCKSIZE_MAX, FNSIZE,
@@ -175,6 +195,11 @@ pub use crate::codec::{
     FILETYPE_U8, STREAMING_CODEC_ID_STR,
 };
 pub use crate::driver::{decode_stream, DecodedStream, MAX_COMMANDS};
+pub use crate::encoder::{
+    encode_envelope_stream, write_byte_aligned_prefix, write_parameter_block, write_quit_command,
+    write_stream_header, write_verbatim_block, EncodeError, EncodeResult, ENCODER_VERSION, FN_QUIT,
+    FN_VERBATIM,
+};
 pub use crate::error::{Error, Result};
 pub use crate::header::{
     parse_stream_header, ParsedHeader, ShortenStreamHeader, MAGIC, MIN_HEADER_BYTES,
