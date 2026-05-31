@@ -128,10 +128,24 @@
 //!   verbatim_prefix)` pair using the header / verbatim / QUIT
 //!   primitives ([`write_stream_header`], [`write_verbatim_block`],
 //!   [`write_quit_command`]). Output round-trips losslessly through
-//!   [`decode_stream`]. The per-block predictor encoders
-//!   (`BLOCK_FN_DIFFn` / `BLOCK_FN_QLPC` + the Rice-parameter
-//!   selection of TR.156 §3.3 + the per-block channel-round
-//!   sequencer) are still pending — round 12 stops at the envelope.
+//!   [`decode_stream`].
+//!
+//! * Round 13 — the **`BLOCK_FN_DIFF0` predictor encoder**
+//!   ([`write_diff0_block`]) per `spec/03` §3.1 + `spec/05` §3.
+//!   Emits the order-0 polynomial-difference predictor's per-block
+//!   command (function code 0 + `uvar(ENERGYSIZE = 3)` energy +
+//!   `bs × svar(energy + 1)` residuals) for samples whose residual
+//!   `e₀(t) = s(t) − μ_chan` decoder-reconstructs via
+//!   [`decode_diff_block`] with [`PolyOrder::Order0`].
+//!   [`min_energy_for_diff0`] picks the natural energy parameter
+//!   (smallest `e ∈ 0..=7` such that every folded residual fits
+//!   inside the svar mantissa with zero prefix-zero bits, matching
+//!   `spec/05` §3.1's "smallest sensible n is 1" floor). DIFF0 is
+//!   the only predictor whose residual genuinely depends on the
+//!   per-channel running mean (`spec/05` §2.3) — orders 1..3 are
+//!   mean-invariant by §2 introductory paragraph. The
+//!   `BLOCK_FN_DIFF1..3` and `BLOCK_FN_QLPC` predictor encoders +
+//!   the per-block channel-round sequencer remain unwritten.
 //!
 //! The public entry points are [`decode_stream`], [`parse_stream_header`],
 //! [`read_function_code`], [`read_verbatim_payload`],
@@ -141,9 +155,10 @@
 //! / [`make_decoder`] / [`register_codecs`] and the round-12 encoder
 //! surface [`BitWriter`] / [`encode_envelope_stream`] /
 //! [`write_stream_header`] / [`write_verbatim_block`] /
-//! [`write_quit_command`]. The [`Error::NotImplemented`] sentinel
-//! remains available for any API the orphan-rebuild scaffold has not
-//! yet wired up.
+//! [`write_quit_command`] plus the round-13 [`write_diff0_block`] /
+//! [`min_energy_for_diff0`] predictor encoder. The
+//! [`Error::NotImplemented`] sentinel remains available for any API
+//! the orphan-rebuild scaffold has not yet wired up.
 //!
 //! ## Clean-room provenance
 //!
@@ -196,9 +211,9 @@ pub use crate::codec::{
 };
 pub use crate::driver::{decode_stream, DecodedStream, MAX_COMMANDS};
 pub use crate::encoder::{
-    encode_envelope_stream, write_byte_aligned_prefix, write_parameter_block, write_quit_command,
-    write_stream_header, write_verbatim_block, EncodeError, EncodeResult, ENCODER_VERSION, FN_QUIT,
-    FN_VERBATIM,
+    encode_envelope_stream, min_energy_for_diff0, write_byte_aligned_prefix, write_diff0_block,
+    write_parameter_block, write_quit_command, write_stream_header, write_verbatim_block,
+    EncodeError, EncodeResult, ENCODER_VERSION, FN_DIFF0, FN_QUIT, FN_VERBATIM, MAX_NATURAL_ENERGY,
 };
 pub use crate::error::{Error, Result};
 pub use crate::header::{

@@ -313,12 +313,48 @@ Wayne Stielau's seek-table utility:
     for a header version outside `{1, 2, 3}` per `spec/00`;
     `VerbatimTooLong` for a payload exceeding
     `VERBATIM_MAX_LEN` per `spec/02` §4.5).
-  * **Scope.** Round 12 stops at the envelope. The `BLOCK_FN_DIFFn`
+  * **Scope.** Round 12 stops at the envelope. Round 13 (below)
+    adds `BLOCK_FN_DIFF0` — the simplest predictor encoder. The
+    other predictor + housekeeping encoder paths (`BLOCK_FN_DIFF1..3`
     / `BLOCK_FN_QLPC` / `BLOCK_FN_BLOCKSIZE` / `BLOCK_FN_BITSHIFT` /
-    `BLOCK_FN_ZERO` encoder paths still belong to the next round —
-    `BLOCK_FN_DIFFn` needs encoder-side parameter selection (the
-    Rice-`n` optimisation TR.156 §3.3 derives) and per-block carry
-    sequencing, which are larger surfaces than a single round.
+    `BLOCK_FN_ZERO`) still belong to later rounds —
+    `BLOCK_FN_DIFFn` for `n > 0` needs the per-channel sample-history
+    carry across blocks and the higher orders' recurrence-form
+    residual computation; `BLOCK_FN_QLPC` needs the coefficient
+    quantisation of `spec/03` §3.5; and a full per-block channel-
+    round sequencer with the Rice-`n` optimisation TR.156 §3.3
+    derives sits above all of them.
+
+- **Round 13** — the `BLOCK_FN_DIFF0` predictor encoder
+  (`spec/03` §3.1 + `spec/05` §3.1):
+  * `write_diff0_block(writer, energy_encoded, samples, mu_chan)`
+    — emits the full `<fn=0> <energy> <residual>×bs` command,
+    computing residuals encode-side as `e₀(t) = s(t) − μ_chan`.
+    The decoder's `decode_diff_block` with `PolyOrder::Order0`
+    reconstructs `s(t) = e₀(t) + μ_chan` per `spec/05` §2.3.
+  * `min_energy_for_diff0(residuals)` — picks the smallest
+    encoded energy `e ∈ 0..=7` such that every folded residual
+    fits inside the `svar(e + 1)` mantissa with zero prefix-zero
+    bits (the "natural" width per `spec/05` §3.1's "smallest
+    sensible n is 1" floor). Returns `None` when no natural
+    width fits the largest folded residual.
+  * `FN_DIFF0 = 0` / `MAX_NATURAL_ENERGY = 7` — new wire-format
+    numeric constants.
+  * 6 new integration tests (`tests/encoder_diff0_pipeline.rs`)
+    confirm: mono single-block round-trip, stereo round-robin
+    multi-block round-trip, DIFF0 + envelope-VERBATIM splice
+    decoded through `decode_stream`, all-zero silent block at
+    minimum energy, ±100 residuals at maximum natural energy,
+    and encode/decode mean-directionality consistency.
+  * **Scope.** Round 13 is `DIFF0` only — the simplest of the
+    four polynomial-difference predictors, with no past-sample
+    carry on the encoder side. `BLOCK_FN_DIFF1..3` need the
+    recurrence-form residual computation off the per-channel
+    carry; `BLOCK_FN_QLPC` needs coefficient quantisation. The
+    Rice-`n` selection helper is a natural-width-only heuristic;
+    the statistical optimum of TR.156 §3.3 (which minimises
+    total encoded bit count, not just prefix bits) is a future
+    refinement that doesn't change the wire format.
   * **Spec gap (docs/audio/shorten/spec/04 §2):** the §2 narrative
     incorrectly describes `BLOCK_FN_QUIT = 4`'s encoding as the
     5-bit `uvar(2)` pattern `00100`, but per `spec/02` §2.1's
@@ -337,7 +373,7 @@ Wayne Stielau's seek-table utility:
     position 4 of the last byte; the §2 narrative conflates the
     two cases).
 
-The combined surface is exercised by **189 tests** (168 unit + 21
+The combined surface is exercised by **203 tests** (177 unit + 26
 integration). The integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
@@ -366,13 +402,14 @@ leaves the second block undecoded until the next pull) (round 10).
 
 ### What's not yet here
 
-* DIFFn / QLPC **predictor encoder** path: round 12 lands the
-  envelope encoder (header + verbatim + QUIT) and the bit-level
-  primitives every sample-producing encoder needs, but the per-
-  block predictor encoders themselves — `BLOCK_FN_DIFFn` Rice-
-  parameter selection per TR.156 §3.3, `BLOCK_FN_QLPC` coefficient
-  quantisation per `spec/03` §3.5, the channel-round command
-  sequencer — still belong to the next round.
+* DIFF1..3 / QLPC **predictor encoder** path: round 13 lands
+  `BLOCK_FN_DIFF0`, but the higher-order polynomial-difference
+  predictors (`BLOCK_FN_DIFF1..3`) and the general LPC predictor
+  (`BLOCK_FN_QLPC`) still need encoder-side residual computation
+  off the per-channel sample-history carry (orders 1..3) and
+  coefficient quantisation per `spec/03` §3.5 (QLPC), plus the
+  Rice-`n` optimal-selection of TR.156 §3.3 and the channel-round
+  command sequencer.
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking

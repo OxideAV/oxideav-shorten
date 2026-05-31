@@ -8,6 +8,45 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 13 clean-room rebuild.** `BLOCK_FN_DIFF0` predictor encoder
+  (`spec/03` §3.1 + `spec/05` §3.1) — the first predictor-side
+  encoder, building on round 12's envelope surface:
+  - `write_diff0_block(writer, energy_encoded, samples, mu_chan)` —
+    emits a full `BLOCK_FN_DIFF0` command (function code 0 +
+    `uvar(ENERGYSIZE = 3)` energy field + `bs × svar(energy + 1)`
+    residuals) per `spec/03` §3.1. Residuals are computed
+    encode-side as `e₀(t) = s(t) − μ_chan`; the decoder's
+    `decode_diff_block` with `PolyOrder::Order0` reconstructs
+    `s(t) = e₀(t) + μ_chan` per `spec/05` §2.3. Output round-trips
+    losslessly through `decode_stream` and the streaming decoder.
+  - `min_energy_for_diff0(residuals)` — picks the smallest encoded
+    energy `e ∈ 0..=7` such that every folded residual fits inside
+    the `svar(e + 1)` mantissa with zero prefix-zero bits — matching
+    `spec/05` §3.1's "smallest sensible n is 1" floor. Returns
+    `None` if the largest folded residual exceeds the natural
+    8-bit width; callers may either accept a prefix-zero blow-up
+    by passing `MAX_NATURAL_ENERGY = 7` explicitly or fall back to
+    a wider non-natural width up to the decoder's
+    `MAX_RESIDUAL_WIDTH = 30` cap.
+  - `FN_DIFF0 = 0` / `MAX_NATURAL_ENERGY = 7` — new wire-format
+    constants the encoder emits.
+  - `EncodeError::EnergyOutOfRange` / `EncodeError::ResidualOutOfRange`
+    / `EncodeError::BlockTooLong` — three new encoder-side error
+    variants surfacing per-block parameter validation failures.
+  - 9 new in-module unit tests + 6 new integration tests
+    (`tests/encoder_diff0_pipeline.rs`) covering: minimum-energy
+    selection across the `e ∈ 0..=7` range, function-code emission
+    + bit-count correctness, round-trip through `decode_diff_block`
+    at all natural widths, full envelope-encoder + DIFF0 splice
+    decoding via the round-7 `decode_stream` driver, multi-block
+    round-robin stereo round-trip, silent-block (all-zero) encoding,
+    and encode/decode mean-directionality consistency.
+
+  Test counts: 168 → 177 library tests (+9), 20 → 26 integration
+  tests (+6) — totals 197 → 203 (+14). The `DIFF1..3` and `QLPC`
+  predictor encoders + the per-block channel-round sequencer + the
+  Rice-parameter optimal-selection of TR.156 §3.3 remain pending.
+
 - **Round 12 clean-room rebuild.** Encoder-side envelope primitives
   + `BitWriter` foundation — first encoder-side surface since the
   2026-05-18 orphan rebuild (`spec/01` §1 + §3 + `spec/02` §1..§3 +
