@@ -55,9 +55,7 @@
 //! cursor) + §3.6/§3.7 (housekeeping state) + §3.8 (QUIT termination),
 //! `spec/05-state-and-quirks.md` §1 (carry update + §1.4 bit-shift
 //! externality) + §2 (mean estimator), and `spec/01-stream-header.md`
-//! (header parse + carry-length derivation). No external decoder
-//! source, no FFmpeg `shorten.c`, and no archived `old` branch were
-//! consulted.
+//! (header parse + carry-length derivation).
 
 use crate::bitreader::BitReader;
 use crate::block::{

@@ -85,9 +85,7 @@
 //! The trait wiring is assembled from `docs/audio/shorten/spec/05` §6
 //! (the file-type table), `spec/03` §3.10 (verbatim prefix), `spec/03`
 //! §2 (per-channel sample ordering), and the public surface of
-//! `oxideav_core` (the `Decoder` trait contract). No external decoder
-//! source, no FFmpeg `shorten.c`, and no archived `old` branch were
-//! consulted.
+//! `oxideav_core` (the `Decoder` trait contract).
 //!
 //! ## Streaming adaptor — round 11
 //!

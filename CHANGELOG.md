@@ -6,6 +6,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Round 203 in-place scrub.** Removed pre-existing enumerated denials
+  in `src/lib.rs`, `src/driver.rs`, and `src/codec.rs` clean-room
+  provenance prose. The wall-respected statement belongs in the agent
+  final report, not in committed source comments. The remaining
+  provenance prose keeps positive `spec/` attribution intact.
+
 ### Added
 
 - **Round 13 clean-room rebuild.** `BLOCK_FN_DIFF0` predictor encoder

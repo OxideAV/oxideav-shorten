@@ -163,12 +163,7 @@
 //! ## Clean-room provenance
 //!
 //! Rounds 1+2+3+4+5+6 were implemented strictly from
-//! `docs/audio/shorten/spec/00-scope.md` through `spec/05-…md`. No
-//! external library source, no FFmpeg shorten source, no Tony
-//! Robinson reference encoder source, no archived `old` branch of
-//! this crate, and no `reference-impl/python/` material (forbidden
-//! to the Implementer per `docs/IMPLEMENTOR_ROUND.md` §"Special
-//! case: clean-room rebuild rounds") was read at any phase. The
+//! `docs/audio/shorten/spec/00-scope.md` through `spec/05-…md`. The
 //! behavioural anchors driving the test suite (fixture `F1`'s
 //! header field values + end-of-header bit position; the post-header
 //! `BLOCK_FN_VERBATIM`'s 44-byte WAV-preamble recovery; the per-
