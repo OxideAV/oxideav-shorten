@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 12 (2026-05-30).** The crate was
+**Clean-room rebuild — round 14 (2026-06-02).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -355,6 +355,51 @@ Wayne Stielau's seek-table utility:
     the statistical optimum of TR.156 §3.3 (which minimises
     total encoded bit count, not just prefix bits) is a future
     refinement that doesn't change the wire format.
+
+- **Round 14** — the `BLOCK_FN_DIFF1` predictor encoder
+  (`spec/03` §3.2 + `spec/05` §1 + §3.1):
+  * `write_diff1_block(writer, energy_encoded, samples, carry)`
+    — emits the full `<fn=1> <energy> <residual>×bs` command,
+    computing the per-sample first-differences
+    `e₁(t) = s(t) − s(t − 1)`. The initial `s(t − 1)` comes
+    from `carry.at(0)` per `spec/05` §1.1 (index 0 is the
+    most-recent past sample, zero-initialised at stream start);
+    the rolling `s_m1` slides to each just-emitted sample as
+    the recurrence advances. The decoder's `decode_diff_block`
+    with `PolyOrder::Order1` reconstructs
+    `s(t) = s(t − 1) + e₁(t)` per `spec/03` §3.2.
+  * DIFF1 is mean-invariant per `spec/05` §2 introductory
+    paragraph (the channel running mean cancels in the
+    difference form), so the encoder takes no `mu_chan`
+    parameter — a deliberate signature divergence from
+    `write_diff0_block`.
+  * `min_energy_for_diff1(residuals)` — picks the smallest
+    encoded energy `e ∈ 0..=7` under the same svar-prefix-zero
+    rule as `min_energy_for_diff0` (sharing a private scan
+    helper); the per-predictor entry points exist to make the
+    call-site intent explicit and to document which predictor
+    definition the caller has applied to the input samples.
+  * `FN_DIFF1 = 1` — new wire-format numeric constant.
+  * 8 new in-module unit tests + 9 new integration tests
+    (`tests/encoder_diff1_pipeline.rs`) confirm: minimum-energy
+    selection across `e ∈ 0..=7`, function-code + bit-count
+    correctness for the small encoder output, full round-trip
+    through `decode_diff_block` with zero-seeded and non-zero-
+    seeded `ChannelCarry`, mono single-block + stereo two-
+    block round-robin round-trip via the full
+    `decode_stream` driver, cross-block carry continuity for
+    consecutive blocks on the same channel (load-bearing for
+    `spec/05` §1.3's update rule), VERBATIM-prefix splice
+    decoded end-to-end, silent block (all-zero samples) at
+    minimum energy, constant-signal collapse (first-difference
+    `[seed, 0, 0, …]`) selecting an explicit width for the seed
+    jump, ±127 max-natural first-difference edge, and a
+    three-channel three-blocks-each round-robin stress.
+  * **Scope.** Round 14 adds `DIFF1`. `BLOCK_FN_DIFF2..3` need
+    the order-2 / order-3 recurrence-form residual computation
+    that reads two and three past samples from the carry; the
+    Rice-`n` selection is still a natural-width-only heuristic
+    and the statistical optimum of TR.156 §3.3 remains pending.
   * **Spec gap (docs/audio/shorten/spec/04 §2):** the §2 narrative
     incorrectly describes `BLOCK_FN_QUIT = 4`'s encoding as the
     5-bit `uvar(2)` pattern `00100`, but per `spec/02` §2.1's
@@ -373,8 +418,9 @@ Wayne Stielau's seek-table utility:
     position 4 of the last byte; the §2 narrative conflates the
     two cases).
 
-The combined surface is exercised by **203 tests** (177 unit + 26
-integration). The integration suite composes the header parse
+The combined surface is exercised by **224 tests** (188 in-module
+unit + 36 integration tests across 11 integration binaries). The
+integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
 `spec/03` §2 (round 3), DIFF0-ZERO-DIFF0-QUIT exercising the
@@ -402,14 +448,16 @@ leaves the second block undecoded until the next pull) (round 10).
 
 ### What's not yet here
 
-* DIFF1..3 / QLPC **predictor encoder** path: round 13 lands
-  `BLOCK_FN_DIFF0`, but the higher-order polynomial-difference
-  predictors (`BLOCK_FN_DIFF1..3`) and the general LPC predictor
-  (`BLOCK_FN_QLPC`) still need encoder-side residual computation
-  off the per-channel sample-history carry (orders 1..3) and
+* DIFF2..3 / QLPC **predictor encoder** path: round 13 lands
+  `BLOCK_FN_DIFF0` and round 14 lands `BLOCK_FN_DIFF1`, but the
+  higher-order polynomial-difference predictors (`BLOCK_FN_DIFF2..3`)
+  and the general LPC predictor (`BLOCK_FN_QLPC`) still need
+  encoder-side residual computation off the per-channel sample-
+  history carry (orders 2..3 read two and three past samples) and
   coefficient quantisation per `spec/03` §3.5 (QLPC), plus the
   Rice-`n` optimal-selection of TR.156 §3.3 and the channel-round
-  command sequencer.
+  command sequencer that picks predictor order per block under a
+  statistical criterion.
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking

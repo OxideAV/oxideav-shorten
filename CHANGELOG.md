@@ -16,6 +16,52 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 14 clean-room rebuild.** `BLOCK_FN_DIFF1` predictor encoder
+  (`spec/03` §3.2 + `spec/05` §1 + §3.1) — the order-1 polynomial-
+  difference predictor encoder, next step after round 13's `DIFF0`:
+  - `write_diff1_block(writer, energy_encoded, samples, carry)` —
+    emits a full `BLOCK_FN_DIFF1` command (function code 1 +
+    `uvar(ENERGYSIZE = 3)` energy field + `bs × svar(energy + 1)`
+    per-sample first-differences) per `spec/03` §3.2. The encoder
+    seeds `s(t − 1)` from `carry.at(0)` (`spec/05` §1.1: index 0 is
+    the most-recent past sample, zero-initialised at stream start),
+    then slides the rolling `s_m1` to each just-emitted sample.
+    The decoder's `decode_diff_block` with `PolyOrder::Order1`
+    reconstructs `s(t) = s(t − 1) + e₁(t)` per `spec/03` §3.2.
+    Output round-trips losslessly through `decode_stream`.
+  - DIFF1 is mean-invariant per `spec/05` §2 introductory paragraph
+    (the running mean cancels in the difference), so the encoder
+    takes no `mu_chan` parameter — distinct from `write_diff0_block`.
+  - `min_energy_for_diff1(residuals)` — picks the smallest encoded
+    energy `e ∈ 0..=7` such that every folded first-difference
+    fits inside the `svar(e + 1)` mantissa with zero prefix-zero
+    bits, under the same scan rule as `min_energy_for_diff0`. The
+    two helpers share a private scan; the per-predictor entry
+    points exist to make the call-site intent explicit. Returns
+    `None` if the largest folded residual exceeds the natural
+    8-bit width.
+  - `FN_DIFF1 = 1` — new wire-format constant the encoder emits.
+  - 8 new in-module unit tests + 9 new integration tests
+    (`tests/encoder_diff1_pipeline.rs`) covering: minimum-energy
+    selection across the `e ∈ 0..=7` range, function-code emission
+    + bit-count correctness, round-trip through `decode_diff_block`
+    at all natural widths with zero-seeded and non-zero-seeded
+    carry, multi-channel round-robin dispatch with per-channel
+    carry update, cross-block carry continuity (`spec/05` §1.3
+    update rule), VERBATIM-prefix splice with DIFF1 block, silent
+    block (all-zero samples → all-zero residuals → energy 0),
+    constant-signal collapse (first-difference [seed, 0, 0, …]),
+    ±127 max-natural first-difference edge, and three-channel
+    three-blocks-each round-robin stress.
+
+  Test counts: 177 → 188 in-module tests (+8 DIFF1 plus 3 inline
+  helper unit tests on `diff1_residuals` and the new
+  `ChannelCarry::update_after_block` interaction), 26 → 35
+  integration tests (+9 DIFF1 pipeline tests) — totals 203 → 224
+  (+20 net). The `DIFF2..3` and `QLPC` predictor encoders + the
+  per-block channel-round sequencer + the Rice-parameter optimal-
+  selection of TR.156 §3.3 remain pending.
+
 - **Round 13 clean-room rebuild.** `BLOCK_FN_DIFF0` predictor encoder
   (`spec/03` §3.1 + `spec/05` §3.1) — the first predictor-side
   encoder, building on round 12's envelope surface:
