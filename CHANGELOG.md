@@ -16,6 +16,54 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 15 clean-room rebuild.** `BLOCK_FN_DIFF2` predictor encoder
+  (`spec/03` §3.3 + `spec/05` §1 + §3.1) — the order-2 polynomial-
+  difference predictor encoder, next step after round 14's `DIFF1`:
+  - `write_diff2_block(writer, energy_encoded, samples, carry)` —
+    emits a full `BLOCK_FN_DIFF2` command (function code 2 +
+    `uvar(ENERGYSIZE = 3)` energy field + `bs × svar(energy + 1)`
+    per-sample second-differences) per `spec/03` §3.3. The encoder
+    seeds `s(t − 1)` from `carry.at(0)` and `s(t − 2)` from
+    `carry.at(1)` (`spec/05` §1.1), then slides the rolling
+    `s_m1` / `s_m2` window to each just-emitted sample. The
+    per-sample residual is
+    `e₂(t) = s(t) − (2·s(t − 1) − s(t − 2))`. The decoder's
+    `decode_diff_block` with `PolyOrder::Order2` reconstructs
+    `s(t) = 2·s(t − 1) − s(t − 2) + e₂(t)` per `spec/03` §3.3.
+    Output round-trips losslessly through `decode_stream`.
+  - DIFF2 is mean-invariant per `spec/05` §2 introductory paragraph
+    (the running mean cancels in the second-difference), so the
+    encoder takes no `mu_chan` parameter — matches the DIFF1
+    signature shape, distinct from DIFF0.
+  - `min_energy_for_diff2(residuals)` — picks the smallest encoded
+    energy `e ∈ 0..=7` such that every folded second-difference
+    fits inside the `svar(e + 1)` mantissa with zero prefix-zero
+    bits, under the same scan rule as `min_energy_for_diff0` /
+    `min_energy_for_diff1`. The three helpers share a private
+    scan; the per-predictor entry points exist to make the
+    call-site intent explicit. Returns `None` if the largest folded
+    residual exceeds the natural 8-bit width.
+  - `FN_DIFF2 = 2` — new wire-format constant the encoder emits.
+  - 8 new in-module unit tests + 9 new integration tests
+    (`tests/encoder_diff2_pipeline.rs`) covering: minimum-energy
+    selection across the `e ∈ 0..=7` range, function-code emission
+    + bit-count correctness, round-trip through `decode_diff_block`
+    at all natural widths with zero-seeded and non-zero-seeded
+    carry (two-sample window), multi-channel round-robin dispatch
+    with per-channel carry update, cross-block carry continuity
+    (the load-bearing two-sample seed test), VERBATIM-prefix splice
+    with DIFF2 block, silent block (all-zero samples → all-zero
+    residuals → energy 0), pure-ramp collapse (second-difference
+    `[seed, 0, 0, …]`), `±127` max-natural second-difference edge,
+    and three-channel three-blocks-each round-robin stress.
+
+  Test counts: 188 → 199 in-module tests (+8 DIFF2 plus 3 inline
+  helper unit tests on `diff2_residuals` and the carry-pair seeding),
+  35 → 44 integration tests (+9 DIFF2 pipeline tests) — totals
+  224 → 244 (+20 net). The `DIFF3` and `QLPC` predictor encoders +
+  the per-block channel-round sequencer + the Rice-parameter
+  optimal-selection of TR.156 §3.3 remain pending.
+
 - **Round 14 clean-room rebuild.** `BLOCK_FN_DIFF1` predictor encoder
   (`spec/03` §3.2 + `spec/05` §1 + §3.1) — the order-1 polynomial-
   difference predictor encoder, next step after round 13's `DIFF0`:
