@@ -16,6 +16,53 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 16 clean-room rebuild.** `BLOCK_FN_DIFF3` predictor encoder
+  (`spec/03` §3.4 + `spec/05` §1 + §3.1) — the order-3 polynomial-
+  difference predictor encoder, closing the polynomial-difference
+  predictor family on the encoder side:
+  - `write_diff3_block(writer, energy_encoded, samples, carry)` —
+    emits a full `BLOCK_FN_DIFF3` command (function code 3 +
+    `uvar(ENERGYSIZE = 3)` energy field + `bs × svar(energy + 1)`
+    per-sample third-differences) per `spec/03` §3.4. The encoder
+    seeds `s(t − 1)` from `carry.at(0)`, `s(t − 2)` from
+    `carry.at(1)`, and `s(t − 3)` from `carry.at(2)` (`spec/05`
+    §1.1), then slides the rolling `s_m1` / `s_m2` / `s_m3` window
+    to each just-emitted sample. The per-sample residual is
+    `e₃(t) = s(t) − (3·s(t − 1) − 3·s(t − 2) + s(t − 3))`
+    (TR.156 §3.2 eq. 6). The decoder's `decode_diff_block` with
+    `PolyOrder::Order3` reconstructs
+    `s(t) = 3·s(t − 1) − 3·s(t − 2) + s(t − 3) + e₃(t)` per
+    `spec/03` §3.4. Output round-trips losslessly through
+    `decode_stream`.
+  - DIFF3 is mean-invariant per `spec/05` §2 introductory paragraph
+    (the running mean cancels in the third-difference form), so the
+    encoder takes no `mu_chan` parameter — matches the DIFF1 /
+    DIFF2 signature shape, distinct from DIFF0.
+  - `min_energy_for_diff3(residuals)` — picks the smallest encoded
+    energy `e ∈ 0..=7` such that every folded third-difference fits
+    inside the `svar(e + 1)` mantissa with zero prefix-zero bits
+    (the "natural" width per `spec/05` §3.1's "smallest sensible
+    `n` is 1" floor). Returns `None` when no natural width fits the
+    largest folded residual.
+  - `FN_DIFF3 = 3` — new wire-format numeric constant
+    (`spec/04` §7).
+  - 8 new in-module unit tests (`encoder::tests::*`) + 9 new
+    integration tests (`tests/encoder_diff3_pipeline.rs`) confirm:
+    minimum-energy selection across `e ∈ 0..=7`, function-code +
+    bit-count correctness for the small encoder output, full
+    round-trip through `decode_diff_block` with zero-seeded and
+    non-zero-seeded `ChannelCarry` (three-sample window), mono
+    single-block + stereo two-block round-robin round-trip via the
+    full `decode_stream` driver, cross-block carry continuity for
+    consecutive blocks on the same channel (load-bearing for
+    `spec/05` §1.3's update rule — three-sample window seeding),
+    VERBATIM-prefix splice decoded end-to-end, silent block
+    (all-zero samples) at minimum energy, pure-quadratic collapse
+    (third-differences `[seed₀, seed₁, seed₂, 0, 0, …]` selecting
+    an explicit width for the seed jumps), ±127 max-natural
+    third-difference edge, and a three-channel three-blocks-each
+    round-robin stress.
+
 - **Round 15 clean-room rebuild.** `BLOCK_FN_DIFF2` predictor encoder
   (`spec/03` §3.3 + `spec/05` §1 + §3.1) — the order-2 polynomial-
   difference predictor encoder, next step after round 14's `DIFF1`:

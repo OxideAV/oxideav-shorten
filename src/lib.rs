@@ -175,9 +175,28 @@
 //!   reconstructs by `s(t) = 2·s(t − 1) − s(t − 2) + e₂(t)`. DIFF2 is
 //!   mean-invariant per `spec/05` §2 introductory paragraph.
 //!   [`min_energy_for_diff2`] picks the smallest natural energy under
-//!   the same svar-prefix-zero rule as DIFF0 / DIFF1. The
-//!   `BLOCK_FN_DIFF3` and `BLOCK_FN_QLPC` predictor encoders + the
-//!   per-block channel-round sequencer remain unwritten.
+//!   the same svar-prefix-zero rule as DIFF0 / DIFF1.
+//!
+//! * Round 16 — the **`BLOCK_FN_DIFF3` predictor encoder**
+//!   ([`write_diff3_block`]) per `spec/03` §3.4 + `spec/05` §1 + §3.
+//!   Emits the order-3 polynomial-difference predictor's per-block
+//!   command (function code 3 + `uvar(ENERGYSIZE = 3)` energy +
+//!   `bs × svar(energy + 1)` residuals) carrying the per-sample
+//!   third-differences
+//!   `e₃(t) = s(t) − (3·s(t − 1) − 3·s(t − 2) + s(t − 3))` (TR.156
+//!   §3.2 eq. 6). The first three `s(t − k)` values of a channel-block
+//!   come from `carry.at(0)` (`s(t − 1)`), `carry.at(1)` (`s(t − 2)`),
+//!   and `carry.at(2)` (`s(t − 3)`) per `spec/05` §1.1, all
+//!   zero-initialised at stream start; subsequent samples slide the
+//!   window forward against just-emitted samples. The decoder side
+//!   [`decode_diff_block`] with [`PolyOrder::Order3`] reconstructs by
+//!   `s(t) = 3·s(t − 1) − 3·s(t − 2) + s(t − 3) + e₃(t)`. DIFF3 is
+//!   mean-invariant per `spec/05` §2 introductory paragraph.
+//!   [`min_energy_for_diff3`] picks the smallest natural energy under
+//!   the same svar-prefix-zero rule as DIFF0 / DIFF1 / DIFF2. Round 16
+//!   closes the polynomial-difference predictor family on the encoder
+//!   side; the `BLOCK_FN_QLPC` predictor encoder + the per-block
+//!   channel-round sequencer remain unwritten.
 //!
 //! The public entry points are [`decode_stream`], [`parse_stream_header`],
 //! [`read_function_code`], [`read_verbatim_payload`],
@@ -189,8 +208,9 @@
 //! [`write_stream_header`] / [`write_verbatim_block`] /
 //! [`write_quit_command`] plus the round-13 [`write_diff0_block`] /
 //! [`min_energy_for_diff0`], round-14 [`write_diff1_block`] /
-//! [`min_energy_for_diff1`], and round-15 [`write_diff2_block`] /
-//! [`min_energy_for_diff2`] predictor encoders. The
+//! [`min_energy_for_diff1`], round-15 [`write_diff2_block`] /
+//! [`min_energy_for_diff2`], and round-16 [`write_diff3_block`] /
+//! [`min_energy_for_diff3`] predictor encoders. The
 //! [`Error::NotImplemented`] sentinel remains available for any API
 //! the orphan-rebuild scaffold has not yet wired up.
 //!
@@ -241,10 +261,10 @@ pub use crate::codec::{
 pub use crate::driver::{decode_stream, DecodedStream, MAX_COMMANDS};
 pub use crate::encoder::{
     encode_envelope_stream, min_energy_for_diff0, min_energy_for_diff1, min_energy_for_diff2,
-    write_byte_aligned_prefix, write_diff0_block, write_diff1_block, write_diff2_block,
-    write_parameter_block, write_quit_command, write_stream_header, write_verbatim_block,
-    EncodeError, EncodeResult, ENCODER_VERSION, FN_DIFF0, FN_DIFF1, FN_DIFF2, FN_QUIT, FN_VERBATIM,
-    MAX_NATURAL_ENERGY,
+    min_energy_for_diff3, write_byte_aligned_prefix, write_diff0_block, write_diff1_block,
+    write_diff2_block, write_diff3_block, write_parameter_block, write_quit_command,
+    write_stream_header, write_verbatim_block, EncodeError, EncodeResult, ENCODER_VERSION,
+    FN_DIFF0, FN_DIFF1, FN_DIFF2, FN_DIFF3, FN_QUIT, FN_VERBATIM, MAX_NATURAL_ENERGY,
 };
 pub use crate::error::{Error, Result};
 pub use crate::header::{

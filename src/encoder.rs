@@ -1,5 +1,5 @@
 //! Shorten encode-side primitives — round 12 envelope + round 13 DIFF0
-//! + round 14 DIFF1 + round 15 DIFF2 predictor encoder.
+//! + round 14 DIFF1 + round 15 DIFF2 + round 16 DIFF3 predictor encoder.
 //!
 //! Round 12 lands the encoder-side scaffolding the README "lacks" tail
 //! has been naming since round 8: the bit-level wire-format writer
@@ -51,10 +51,29 @@
 //! [`min_energy_for_diff2`] picks the smallest natural energy under the
 //! same svar-prefix-zero rule as DIFF0 / DIFF1.
 //!
-//! The remaining predictor encoders (`BLOCK_FN_DIFF3` and
-//! `BLOCK_FN_QLPC` residual production, plus the per-block channel-
-//! round sequencer that picks `BLOCK_FN_DIFFn` order from a per-block
-//! statistical objective per TR.156 §3.3) are deferred to later rounds.
+//! Round 16 lands the order-3 polynomial-difference predictor encoder:
+//! [`write_diff3_block`] emits a `BLOCK_FN_DIFF3` command (function
+//! code 3 per `spec/03` §3.4) carrying `bs` per-sample residuals
+//! `e₃(t) = s(t) − (3·s(t − 1) − 3·s(t − 2) + s(t − 3))` under
+//! `svar(e + 1)` mantissa width (TR.156 §3.2 eq. 6 — the order-3
+//! predictor fits a quadratic to the last three samples). The first
+//! three `s(t − k)` values come from `carry.at(0)` (`s(t − 1)`),
+//! `carry.at(1)` (`s(t − 2)`), and `carry.at(2)` (`s(t − 3)`) per
+//! `spec/05` §1.1; the rolling `s_m1` / `s_m2` / `s_m3` window slides
+//! to each just-emitted sample as the recurrence advances, exactly
+//! mirroring the decoder's order-3 reconstruction recurrence
+//! `s(t) = 3·s(t − 1) − 3·s(t − 2) + s(t − 3) + e₃(t)`. DIFF3 is
+//! mean-invariant per `spec/05` §2 introductory paragraph (the running
+//! mean cancels in the third-difference form), so [`write_diff3_block`]
+//! takes no `mu_chan` parameter. [`min_energy_for_diff3`] picks the
+//! smallest natural energy under the same svar-prefix-zero rule as
+//! DIFF0 / DIFF1 / DIFF2.
+//!
+//! Round 16 closes the polynomial-difference predictor family on the
+//! encoder side; the remaining encoder gap is `BLOCK_FN_QLPC` (general
+//! quantised-LPC predictor residual production) plus the per-block
+//! channel-round sequencer that picks `BLOCK_FN_DIFFn` order from a
+//! per-block statistical objective per TR.156 §3.3.
 //! `DIFF0` was the natural starting point because (a) its
 //! reconstruction formula `s(t) = e₀(t) + μ_chan` involves no carry of
 //! past samples, and (b) it's the only predictor whose residual
@@ -62,8 +81,10 @@
 //! DIFF1 is the natural follow-on because the per-sample recurrence
 //! window is one sample deep and the residual stream is the first-
 //! differences of the source — a closed form that needs no statistical
-//! fitting (in contrast to DIFF2/DIFF3, which carry the same
-//! recurrence depth at orders 2 and 3).
+//! fitting. DIFF2 and DIFF3 deepen the recurrence window to two and
+//! three past samples respectively, but share the same shape: a
+//! sliding window of just-emitted samples seeded from the per-channel
+//! carry.
 //!
 //! ## What round 12 unlocks
 //!
@@ -132,6 +153,12 @@ pub const FN_DIFF1: u32 = 1;
 /// `e₂(t) = s(t) − ŝ₂(t)`.
 pub const FN_DIFF2: u32 = 2;
 
+/// `BLOCK_FN_DIFF3` function-code numeric value (`spec/03` §3.4 /
+/// `spec/04` §7). The order-3 polynomial-difference predictor —
+/// `ŝ₃(t) = 3·s(t − 1) − 3·s(t − 2) + s(t − 3)` (TR.156 §3.2 eq. 6),
+/// residual `e₃(t) = s(t) − ŝ₃(t)`.
+pub const FN_DIFF3: u32 = 3;
+
 /// Largest energy encoded value the round-13 `DIFF0` encoder will pick
 /// automatically.
 ///
@@ -155,8 +182,8 @@ pub const MAX_NATURAL_ENERGY: u32 = 7;
 /// awaits a `-v` fixture round per `spec/05` §7's open §9.4 candidate.
 pub const ENCODER_VERSION: u8 = 2;
 
-/// Errors the round-12 + round-13 + round-14 encoder primitives can
-/// surface.
+/// Errors the round-12 envelope encoder and the round-13 / round-14 /
+/// round-15 / round-16 predictor encoders can surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
     /// A header carried a format version outside `{1, 2, 3}`. The
@@ -448,11 +475,41 @@ pub fn min_energy_for_diff2(residuals: &[i64]) -> Option<u32> {
     min_natural_energy_for_residuals(residuals)
 }
 
+/// Compute the smallest energy encoded value `e ∈ 0..=MAX_NATURAL_ENERGY`
+/// such that every `DIFF3` residual fits within the `svar(e + 1)`
+/// mantissa with **zero** prefix-zero bits.
+///
+/// Per `spec/03` §3.4 the `DIFF3` residual is
+/// `e₃(t) = s(t) − (3·s(t − 1) − 3·s(t − 2) + s(t − 3))` with
+/// `s(t − 1)` / `s(t − 2)` / `s(t − 3)` supplied by the per-channel
+/// sample-history carry of `spec/05` §1 (zero on the very first block
+/// for each channel). The caller is responsible for computing the
+/// third-differences and passing them as `residuals`; this helper
+/// makes no assumption about the carry seed.
+///
+/// The svar-mantissa-fit rule is identical to [`min_energy_for_diff0`]
+/// — folding signed `r` to unsigned `u = 2r` (`r ≥ 0`) or `u = 2|r| − 1`
+/// (`r < 0`) per `spec/02` §2.2 and finding the smallest `e` such that
+/// `u_max < 2^(e + 1)`. The four helpers are kept separate by name so
+/// the caller's intent is explicit at the call site and the helper
+/// signature documents which predictor's residual definition the
+/// caller has applied.
+///
+/// Returns `None` if no `e` in the natural range fits the largest
+/// folded residual; the caller may either accept the prefix-zero cost
+/// by passing `MAX_NATURAL_ENERGY` explicitly or fall back to a wider
+/// (non-natural) width up to the decoder's `MAX_RESIDUAL_WIDTH = 30`
+/// cap.
+pub fn min_energy_for_diff3(residuals: &[i64]) -> Option<u32> {
+    min_natural_energy_for_residuals(residuals)
+}
+
 /// Shared svar-mantissa-fit scan: smallest `e ∈ 0..=MAX_NATURAL_ENERGY`
 /// such that every folded residual is strictly less than `2^(e + 1)`.
 ///
-/// Reused by [`min_energy_for_diff0`] and [`min_energy_for_diff1`];
-/// the per-predictor entrypoints exist to make the call site's intent
+/// Reused by [`min_energy_for_diff0`], [`min_energy_for_diff1`],
+/// [`min_energy_for_diff2`], and [`min_energy_for_diff3`]; the
+/// per-predictor entrypoints exist to make the call site's intent
 /// explicit. The helper carries no DIFFn-specific assumption — the
 /// caller has already computed the residuals in the predictor's
 /// definition.
@@ -761,6 +818,142 @@ pub fn write_diff2_block(
         let predicted = 2 * s_m1 - s_m2;
         let residual = s_i64 - predicted;
         writer.write_svar(residual, width);
+        s_m2 = s_m1;
+        s_m1 = s_i64;
+    }
+    Ok(())
+}
+
+/// Compute the per-sample `DIFF3` residual stream for `samples` given
+/// the per-channel carry-supplied `s(t − 1)` / `s(t − 2)` / `s(t − 3)`
+/// seeds.
+///
+/// Per `spec/03` §3.4 the residual is
+/// `e₃(t) = s(t) − (3·s(t − 1) − 3·s(t − 2) + s(t − 3))`. The initial
+/// `s(t − 1)` comes from `carry.at(0)`, `s(t − 2)` from `carry.at(1)`,
+/// and `s(t − 3)` from `carry.at(2)` (`spec/05` §1.1); the rolling
+/// `s_m1` / `s_m2` / `s_m3` window slides to each just-emitted sample
+/// as the recurrence advances. The result is a `Vec<i64>` of length
+/// `samples.len()` — `i64` headroom keeps the
+/// `3·s(t − 1) − 3·s(t − 2) + s(t − 3)` arithmetic safe against the
+/// `3·i32::MIN` / `3·i32::MAX` overflow that would not fit plain `i32`.
+///
+/// Used by the inline test harness to verify the recurrence direction
+/// matches [`crate::decode_diff_block`]'s order-3 reconstruction
+/// without re-implementing it. [`write_diff3_block`] inlines the
+/// equivalent recurrence into its sample-emission loop to avoid an
+/// intermediate allocation.
+#[cfg(test)]
+pub(crate) fn diff3_residuals(samples: &[i32], carry: &ChannelCarry) -> Vec<i64> {
+    let mut s_m1: i64 = carry.at(0) as i64;
+    let mut s_m2: i64 = if carry.len() > 1 {
+        carry.at(1) as i64
+    } else {
+        0
+    };
+    let mut s_m3: i64 = if carry.len() > 2 {
+        carry.at(2) as i64
+    } else {
+        0
+    };
+    let mut out: Vec<i64> = Vec::with_capacity(samples.len());
+    for &s in samples {
+        let s_i64 = s as i64;
+        let predicted = 3 * s_m1 - 3 * s_m2 + s_m3;
+        out.push(s_i64 - predicted);
+        s_m3 = s_m2;
+        s_m2 = s_m1;
+        s_m1 = s_i64;
+    }
+    out
+}
+
+/// Emit a `BLOCK_FN_DIFF3` command (function-code numeric `3`) to
+/// `writer` per `spec/03` §3.4 + `spec/05` §3.
+///
+/// Wire layout:
+///
+/// * `uvar(FNSIZE = 2)` over the value `FN_DIFF3 = 3`.
+/// * `uvar(ENERGYSIZE = 3)` over `energy_encoded` (the residual width
+///   is `energy_encoded + 1` per `spec/05` §3.1).
+/// * `samples.len()` × `svar(energy_encoded + 1)` over each per-sample
+///   residual
+///   `e₃(t) = s(t) − (3·s(t − 1) − 3·s(t − 2) + s(t − 3))`.
+///
+/// The order-3 polynomial-difference predictor fits a quadratic to the
+/// last three samples (`ŝ₃(t) = 3·s(t − 1) − 3·s(t − 2) + s(t − 3)` per
+/// TR.156 §3.2 eq. 6), so the residual stored on the wire is the
+/// third-difference of the channel-local sample stream. The first three
+/// `s(t − k)` values of a channel-block come from the per-channel
+/// sample-history carry (`spec/05` §1.1: `carry.at(0)` is the
+/// most-recent past sample `s(t − 1)`, `carry.at(1)` is `s(t − 2)`,
+/// `carry.at(2)` is `s(t − 3)`, all zero-initialised at stream start);
+/// subsequent samples within the block slide the window forward against
+/// just-emitted samples.
+///
+/// DIFF3 is **mean-invariant** per `spec/05` §2 introductory paragraph
+/// (the running mean cancels in the third-difference), so this
+/// function takes no `mu_chan` parameter.
+///
+/// The block advances the channel cursor on decode per `spec/03` §3.4.
+///
+/// Caller responsibilities:
+///
+/// * Choose `energy_encoded ∈ 0..=7`. The width applied is
+///   `energy_encoded + 1` bits. [`min_energy_for_diff3`] picks the
+///   smallest natural choice; a smaller value than necessary still
+///   encodes correctly (the svar prefix-zero count grows) but is
+///   wasteful.
+/// * Provide the per-channel sample-history `carry`; `carry.at(0)`,
+///   `carry.at(1)`, and `carry.at(2)` supply the initial three-sample
+///   window. The mean estimator's state is NOT consulted by the DIFF3
+///   encoder (mean-invariant predictor).
+/// * Update the per-channel sample-history carry
+///   ([`crate::ChannelCarry::update_after_block`]) and the mean
+///   estimator ([`crate::MeanEstimator::record_block`]) after a
+///   successful return — this function does not maintain any state.
+///
+/// Errors:
+///
+/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > 7`.
+/// * [`EncodeError::BlockTooLong`] if `samples.len() > u32::MAX as usize`.
+///
+/// The decoder side ([`crate::decode_diff_block`] with
+/// [`crate::PolyOrder::Order3`]) consumes the emitted bits and
+/// reconstructs `s(t) = 3·s(t − 1) − 3·s(t − 2) + s(t − 3) + e₃(t)` per
+/// `spec/03` §3.4.
+pub fn write_diff3_block(
+    writer: &mut BitWriter,
+    energy_encoded: u32,
+    samples: &[i32],
+    carry: &ChannelCarry,
+) -> EncodeResult<()> {
+    if energy_encoded > MAX_NATURAL_ENERGY {
+        return Err(EncodeError::EnergyOutOfRange(energy_encoded));
+    }
+    if samples.len() > u32::MAX as usize {
+        return Err(EncodeError::BlockTooLong(samples.len()));
+    }
+    let width = energy_encoded + 1;
+    writer.write_uvar(FN_DIFF3, FNSIZE);
+    writer.write_uvar(energy_encoded, ENERGYSIZE);
+    let mut s_m1: i64 = carry.at(0) as i64;
+    let mut s_m2: i64 = if carry.len() > 1 {
+        carry.at(1) as i64
+    } else {
+        0
+    };
+    let mut s_m3: i64 = if carry.len() > 2 {
+        carry.at(2) as i64
+    } else {
+        0
+    };
+    for &s in samples {
+        let s_i64 = s as i64;
+        let predicted = 3 * s_m1 - 3 * s_m2 + s_m3;
+        let residual = s_i64 - predicted;
+        writer.write_svar(residual, width);
+        s_m3 = s_m2;
         s_m2 = s_m1;
         s_m1 = s_i64;
     }
@@ -1608,5 +1801,227 @@ mod tests {
         out.extend(writer.into_bytes());
         let dec = decode_stream(&out).expect("decode");
         assert_eq!(dec.verbatim, b"hello".to_vec());
+    }
+
+    // ---- DIFF3 encoder ----
+
+    #[test]
+    fn min_energy_for_diff3_picks_zero_for_zero_residuals() {
+        // Third-differences of a pure cubic-free polynomial of degree
+        // ≤ 2 (constant / linear / quadratic ramp) fold to 0; u_max = 0
+        // < 2^1, so e = 0 (width 1). Matches DIFF0..2 behaviour on an
+        // all-zero residual stream.
+        assert_eq!(min_energy_for_diff3(&[0, 0, 0, 0]), Some(0));
+    }
+
+    #[test]
+    fn min_energy_for_diff3_picks_smallest_width_per_max_residual() {
+        // Same scan rule as min_energy_for_diff0..2 — duplicated rather
+        // than shared so a regression in the shared helper is caught at
+        // every call site.
+        assert_eq!(min_energy_for_diff3(&[3, -3, 0, 1]), Some(2));
+        assert_eq!(min_energy_for_diff3(&[10, -7, -10, 1]), Some(4));
+        assert_eq!(min_energy_for_diff3(&[127, -128, 0]), Some(7));
+    }
+
+    #[test]
+    fn min_energy_for_diff3_returns_none_for_over_natural_range() {
+        assert_eq!(min_energy_for_diff3(&[1000, 0]), None);
+    }
+
+    #[test]
+    fn write_diff3_block_rejects_oversize_energy() {
+        let mut w = BitWriter::new();
+        let carry = crate::predictor::ChannelCarry::new(3);
+        assert_eq!(
+            write_diff3_block(&mut w, 8, &[0, 0], &carry),
+            Err(EncodeError::EnergyOutOfRange(8))
+        );
+    }
+
+    #[test]
+    fn write_diff3_block_emits_function_code_then_energy_then_residuals() {
+        // fn = uvar(2) over 3: ⌊3/4⌋ = 0 leading zeros + terminator +
+        //   mantissa `11` (low 2 bits of 3) → `1 11` = 3 bits.
+        // energy = uvar(3) over 0 = "1000" (4 bits).
+        // 2 residuals at width 1 over folded u ∈ {0, 1}: 2 bits each →
+        //   4 bits. Total 11.
+        let mut w = BitWriter::new();
+        let carry = crate::predictor::ChannelCarry::new(3);
+        write_diff3_block(&mut w, 0, &[0, 0], &carry).expect("encode");
+        assert_eq!(w.bits_written(), 11);
+    }
+
+    #[test]
+    fn diff3_residuals_match_third_differences_against_zero_carry() {
+        use crate::predictor::ChannelCarry;
+        // Zero-initialised carry → s(t-1) = s(t-2) = s(t-3) = 0 for the
+        // first sample. Predictor `ŝ₃(t) = 3·s(t-1) − 3·s(t-2) + s(t-3)`
+        // is 0 for the first sample; residual e₃(0) = s(0). The
+        // recurrence becomes the actual third-difference only from
+        // the fourth sample onward.
+        let carry = ChannelCarry::new(3);
+        let samples: &[i32] = &[5, 7, 4, 4, -3];
+        let residuals = diff3_residuals(samples, &carry);
+        // Hand-computed:
+        //   t=0: pred = 3·0 − 3·0 + 0 = 0;            r = 5  − 0   = 5
+        //   t=1: pred = 3·5 − 3·0 + 0 = 15;           r = 7  − 15  = -8
+        //   t=2: pred = 3·7 − 3·5 + 0 = 6;            r = 4  − 6   = -2
+        //   t=3: pred = 3·4 − 3·7 + 5 = -4;           r = 4  − (-4)= 8
+        //   t=4: pred = 3·4 − 3·4 + 7 = 7;            r = -3 − 7   = -10
+        assert_eq!(residuals, vec![5i64, -8, -2, 8, -10]);
+    }
+
+    #[test]
+    fn diff3_residuals_seed_from_carry_triple() {
+        use crate::predictor::ChannelCarry;
+        let mut carry = ChannelCarry::new(3);
+        // Previous block ended on samples …, 80, 90, 100. update_after_block
+        // sets carry.at(0) = 100 (s(t-1)), carry.at(1) = 90 (s(t-2)),
+        // carry.at(2) = 80 (s(t-3)).
+        carry.update_after_block(&[20, 80, 90, 100]);
+        assert_eq!(carry.at(0), 100);
+        assert_eq!(carry.at(1), 90);
+        assert_eq!(carry.at(2), 80);
+        let samples: &[i32] = &[110, 119, 127];
+        let residuals = diff3_residuals(samples, &carry);
+        // Hand-computed:
+        //   t=0: pred = 3·100 − 3·90 + 80 = 110;      r = 110 − 110 = 0
+        //   t=1: pred = 3·110 − 3·100 + 90 = 120;     r = 119 − 120 = -1
+        //   t=2: pred = 3·119 − 3·110 + 100 = 127;    r = 127 − 127 = 0
+        assert_eq!(residuals, vec![0i64, -1, 0]);
+    }
+
+    #[test]
+    fn diff3_block_roundtrips_through_decode_diff_block() {
+        use crate::bitreader::BitReader;
+        use crate::block::{read_function_code, FunctionCode};
+        use crate::predictor::{decode_diff_block, ChannelCarry, PolyOrder};
+
+        // Representative spread of test samples; carry zero-initialised
+        // per-case to match a fresh-channel block.
+        let cases: &[(u32, &[i32])] = &[
+            (0, &[0, 0, 0, 0]),
+            (1, &[0, 0, 0, 1, 0, -1, 0]),
+            (3, &[5, -8, -2, 8, -10]),
+            (4, &[15, -16, 8, -8, 7, 0]),
+            (7, &[100, -100, 64, -64, 0, 0]),
+        ];
+        for (i, &(energy, samples)) in cases.iter().enumerate() {
+            // Encode side: write the full DIFF3 command.
+            let mut w = BitWriter::new();
+            let enc_carry = ChannelCarry::new(3);
+            write_diff3_block(&mut w, energy, samples, &enc_carry).expect("encode");
+            let bytes = w.into_bytes();
+
+            // Decode side: read fn code, then dispatch into
+            // decode_diff_block (which starts at the energy field).
+            let mut r = BitReader::new(&bytes);
+            let fc = read_function_code(&mut r).expect("read fn code");
+            assert_eq!(fc, FunctionCode::Diff3, "case {i}");
+            let dec_carry = ChannelCarry::new(3);
+            // mu_chan is ignored by Order3 — pass 0.
+            let block = decode_diff_block(
+                &mut r,
+                PolyOrder::Order3,
+                samples.len() as u32,
+                &dec_carry,
+                0,
+            )
+            .expect("decode_diff_block");
+            assert_eq!(block, samples.to_vec(), "case {i}");
+        }
+    }
+
+    #[test]
+    fn diff3_block_roundtrips_with_non_zero_carry_seed() {
+        use crate::bitreader::BitReader;
+        use crate::block::read_function_code;
+        use crate::predictor::{decode_diff_block, ChannelCarry, PolyOrder};
+
+        // Encoder + decoder share the same carry state, which has just
+        // absorbed a prior block ending on samples 80, 90, 100.
+        let mut enc_carry = ChannelCarry::new(3);
+        enc_carry.update_after_block(&[20, 80, 90, 100]);
+        let mut dec_carry = ChannelCarry::new(3);
+        dec_carry.update_after_block(&[20, 80, 90, 100]);
+
+        // Continuing a smooth (pure-quadratic) ramp; residuals are small.
+        let samples: &[i32] = &[110, 119, 127, 134];
+        // Hand-computed residuals from diff3_residuals_seed_from_carry_triple
+        // span r ∈ [-2, 0]; e = 2 (width 3) covers it with room to spare.
+        let energy: u32 = 2;
+
+        let mut w = BitWriter::new();
+        write_diff3_block(&mut w, energy, samples, &enc_carry).expect("encode");
+        let bytes = w.into_bytes();
+
+        let mut r = BitReader::new(&bytes);
+        let _fc = read_function_code(&mut r).expect("fn code");
+        let block = decode_diff_block(
+            &mut r,
+            PolyOrder::Order3,
+            samples.len() as u32,
+            &dec_carry,
+            0,
+        )
+        .expect("decode_diff_block");
+        assert_eq!(block, samples.to_vec());
+    }
+
+    #[test]
+    fn write_diff3_block_then_quit_decodes_via_decode_stream() {
+        // Mono, default block size 6, no mean, v2. Use samples whose
+        // third-differences are bounded for compact encoding.
+        let header = synth_header(2, 5, 1, 6, 0, 0, 0);
+        let samples: Vec<i32> = vec![1, 4, 3, 7, 2, 6];
+        let carry = crate::predictor::ChannelCarry::new(3);
+        let residuals = diff3_residuals(&samples, &carry);
+        let energy = min_energy_for_diff3(&residuals).expect("natural energy fits");
+
+        let mut out = Vec::new();
+        write_byte_aligned_prefix(&mut out, header.version).expect("prefix");
+        let mut writer = BitWriter::new();
+        write_parameter_block(&mut writer, &header);
+        write_diff3_block(&mut writer, energy, &samples, &carry).expect("diff3");
+        write_quit_command(&mut writer);
+        writer.pad_to_byte();
+        out.extend(writer.into_bytes());
+
+        let dec = decode_stream(&out).expect("decode stream");
+        assert_eq!(dec.header, header);
+        assert_eq!(dec.channels.len(), 1);
+        assert_eq!(dec.channels[0], samples);
+    }
+
+    #[test]
+    fn write_diff3_block_two_channels_round_robin() {
+        // Stereo: channels round-robin on each emitted sample-producing
+        // command. Each channel has its own zero-initialised carry.
+        let header = synth_header(2, 5, 2, 4, 0, 0, 0);
+        let ch0: Vec<i32> = vec![4, 6, 3, 1];
+        let ch1: Vec<i32> = vec![-2, 0, -5, 2];
+        let enc_carry_ch0 = crate::predictor::ChannelCarry::new(3);
+        let enc_carry_ch1 = crate::predictor::ChannelCarry::new(3);
+        let r0 = diff3_residuals(&ch0, &enc_carry_ch0);
+        let r1 = diff3_residuals(&ch1, &enc_carry_ch1);
+        let e0 = min_energy_for_diff3(&r0).expect("ch0 fits");
+        let e1 = min_energy_for_diff3(&r1).expect("ch1 fits");
+
+        let mut out = Vec::new();
+        write_byte_aligned_prefix(&mut out, header.version).expect("prefix");
+        let mut writer = BitWriter::new();
+        write_parameter_block(&mut writer, &header);
+        // Per spec/03 §2: ch0 first, then ch1, then back to ch0…
+        write_diff3_block(&mut writer, e0, &ch0, &enc_carry_ch0).expect("ch0");
+        write_diff3_block(&mut writer, e1, &ch1, &enc_carry_ch1).expect("ch1");
+        write_quit_command(&mut writer);
+        writer.pad_to_byte();
+        out.extend(writer.into_bytes());
+
+        let dec = decode_stream(&out).expect("decode");
+        assert_eq!(dec.channels.len(), 2);
+        assert_eq!(dec.channels[0], ch0);
+        assert_eq!(dec.channels[1], ch1);
     }
 }
