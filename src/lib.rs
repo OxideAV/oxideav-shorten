@@ -261,10 +261,11 @@ pub use crate::codec::{
 pub use crate::driver::{decode_stream, DecodedStream, MAX_COMMANDS};
 pub use crate::encoder::{
     encode_envelope_stream, min_energy_for_diff0, min_energy_for_diff1, min_energy_for_diff2,
-    min_energy_for_diff3, write_byte_aligned_prefix, write_diff0_block, write_diff1_block,
-    write_diff2_block, write_diff3_block, write_parameter_block, write_quit_command,
-    write_stream_header, write_verbatim_block, EncodeError, EncodeResult, ENCODER_VERSION,
-    FN_DIFF0, FN_DIFF1, FN_DIFF2, FN_DIFF3, FN_QUIT, FN_VERBATIM, MAX_NATURAL_ENERGY,
+    min_energy_for_diff3, min_energy_for_qlpc, qlpc_residuals, write_byte_aligned_prefix,
+    write_diff0_block, write_diff1_block, write_diff2_block, write_diff3_block,
+    write_parameter_block, write_qlpc_block, write_quit_command, write_stream_header,
+    write_verbatim_block, EncodeError, EncodeResult, ENCODER_VERSION, FN_DIFF0, FN_DIFF1, FN_DIFF2,
+    FN_DIFF3, FN_QLPC, FN_QUIT, FN_VERBATIM, MAX_NATURAL_ENERGY, MAX_QLPC_ORDER,
 };
 pub use crate::error::{Error, Result};
 pub use crate::header::{

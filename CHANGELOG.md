@@ -16,6 +16,69 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 17 clean-room rebuild.** `BLOCK_FN_QLPC` predictor encoder
+  (`spec/03` §3.5 + `spec/02` §4.3 + §4.4 + `spec/05` §1 + §3.1) — the
+  general quantised-LPC predictor encoder, closing the predictor
+  encoder family on the encoder side (DIFF0..3 from rounds 13..16 plus
+  QLPC here):
+  - `write_qlpc_block(writer, energy_encoded, coefs, samples, carry)`
+    — emits a full `BLOCK_FN_QLPC` command (function code 7 +
+    `uvar(LPCQSIZE = 2)` per-block order + `order` quantised
+    coefficients as `svar(LPCQUANT = 2)` + `uvar(ENERGYSIZE = 3)`
+    energy + `bs × svar(energy + 1)` per-sample residuals) per
+    `spec/03` §3.5. The encoder seeds the predictor history window
+    from `carry.at(0)..carry.at(order − 1)` per `spec/05` §1.1,
+    then slides the window to each just-emitted sample as the
+    recurrence advances. The per-sample residual is
+    `e_QLPC(t) = s(t) − Σᵢ coefs[i] · s(t − i − 1)` (TR.156 §3.2
+    first equation). Coefficients are applied **without scaling**
+    per `spec/03` §3.5. The decoder's `decode_qlpc_block`
+    reconstructs `s(t) = Σᵢ aᵢ · s(t − i) + e_QLPC(t)`. Output
+    round-trips losslessly through `decode_stream`.
+  - QLPC is **mean-invariant** per `spec/03` §3.12 / `spec/05` §2
+    introductory paragraph (the prediction is a linear function of
+    past *samples* which already incorporate the channel mean), so
+    `write_qlpc_block` takes no `mu_chan` parameter — matches the
+    DIFF1 / DIFF2 / DIFF3 signature shape, distinct from DIFF0.
+  - `qlpc_residuals(samples, coefs, carry)` — public helper
+    computing the per-sample QLPC residual stream so callers
+    driving `min_energy_for_qlpc` don't have to re-derive the
+    per-sample scan at the call site.
+  - `min_energy_for_qlpc(residuals)` — picks the smallest encoded
+    energy `e ∈ 0..=7` such that every folded QLPC residual fits
+    inside the `svar(e + 1)` mantissa with zero prefix-zero bits
+    (the "natural" width per `spec/05` §3.1's "smallest sensible
+    `n` is 1" floor). Returns `None` when no natural width fits
+    the largest folded residual. Shares the same private scan as
+    the four `min_energy_for_diff*` helpers.
+  - `FN_QLPC = 7` (`spec/03` §3 + `spec/04` §5) and
+    `MAX_QLPC_ORDER = 1024` (encoder safety cap matching the
+    decoder's `MAX_LPC_ORDER`) — new public constants.
+  - `EncodeError::LpcOrderTooLarge { order, carry_len }` and the
+    `#[doc(hidden)]` `EncodeError::CoefficientOutOfRange(i64)` /
+    `EncodeError::QlpcOrderCoefCountMismatch { order, coefs }`
+    variants — new error states surfaced when `coefs.len()`
+    exceeds the safety cap or the supplied `ChannelCarry`'s length.
+  - 15 new in-module unit tests (`encoder::tests::*`) + 9 new
+    integration tests (`tests/encoder_qlpc_pipeline.rs`) confirm:
+    function-code constant matches `spec/03` §3; order-0 / 1 / 2 /
+    3 residual scans against hand-computed expectations (order 0
+    reduces to the input; `a₁ = 1` reduces to first-differences;
+    `a₁ = 2, a₂ = -1` is the order-2 polynomial-difference
+    predictor wire-encoded as QLPC; `a₁ = 3, a₂ = -3, a₃ = 1` is
+    the order-3 polynomial-difference predictor on a pure-cubic
+    ramp); minimum-energy selection (zero residuals → energy 0;
+    cross-helper consistency vs. `min_energy_for_diff0`);
+    energy-out-of-range / order-out-of-range / over-cap order
+    rejection; bit-count correctness for the encoded fn + order +
+    energy + residual layout; non-zero carry seed for cross-block
+    continuity; full-stream round-trip via `decode_stream` at
+    `H_maxlpcorder = 2` (mono single block) and `H_maxlpcorder = 1`
+    (stereo two-block round-robin); a three-channel two-blocks-each
+    round-robin stress with three distinct per-channel coefficient
+    vectors; VERBATIM splice; silent block; carry continuity across
+    two consecutive QLPC blocks on the same channel.
+
 - **Round 16 clean-room rebuild.** `BLOCK_FN_DIFF3` predictor encoder
   (`spec/03` §3.4 + `spec/05` §1 + §3.1) — the order-3 polynomial-
   difference predictor encoder, closing the polynomial-difference

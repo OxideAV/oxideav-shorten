@@ -1,5 +1,6 @@
-//! Shorten encode-side primitives — round 12 envelope + round 13 DIFF0
-//! + round 14 DIFF1 + round 15 DIFF2 + round 16 DIFF3 predictor encoder.
+//! Shorten encode-side primitives — round 12 envelope + round 13 DIFF0 +
+//! round 14 DIFF1 + round 15 DIFF2 + round 16 DIFF3 + round 17 QLPC
+//! predictor encoder.
 //!
 //! Round 12 lands the encoder-side scaffolding the README "lacks" tail
 //! has been naming since round 8: the bit-level wire-format writer
@@ -70,10 +71,40 @@
 //! DIFF0 / DIFF1 / DIFF2.
 //!
 //! Round 16 closes the polynomial-difference predictor family on the
-//! encoder side; the remaining encoder gap is `BLOCK_FN_QLPC` (general
-//! quantised-LPC predictor residual production) plus the per-block
-//! channel-round sequencer that picks `BLOCK_FN_DIFFn` order from a
-//! per-block statistical objective per TR.156 §3.3.
+//! encoder side; round 17 lands the general quantised-LPC predictor
+//! encoder.
+//!
+//! Round 17 lands the general quantised-LPC predictor encoder:
+//! [`write_qlpc_block`] emits a `BLOCK_FN_QLPC` command (function code 7
+//! per `spec/03` §3.5) carrying a per-block order
+//! (`uvar(LPCQSIZE = 2)`), `order` quantised coefficients
+//! (`svar(LPCQUANT = 2)`), an energy field (`uvar(ENERGYSIZE = 3)`), and
+//! `bs × svar(energy + 1)` per-sample residuals
+//! `e_QLPC(t) = s(t) − Σᵢ aᵢ · s(t − i)` (TR.156 §3.2 first equation).
+//! The first `order` past samples for the predictor's window come from
+//! the per-channel sample-history carry (`carry.at(0) = s(t − 1)`,
+//! `carry.at(1) = s(t − 2)`, …, `carry.at(order − 1) = s(t − order)` per
+//! `spec/05` §1.1); the rolling history window slides to each
+//! just-emitted sample as the recurrence advances, exactly mirroring the
+//! decoder's reconstruction `s(t) = Σᵢ aᵢ · s(t − i) + e_QLPC(t)` of
+//! `spec/03` §3.5. The coefficients are applied **without scaling** per
+//! `spec/03` §3.5 — `coef[i] = aᵢ₊₁` paired with `s(t − i − 1)` in the
+//! history window.
+//!
+//! QLPC is **mean-invariant** per `spec/03` §3.12 / `spec/05` §2 (its
+//! prediction is a linear function of past *samples* which already
+//! incorporate the channel mean), so [`write_qlpc_block`] takes no
+//! `mu_chan` parameter. [`min_energy_for_qlpc`] picks the smallest
+//! natural energy under the same svar-prefix-zero rule as the DIFFn
+//! family. [`qlpc_residuals`] is exposed as a public helper so callers
+//! that drive [`min_energy_for_qlpc`] don't have to re-derive the
+//! per-sample residual scan; the decoder side's reconstruction is the
+//! inverse operation.
+//!
+//! The per-block channel-round sequencer that picks `BLOCK_FN_DIFFn` /
+//! `BLOCK_FN_QLPC` from a per-block statistical objective per TR.156
+//! §3.3 remains a separate, higher-layer concern that builds on top of
+//! the five predictor encoders.
 //! `DIFF0` was the natural starting point because (a) its
 //! reconstruction formula `s(t) = e₀(t) + μ_chan` involves no carry of
 //! past samples, and (b) it's the only predictor whose residual
@@ -125,7 +156,7 @@
 use crate::bitwriter::{natural_ulong_width, BitWriter};
 use crate::block::{FNSIZE, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE, VERBATIM_MAX_LEN};
 use crate::header::{ShortenStreamHeader, MAGIC};
-use crate::predictor::{ChannelCarry, ENERGYSIZE};
+use crate::predictor::{ChannelCarry, ENERGYSIZE, LPCQSIZE, LPCQUANT};
 
 /// `BLOCK_FN_VERBATIM` function-code numeric value (`spec/03` §3.10 /
 /// `spec/04` §7). Re-exported as a public constant so callers building
@@ -158,6 +189,23 @@ pub const FN_DIFF2: u32 = 2;
 /// `ŝ₃(t) = 3·s(t − 1) − 3·s(t − 2) + s(t − 3)` (TR.156 §3.2 eq. 6),
 /// residual `e₃(t) = s(t) − ŝ₃(t)`.
 pub const FN_DIFF3: u32 = 3;
+
+/// `BLOCK_FN_QLPC` function-code numeric value (`spec/03` §3.5 /
+/// `spec/04` §5). The general quantised-LPC predictor —
+/// `ŝ_QLPC(t) = Σᵢ₌₁..order aᵢ · s(t − i)` (TR.156 §3.2 first
+/// equation), residual `e_QLPC(t) = s(t) − ŝ_QLPC(t)`.
+pub const FN_QLPC: u32 = 7;
+
+/// Implementation safety cap on the per-block LPC order the encoder
+/// will accept. The wire-format `uvar(LPCQSIZE = 2)` field carries any
+/// `u32`, but the decoder caps the order at the same value
+/// ([`crate::Error::LpcOrderTooLarge`] surfaces above it); the encoder
+/// rejects over-cap orders rather than emit a block the decoder would
+/// reject. `spec/03` §3.5 bounds the per-block order at
+/// `H_maxlpcorder` (`spec/01` §3.4); fixture `F1` has
+/// `H_maxlpcorder = 0` so a v2/v3 stream that never engages the LPC
+/// predictor stays well clear of the cap.
+pub const MAX_QLPC_ORDER: u32 = 1024;
 
 /// Largest energy encoded value the round-13 `DIFF0` encoder will pick
 /// automatically.
@@ -209,6 +257,33 @@ pub enum EncodeError {
     /// The block-sample count exceeds `u32::MAX` or hits the
     /// implementation's safety cap on per-block samples.
     BlockTooLong(usize),
+    /// The caller's `BLOCK_FN_QLPC` per-block order exceeded the
+    /// implementation safety cap [`MAX_QLPC_ORDER`] or the supplied
+    /// `ChannelCarry`'s length (the predictor needs `order` past
+    /// samples from the carry to seed its history window per
+    /// `spec/05` §1.1).
+    LpcOrderTooLarge { order: u32, carry_len: u32 },
+    /// The caller's QLPC `coefs.len()` did not match the explicit
+    /// `order` argument passed to [`write_qlpc_block`]. The two must
+    /// agree because `order` is what gets written to the wire while
+    /// `coefs[i]` is what supplies `aᵢ₊₁` to the predictor recurrence;
+    /// a mismatch would write a block the decoder cannot parse.
+    QlpcOrderCoefCountMismatch { order: u32, coefs: usize },
+    /// A QLPC coefficient passed to [`write_qlpc_block`] does not fit
+    /// in the natural `svar(LPCQUANT = 2)` mantissa width with zero
+    /// prefix-zero bits. The encoder still emits the coefficient
+    /// correctly (the svar prefix-zero count absorbs the magnitude),
+    /// but a coefficient stream that consistently overflows the
+    /// natural width signals a quantisation problem on the caller's
+    /// side — see TR.156 §3.2 "the prediction coefficients … are
+    /// quantised in accordance with the same Laplacian distribution
+    /// used for the residual signal" and `spec/03` §3.5's "each
+    /// `coef` is a small signed integer".  This variant is currently
+    /// not raised by the implementation (the encoder writes the
+    /// coefficient and proceeds); it is reserved for a future
+    /// strict-natural-width mode.
+    #[doc(hidden)]
+    CoefficientOutOfRange(i64),
 }
 
 impl core::fmt::Display for EncodeError {
@@ -234,6 +309,18 @@ impl core::fmt::Display for EncodeError {
             EncodeError::BlockTooLong(n) => write!(
                 f,
                 "oxideav-shorten: DIFFn block sample count {n} exceeds u32::MAX"
+            ),
+            EncodeError::LpcOrderTooLarge { order, carry_len } => write!(
+                f,
+                "oxideav-shorten: QLPC block order {order} exceeds carry length / safety cap {carry_len}"
+            ),
+            EncodeError::QlpcOrderCoefCountMismatch { order, coefs } => write!(
+                f,
+                "oxideav-shorten: QLPC order {order} does not match coefficient slice length {coefs}"
+            ),
+            EncodeError::CoefficientOutOfRange(c) => write!(
+                f,
+                "oxideav-shorten: QLPC coefficient {c} exceeds the natural svar(LPCQUANT) width"
             ),
         }
     }
@@ -956,6 +1043,215 @@ pub fn write_diff3_block(
         s_m3 = s_m2;
         s_m2 = s_m1;
         s_m1 = s_i64;
+    }
+    Ok(())
+}
+
+/// Compute the per-sample QLPC residual stream for `samples` given the
+/// per-block coefficient vector `coefs` (with `coefs[i] = aᵢ₊₁`,
+/// applied to `s(t − i − 1)`) and the per-channel sample-history
+/// `carry` (with `carry.at(i) = s(t − i − 1)`, all zero-initialised at
+/// stream start per `spec/05` §1.1).
+///
+/// Returns `Err(EncodeError::LpcOrderTooLarge)` when `coefs.len()`
+/// exceeds [`MAX_QLPC_ORDER`] or `carry.len()` (the predictor cannot
+/// seed enough past samples).
+///
+/// The residual stream is `e_QLPC(t) = s(t) − Σᵢ coefs[i] · s(t − i − 1)`
+/// where the history window slides forward against each just-emitted
+/// sample as the recurrence advances. Coefficients are applied
+/// **without scaling** per `spec/03` §3.5. Order 0 (`coefs.is_empty()`)
+/// reduces the predictor to zero-prediction (`e_QLPC(t) = s(t)`),
+/// matching the decoder's order-0 behaviour.
+///
+/// The computation is performed in `i64` headroom; the caller is
+/// responsible for ensuring `samples` and the `carry` already pin to
+/// `i32` range (the wire format does the same: the per-sample residual
+/// is `svar(width)` with `width ≤ MAX_RESIDUAL_WIDTH = 30`).
+///
+/// Exposed as a public helper so callers driving [`min_energy_for_qlpc`]
+/// share one implementation of the per-sample scan rather than
+/// duplicating it across the call site and the [`write_qlpc_block`]
+/// internals.
+pub fn qlpc_residuals(
+    samples: &[i32],
+    coefs: &[i64],
+    carry: &ChannelCarry,
+) -> EncodeResult<Vec<i64>> {
+    let order = coefs.len();
+    if order > MAX_QLPC_ORDER as usize || order > carry.len() {
+        return Err(EncodeError::LpcOrderTooLarge {
+            order: order as u32,
+            carry_len: carry.len() as u32,
+        });
+    }
+    // History window: hist[i] = s(t − i − 1), most-recent-first,
+    // seeded from carry then slid against just-emitted samples.
+    let mut hist: Vec<i64> = (0..order).map(|i| carry.at(i) as i64).collect();
+    let mut out: Vec<i64> = Vec::with_capacity(samples.len());
+    for &s in samples {
+        let s_i64 = s as i64;
+        let mut predicted: i64 = 0;
+        for (c, h) in coefs.iter().zip(hist.iter()) {
+            predicted = predicted.wrapping_add(c.wrapping_mul(*h));
+        }
+        out.push(s_i64.wrapping_sub(predicted));
+        // Slide the history window: the just-emitted sample becomes
+        // the new most-recent past sample (decoder mirrors this in
+        // `decode_qlpc_block`).
+        if order > 0 {
+            for i in (1..order).rev() {
+                hist[i] = hist[i - 1];
+            }
+            hist[0] = s_i64;
+        }
+    }
+    Ok(out)
+}
+
+/// Compute the smallest energy encoded value `e ∈ 0..=MAX_NATURAL_ENERGY`
+/// such that every QLPC residual fits within the `svar(e + 1)` mantissa
+/// with **zero** prefix-zero bits.
+///
+/// Per `spec/03` §3.5 the QLPC residual is
+/// `e_QLPC(t) = s(t) − Σᵢ aᵢ · s(t − i)` with the predictor's past-
+/// sample window seeded from the per-channel sample-history carry of
+/// `spec/05` §1. The caller is responsible for computing the residual
+/// stream (typically via [`qlpc_residuals`]) and passing it here.
+///
+/// The svar-mantissa-fit rule is identical to [`min_energy_for_diff0`]
+/// — folding signed `r` to unsigned `u = 2r` (`r ≥ 0`) or `u = 2|r| − 1`
+/// (`r < 0`) per `spec/02` §2.2 and finding the smallest `e` such that
+/// `u_max < 2^(e + 1)`. The QLPC entry point exists so the call-site
+/// intent is explicit and matches the per-predictor helper shape of the
+/// DIFFn family.
+///
+/// Returns `None` if no `e` in the natural range fits the largest
+/// folded residual; the caller may either accept the prefix-zero cost
+/// by passing `MAX_NATURAL_ENERGY` explicitly or fall back to a wider
+/// (non-natural) width up to the decoder's `MAX_RESIDUAL_WIDTH = 30`
+/// cap. This helper is **not** the optimal Rice parameter of TR.156
+/// §3.3 (which minimises total encoded bit count, not just prefix
+/// bits); callers wanting the statistical optimum should compute it
+/// themselves and pass it as `energy_encoded` to [`write_qlpc_block`].
+pub fn min_energy_for_qlpc(residuals: &[i64]) -> Option<u32> {
+    min_natural_energy_for_residuals(residuals)
+}
+
+/// Emit a `BLOCK_FN_QLPC` command (function-code numeric `7`) to
+/// `writer` per `spec/03` §3.5 + TR.156 §3.2 first equation.
+///
+/// Wire layout:
+///
+/// * `uvar(FNSIZE = 2)` over the value `FN_QLPC = 7`.
+/// * `uvar(LPCQSIZE = 2)` over the per-block order
+///   `coefs.len() as u32`.
+/// * `coefs.len()` × `svar(LPCQUANT = 2)` over the per-block
+///   quantised coefficients in transmission order
+///   (`coefs[0] = a₁`, `coefs[1] = a₂`, … — applied to `s(t − 1)`,
+///   `s(t − 2)`, … respectively).
+/// * `uvar(ENERGYSIZE = 3)` over `energy_encoded` (the residual
+///   width is `energy_encoded + 1` per `spec/05` §3.1).
+/// * `samples.len()` × `svar(energy_encoded + 1)` over each
+///   per-sample residual
+///   `e_QLPC(t) = s(t) − Σᵢ coefs[i] · s(t − i − 1)`.
+///
+/// The first `order` past samples for the predictor's window come from
+/// the per-channel sample-history carry (`carry.at(0) = s(t − 1)`,
+/// `carry.at(1) = s(t − 2)`, …); the rolling window slides to each
+/// just-emitted sample as the recurrence advances, exactly mirroring
+/// the decoder's reconstruction in
+/// [`crate::decode_qlpc_block`].
+///
+/// Coefficients are applied **without scaling** per `spec/03` §3.5
+/// ("each `coef` is a small signed integer that the decoder applies in
+/// the predictor recurrence without scaling"). Order 0 (`coefs` empty)
+/// is well-formed and reduces the predictor to zero-prediction
+/// (`e_QLPC(t) = s(t)`); the per-block-order field still emits the
+/// `uvar(LPCQSIZE)` value 0 so the decoder can parse it.
+///
+/// QLPC is **mean-invariant** per `spec/03` §3.12 / `spec/05` §2 (its
+/// prediction is a linear function of past *samples* which already
+/// incorporate the channel mean), so this function takes no
+/// `mu_chan` parameter.
+///
+/// The block advances the channel cursor on decode per `spec/03` §3.5.
+///
+/// Caller responsibilities:
+///
+/// * Choose `energy_encoded ∈ 0..=7`. The width applied is
+///   `energy_encoded + 1` bits. [`min_energy_for_qlpc`] picks the
+///   smallest natural choice; a smaller value than necessary still
+///   encodes correctly (the svar prefix-zero count grows) but is
+///   wasteful.
+/// * Provide the per-channel sample-history `carry`; the encoder reads
+///   `carry.at(0)..carry.at(order − 1)` to seed the predictor history
+///   window. The mean estimator's state is NOT consulted by the QLPC
+///   encoder (mean-invariant predictor).
+/// * Update the per-channel sample-history carry
+///   ([`crate::ChannelCarry::update_after_block`]) and (if used) the
+///   mean estimator ([`crate::MeanEstimator::record_block`]) after a
+///   successful return — this function does not maintain any state.
+///
+/// Errors:
+///
+/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > 7`.
+/// * [`EncodeError::LpcOrderTooLarge`] if `coefs.len()` exceeds
+///   [`MAX_QLPC_ORDER`] or the supplied `carry`'s length.
+/// * [`EncodeError::BlockTooLong`] if `samples.len() > u32::MAX as usize`.
+///
+/// The decoder side ([`crate::decode_qlpc_block`]) consumes the
+/// emitted bits and reconstructs
+/// `s(t) = Σᵢ aᵢ · s(t − i) + e_QLPC(t)` per `spec/03` §3.5.
+pub fn write_qlpc_block(
+    writer: &mut BitWriter,
+    energy_encoded: u32,
+    coefs: &[i64],
+    samples: &[i32],
+    carry: &ChannelCarry,
+) -> EncodeResult<()> {
+    if energy_encoded > MAX_NATURAL_ENERGY {
+        return Err(EncodeError::EnergyOutOfRange(energy_encoded));
+    }
+    if samples.len() > u32::MAX as usize {
+        return Err(EncodeError::BlockTooLong(samples.len()));
+    }
+    let order = coefs.len();
+    if order > MAX_QLPC_ORDER as usize || order > carry.len() {
+        return Err(EncodeError::LpcOrderTooLarge {
+            order: order as u32,
+            carry_len: carry.len() as u32,
+        });
+    }
+    let width = energy_encoded + 1;
+
+    // Function code.
+    writer.write_uvar(FN_QLPC, FNSIZE);
+    // Per-block order.
+    writer.write_uvar(order as u32, LPCQSIZE);
+    // The order coefficients, in transmission order.
+    for &c in coefs {
+        writer.write_svar(c, LPCQUANT);
+    }
+    // Energy field.
+    writer.write_uvar(energy_encoded, ENERGYSIZE);
+
+    // Predictor recurrence: hist[i] = s(t − i − 1).
+    let mut hist: Vec<i64> = (0..order).map(|i| carry.at(i) as i64).collect();
+    for &s in samples {
+        let s_i64 = s as i64;
+        let mut predicted: i64 = 0;
+        for (c, h) in coefs.iter().zip(hist.iter()) {
+            predicted = predicted.wrapping_add(c.wrapping_mul(*h));
+        }
+        let residual = s_i64.wrapping_sub(predicted);
+        writer.write_svar(residual, width);
+        if order > 0 {
+            for i in (1..order).rev() {
+                hist[i] = hist[i - 1];
+            }
+            hist[0] = s_i64;
+        }
     }
     Ok(())
 }
@@ -2015,6 +2311,257 @@ mod tests {
         // Per spec/03 §2: ch0 first, then ch1, then back to ch0…
         write_diff3_block(&mut writer, e0, &ch0, &enc_carry_ch0).expect("ch0");
         write_diff3_block(&mut writer, e1, &ch1, &enc_carry_ch1).expect("ch1");
+        write_quit_command(&mut writer);
+        writer.pad_to_byte();
+        out.extend(writer.into_bytes());
+
+        let dec = decode_stream(&out).expect("decode");
+        assert_eq!(dec.channels.len(), 2);
+        assert_eq!(dec.channels[0], ch0);
+        assert_eq!(dec.channels[1], ch1);
+    }
+
+    // -------------------------------------------------------------
+    // Round 17 — QLPC predictor encoder tests (spec/03 §3.5).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn fn_qlpc_constant_matches_spec() {
+        // spec/03 §3 table: BLOCK_FN_QLPC = 7.
+        assert_eq!(FN_QLPC, 7);
+    }
+
+    #[test]
+    fn qlpc_residuals_order_zero_returns_samples_unchanged() {
+        // Order 0 → no coefficients → ŝ_QLPC(t) = 0, e(t) = s(t).
+        let carry = crate::predictor::ChannelCarry::new(3);
+        let samples: &[i32] = &[1, -2, 3, -4, 5];
+        let residuals = qlpc_residuals(samples, &[], &carry).expect("scan");
+        assert_eq!(residuals, vec![1i64, -2, 3, -4, 5]);
+    }
+
+    #[test]
+    fn qlpc_residuals_order_one_matches_first_difference_when_a1_is_one() {
+        // a1 = 1 with a zero-initialised carry is identical to DIFF1.
+        let carry = crate::predictor::ChannelCarry::new(3);
+        let samples: &[i32] = &[5, 8, 6, 10];
+        let residuals = qlpc_residuals(samples, &[1], &carry).expect("scan");
+        // Hand-computed: pred(0) = 1·0 = 0 → r = 5
+        //                pred(1) = 1·5 = 5 → r = 3
+        //                pred(2) = 1·8 = 8 → r = -2
+        //                pred(3) = 1·6 = 6 → r = 4
+        assert_eq!(residuals, vec![5i64, 3, -2, 4]);
+    }
+
+    #[test]
+    fn qlpc_residuals_order_two_uses_two_past_samples() {
+        // a1 = 1, a2 = -1; predictor = s(t-1) − s(t-2).
+        let carry = crate::predictor::ChannelCarry::new(3);
+        let samples: &[i32] = &[10, 11, 12, 13];
+        let residuals = qlpc_residuals(samples, &[1, -1], &carry).expect("scan");
+        // pred(0) = 1·0 + (-1)·0 = 0  → r = 10
+        // pred(1) = 1·10 + (-1)·0 = 10 → r = 1
+        // pred(2) = 1·11 + (-1)·10 = 1 → r = 11
+        // pred(3) = 1·12 + (-1)·11 = 1 → r = 12
+        assert_eq!(residuals, vec![10i64, 1, 11, 12]);
+    }
+
+    #[test]
+    fn qlpc_residuals_rejects_order_beyond_carry_length() {
+        let carry = crate::predictor::ChannelCarry::new(3);
+        let samples: &[i32] = &[1, 2, 3];
+        let err = qlpc_residuals(samples, &[1, 1, 1, 1], &carry).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::LpcOrderTooLarge {
+                order: 4,
+                carry_len: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn min_energy_for_qlpc_picks_zero_for_zero_residuals() {
+        assert_eq!(min_energy_for_qlpc(&[0, 0, 0, 0]), Some(0));
+    }
+
+    #[test]
+    fn min_energy_for_qlpc_matches_diff0_helper_on_same_inputs() {
+        // The four min_energy_for_diff* helpers + min_energy_for_qlpc
+        // share one private scan; verify the public surface stays
+        // consistent.
+        let residuals: &[i64] = &[0, 1, -1, 7, -7, 3];
+        assert_eq!(
+            min_energy_for_qlpc(residuals),
+            min_energy_for_diff0(residuals)
+        );
+        let big: &[i64] = &[0, 0, 0, 64, -64];
+        assert_eq!(min_energy_for_qlpc(big), min_energy_for_diff0(big));
+    }
+
+    #[test]
+    fn write_qlpc_block_rejects_energy_above_seven() {
+        let mut w = BitWriter::new();
+        let carry = crate::predictor::ChannelCarry::new(3);
+        let err = write_qlpc_block(&mut w, 8, &[1], &[0], &carry).unwrap_err();
+        assert_eq!(err, EncodeError::EnergyOutOfRange(8));
+    }
+
+    #[test]
+    fn write_qlpc_block_rejects_order_above_carry_length() {
+        let mut w = BitWriter::new();
+        let carry = crate::predictor::ChannelCarry::new(3);
+        let err = write_qlpc_block(&mut w, 0, &[1, 1, 1, 1], &[0], &carry).unwrap_err();
+        assert!(matches!(
+            err,
+            EncodeError::LpcOrderTooLarge {
+                order: 4,
+                carry_len: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn write_qlpc_block_emits_fn_then_order_then_energy_then_residuals() {
+        // fn = uvar(2) over 7: 7 in binary `111`; uvar(2) of value 7
+        // packs as prefix-zero count ⌊7/4⌋ = 1, terminator `1`, then
+        // 2-bit mantissa `11` → bits = `0 1 11` = 4 bits.
+        // order = uvar(2) over 0: prefix `1` + mantissa `00` = 3 bits.
+        // energy = uvar(3) over 0: prefix `1` + mantissa `000` = 4 bits.
+        // 2 residuals at width 1 over folded u ∈ {0, 1}: width-1
+        //   svar(1) of 0 → uvar(1) of u=0 = "10" = 2 bits;
+        //   svar(1) of 1 (sample = 0) → u=0 still 2 bits.
+        // Total: 4 + 3 + 4 + 2 + 2 = 15 bits.
+        let mut w = BitWriter::new();
+        let carry = crate::predictor::ChannelCarry::new(3);
+        write_qlpc_block(&mut w, 0, &[], &[0, 0], &carry).expect("encode");
+        assert_eq!(w.bits_written(), 15);
+    }
+
+    #[test]
+    fn qlpc_block_roundtrips_through_decode_qlpc_block_order_zero() {
+        use crate::bitreader::BitReader;
+        use crate::block::{read_function_code, FunctionCode};
+        use crate::predictor::{decode_qlpc_block, ChannelCarry};
+
+        let samples: &[i32] = &[10, -7, 3, 0, -1];
+        let carry = ChannelCarry::new(3);
+        let energy = 4;
+
+        let mut w = BitWriter::new();
+        write_qlpc_block(&mut w, energy, &[], samples, &carry).expect("encode");
+        let bytes = w.into_bytes();
+
+        let mut r = BitReader::new(&bytes);
+        let fc = read_function_code(&mut r).expect("read fn");
+        assert_eq!(fc, FunctionCode::Qlpc);
+        let dec_carry = ChannelCarry::new(3);
+        let block = decode_qlpc_block(&mut r, samples.len() as u32, &dec_carry).expect("decode");
+        assert_eq!(block, samples.to_vec());
+    }
+
+    #[test]
+    fn qlpc_block_roundtrips_through_decode_qlpc_block_order_three() {
+        use crate::bitreader::BitReader;
+        use crate::block::read_function_code;
+        use crate::predictor::{decode_qlpc_block, ChannelCarry};
+
+        // Order 3 with a non-trivial coefficient vector. Use a smooth
+        // sample sequence so the residuals are bounded.
+        let coefs: Vec<i64> = vec![1, -1, 1];
+        let samples: &[i32] = &[5, 7, 9, 11, 13, 15];
+        let carry = ChannelCarry::new(3);
+        let residuals = qlpc_residuals(samples, &coefs, &carry).expect("scan");
+        let energy = min_energy_for_qlpc(&residuals).expect("fits");
+
+        let mut w = BitWriter::new();
+        write_qlpc_block(&mut w, energy, &coefs, samples, &carry).expect("encode");
+        let bytes = w.into_bytes();
+
+        let mut r = BitReader::new(&bytes);
+        let _fc = read_function_code(&mut r).expect("fn");
+        let dec_carry = ChannelCarry::new(3);
+        let block = decode_qlpc_block(&mut r, samples.len() as u32, &dec_carry).expect("decode");
+        assert_eq!(block, samples.to_vec());
+    }
+
+    #[test]
+    fn qlpc_block_roundtrips_with_non_zero_carry_seed() {
+        use crate::bitreader::BitReader;
+        use crate::block::read_function_code;
+        use crate::predictor::{decode_qlpc_block, ChannelCarry};
+
+        // Encoder + decoder share a carry already populated by a prior
+        // block on this channel. With a1 = 1 the predictor is the
+        // running-sum form and the residuals are the first-differences
+        // of the continued sequence.
+        let mut enc_carry = ChannelCarry::new(3);
+        enc_carry.update_after_block(&[50, 60, 70, 80]);
+        let mut dec_carry = ChannelCarry::new(3);
+        dec_carry.update_after_block(&[50, 60, 70, 80]);
+
+        let samples: &[i32] = &[90, 95, 100, 102];
+        let coefs: Vec<i64> = vec![1];
+        let residuals = qlpc_residuals(samples, &coefs, &enc_carry).expect("scan");
+        let energy = min_energy_for_qlpc(&residuals).expect("fits");
+
+        let mut w = BitWriter::new();
+        write_qlpc_block(&mut w, energy, &coefs, samples, &enc_carry).expect("encode");
+        let bytes = w.into_bytes();
+
+        let mut r = BitReader::new(&bytes);
+        let _fc = read_function_code(&mut r).expect("fn");
+        let block = decode_qlpc_block(&mut r, samples.len() as u32, &dec_carry).expect("decode");
+        assert_eq!(block, samples.to_vec());
+    }
+
+    #[test]
+    fn write_qlpc_block_then_quit_decodes_via_decode_stream_order_two() {
+        // Mono, default block size 6, H_maxlpcorder = 2 so the
+        // decoder allocates a carry of length max(3, 2) = 3.
+        let header = synth_header(2, 5, 1, 6, 2, 0, 0);
+        let samples: Vec<i32> = vec![3, 5, 2, 4, 6, 1];
+        let coefs: Vec<i64> = vec![1, -1];
+        let carry = crate::predictor::ChannelCarry::new(3);
+        let residuals = qlpc_residuals(&samples, &coefs, &carry).expect("scan");
+        let energy = min_energy_for_qlpc(&residuals).expect("fits");
+
+        let mut out = Vec::new();
+        write_byte_aligned_prefix(&mut out, header.version).expect("prefix");
+        let mut writer = BitWriter::new();
+        write_parameter_block(&mut writer, &header);
+        write_qlpc_block(&mut writer, energy, &coefs, &samples, &carry).expect("qlpc");
+        write_quit_command(&mut writer);
+        writer.pad_to_byte();
+        out.extend(writer.into_bytes());
+
+        let dec = decode_stream(&out).expect("decode stream");
+        assert_eq!(dec.header, header);
+        assert_eq!(dec.channels.len(), 1);
+        assert_eq!(dec.channels[0], samples);
+    }
+
+    #[test]
+    fn write_qlpc_block_stereo_round_robin_via_decode_stream() {
+        // Stereo: each channel emits one order-1 QLPC block.
+        let header = synth_header(2, 5, 2, 4, 1, 0, 0);
+        let ch0: Vec<i32> = vec![3, 5, 4, 7];
+        let ch1: Vec<i32> = vec![-1, 0, 2, 3];
+        let coefs0: Vec<i64> = vec![1];
+        let coefs1: Vec<i64> = vec![1];
+        let enc_carry_ch0 = crate::predictor::ChannelCarry::new(3);
+        let enc_carry_ch1 = crate::predictor::ChannelCarry::new(3);
+        let r0 = qlpc_residuals(&ch0, &coefs0, &enc_carry_ch0).expect("scan ch0");
+        let r1 = qlpc_residuals(&ch1, &coefs1, &enc_carry_ch1).expect("scan ch1");
+        let e0 = min_energy_for_qlpc(&r0).expect("ch0 fits");
+        let e1 = min_energy_for_qlpc(&r1).expect("ch1 fits");
+
+        let mut out = Vec::new();
+        write_byte_aligned_prefix(&mut out, header.version).expect("prefix");
+        let mut writer = BitWriter::new();
+        write_parameter_block(&mut writer, &header);
+        write_qlpc_block(&mut writer, e0, &coefs0, &ch0, &enc_carry_ch0).expect("ch0");
+        write_qlpc_block(&mut writer, e1, &coefs1, &ch1, &enc_carry_ch1).expect("ch1");
         write_quit_command(&mut writer);
         writer.pad_to_byte();
         out.extend(writer.into_bytes());

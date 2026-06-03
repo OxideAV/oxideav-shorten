@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 16 (2026-06-03).** The crate was
+**Clean-room rebuild — round 17 (2026-06-04).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -492,11 +492,10 @@ Wayne Stielau's seek-table utility:
     third-difference edge, and a three-channel three-blocks-each
     round-robin stress.
   * **Scope.** Round 16 closes the polynomial-difference predictor
-    family (DIFF0..3) on the encoder side. `BLOCK_FN_QLPC` still
-    needs the coefficient quantisation of `spec/03` §3.5 plus the
-    general LPC residual computation off the per-channel carry;
-    the Rice-`n` selection is still a natural-width-only heuristic
-    and the statistical optimum of TR.156 §3.3 remains pending.
+    family (DIFF0..3) on the encoder side. `BLOCK_FN_QLPC`'s
+    encoder is added by round 17 (below); the Rice-`n` selection
+    is still a natural-width-only heuristic and the statistical
+    optimum of TR.156 §3.3 remains pending.
   * **Spec gap (docs/audio/shorten/spec/04 §2):** the §2 narrative
     incorrectly describes `BLOCK_FN_QUIT = 4`'s encoding as the
     5-bit `uvar(2)` pattern `00100`, but per `spec/02` §2.1's
@@ -515,8 +514,80 @@ Wayne Stielau's seek-table utility:
     position 4 of the last byte; the §2 narrative conflates the
     two cases).
 
-The combined surface is exercised by **264 tests** (210 in-module
-unit + 54 integration tests across 13 integration binaries). The
+- **Round 17** — the `BLOCK_FN_QLPC` predictor encoder
+  (`spec/03` §3.5 + `spec/02` §4.3 + §4.4 + `spec/05` §1 + §3.1):
+  * `write_qlpc_block(writer, energy_encoded, coefs, samples, carry)`
+    — emits a full `<fn=7> <order> <coef>×order <energy>
+    <residual>×bs` command, computing per-sample residuals
+    `e_QLPC(t) = s(t) − Σᵢ coefs[i] · s(t − i − 1)` (TR.156 §3.2
+    first equation). The first `order` past samples come from the
+    per-channel sample-history carry (`carry.at(0) = s(t − 1)`,
+    …, `carry.at(order − 1) = s(t − order)` per `spec/05` §1.1);
+    the rolling history window slides to each just-emitted sample
+    as the recurrence advances. Coefficients are applied
+    **without scaling** per `spec/03` §3.5 — `coef[i] = aᵢ₊₁` is
+    paired with `s(t − i − 1)` in the history window. The
+    decoder's `decode_qlpc_block` reconstructs
+    `s(t) = Σᵢ aᵢ · s(t − i) + e_QLPC(t)` per `spec/03` §3.5.
+    Output round-trips losslessly through `decode_stream`.
+  * QLPC is **mean-invariant** per `spec/03` §3.12 / `spec/05` §2
+    introductory paragraph (the prediction is a linear function of
+    past *samples* which already carry the channel mean), so
+    `write_qlpc_block` takes no `mu_chan` parameter.
+  * `qlpc_residuals(samples, coefs, carry)` — public helper that
+    computes the per-sample residual stream a caller passes to
+    `min_energy_for_qlpc` (and would otherwise have to re-derive
+    at the call site).
+  * `min_energy_for_qlpc(residuals)` — picks the smallest encoded
+    energy `e ∈ 0..=7` such that every folded QLPC residual fits
+    inside the `svar(e + 1)` mantissa with zero prefix-zero bits
+    (the "natural" width per `spec/05` §3.1's "smallest sensible
+    `n` is 1" floor). Shares the same private scan as the four
+    `min_energy_for_diff*` helpers.
+  * `FN_QLPC = 7` (`spec/03` §3 + `spec/04` §5) and
+    `MAX_QLPC_ORDER = 1024` (encoder safety cap matching the
+    decoder's `MAX_LPC_ORDER`) — new public constants.
+  * `EncodeError::LpcOrderTooLarge { order, carry_len }` — new
+    variant surfaced when `coefs.len()` exceeds either the safety
+    cap or the supplied `ChannelCarry`'s length (the encoder
+    cannot seed `order` past samples from a shorter carry).
+  * 15 new in-module unit tests + 9 new integration tests
+    (`tests/encoder_qlpc_pipeline.rs`) confirm: function-code
+    constant matches `spec/03` §3; order-0 residual scan equals
+    the input; order-1 with `a₁ = 1` and zero carry reduces to
+    the first-difference stream; order-2 / order-3 residual scans
+    against hand-computed expectations; over-cap order rejection;
+    minimum-energy selection (zero residuals → energy 0; cross-
+    helper consistency vs. `min_energy_for_diff0`);
+    energy-out-of-range / order-out-of-range rejections; bit-
+    count correctness for the encoded fn + order + energy +
+    residual layout; round-trips at orders 0 / 1 / 2 / 3 (the
+    `a₁ = 1, a₂ = -1` configuration is the order-2 polynomial-
+    difference predictor encoded via QLPC; `a₁ = 3, a₂ = -3,
+    a₃ = 1` is the order-3 polynomial-difference predictor on a
+    pure-cubic ramp); non-zero carry seed for cross-block
+    continuity; full-stream round-trip via `decode_stream` at
+    `H_maxlpcorder = 2` (mono) and `H_maxlpcorder = 1` (stereo
+    round-robin); a three-channel two-blocks-each round-robin
+    stress with three different per-channel coefficient vectors;
+    VERBATIM splice; silent block; carry continuity across two
+    consecutive QLPC blocks on the same channel.
+  * **Scope.** Round 17 closes the predictor encoder family on
+    the encoder side (DIFF0..3 + QLPC). The natural-width
+    `min_energy_for_qlpc` helper is **not** the optimal Rice
+    parameter of TR.156 §3.3 (which minimises total encoded bit
+    count); a future round can layer the statistical optimum on
+    top without changing the wire format. The encoder-side
+    coefficient quantisation (the encoder takes the caller's
+    quantised coefficients as `&[i64]`; deriving the optimal
+    coefficients from input samples is a separate, higher-layer
+    concern per TR.156 §3.2's quantisation narrative). The
+    per-block channel-round sequencer that picks
+    `BLOCK_FN_DIFFn` / `BLOCK_FN_QLPC` from a per-block
+    statistical objective likewise remains pending.
+
+The combined surface is exercised by **288 tests** (225 in-module
+unit + 63 integration tests across 14 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
@@ -545,15 +616,21 @@ leaves the second block undecoded until the next pull) (round 10).
 
 ### What's not yet here
 
-* QLPC **predictor encoder** path: rounds 13..16 land the four
-  polynomial-difference predictor encoders (`BLOCK_FN_DIFF0..3`),
-  closing the polynomial-difference family on the encoder side.
-  The general LPC predictor (`BLOCK_FN_QLPC`) still needs encoder-
-  side coefficient quantisation per `spec/03` §3.5 plus the
-  general LPC residual computation off the per-channel sample-
-  history carry, plus the Rice-`n` optimal-selection of TR.156
-  §3.3 and the channel-round command sequencer that picks
-  predictor order per block under a statistical criterion.
+* Encoder-side **coefficient quantisation** for QLPC. The round-17
+  `write_qlpc_block` entry point accepts the caller's already-
+  quantised coefficient vector as `&[i64]`; the optimal-quantisation
+  derivation from raw input samples per TR.156 §3.2 (the
+  Laplacian-distribution rule) remains a higher-layer concern.
+* **Rice-`n` statistical optimum** (TR.156 §3.3). The five
+  `min_energy_for_*` helpers pick the smallest natural-width energy
+  that fits the largest folded residual with zero prefix-zero bits;
+  the statistical optimum (which minimises total encoded bit count,
+  not just prefix bits) is a refinement that doesn't change the wire
+  format.
+* **Per-block predictor selection** — the channel-round command
+  sequencer that compares DIFF0..3 / QLPC per block under a
+  statistical criterion and picks the cheapest predictor for each
+  block.
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking
