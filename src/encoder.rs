@@ -196,6 +196,13 @@ pub const FN_DIFF3: u32 = 3;
 /// equation), residual `e_QLPC(t) = s(t) − ŝ_QLPC(t)`.
 pub const FN_QLPC: u32 = 7;
 
+/// `BLOCK_FN_ZERO` function-code numeric value (`spec/03` §3.9 /
+/// `spec/04` §6). The constant-block sentinel — a channel-cursor-
+/// advancing command whose decoded payload is `bs` samples all equal
+/// to the channel's current running mean `μ_chan` (`spec/05` §2.4).
+/// Carries no further wire fields after the function code.
+pub const FN_ZERO: u32 = 8;
+
 /// Implementation safety cap on the per-block LPC order the encoder
 /// will accept. The wire-format `uvar(LPCQSIZE = 2)` field carries any
 /// `u32`, but the decoder caps the order at the same value
@@ -1254,6 +1261,55 @@ pub fn write_qlpc_block(
         }
     }
     Ok(())
+}
+
+/// Emit a `BLOCK_FN_ZERO` command (function-code numeric `8`) to
+/// `writer` per `spec/03` §3.9 + `spec/04` §6.
+///
+/// Wire layout:
+///
+/// * `uvar(FNSIZE = 2)` over the value `FN_ZERO = 8`. No further
+///   fields follow — the entire command is the bare function-code
+///   field.
+///
+/// Decode semantics ([`crate::fill_zero_block`] + the round-7 driver's
+/// `FunctionCode::Zero` arm): the decoder emits `bs` per-channel
+/// samples all equal to the channel's current running-mean estimate
+/// `μ_chan` (`spec/05` §2.4). When `H_meanblocks = 0` the running-
+/// mean estimator is disabled and `μ_chan = 0`, so a `BLOCK_FN_ZERO`
+/// block contributes `bs` zeros to that channel. When
+/// `H_meanblocks > 0`, the block contributes `bs` copies of the
+/// current sliding-window-derived mean, which can be non-zero.
+///
+/// The block advances the channel cursor on decode per `spec/03`
+/// §3.9 ("Advances the channel cursor.").
+///
+/// Caller responsibilities:
+///
+/// * Only emit `BLOCK_FN_ZERO` when the source block consists of
+///   exactly `bs` copies of the current `μ_chan` value at the
+///   producer end. The encoder DOES NOT verify this — the choice is
+///   the higher-level sequencer's, because the sequencer is what
+///   tracks per-channel sample values. An over-eager ZERO would
+///   produce wrong samples on decode (`bs` `μ_chan` values where the
+///   original was something else).
+/// * Update the per-channel sample-history carry
+///   ([`crate::ChannelCarry::update_after_block`]) and (when
+///   `H_meanblocks > 0`) the mean estimator
+///   ([`crate::MeanEstimator::record_block`]) after a successful
+///   return — this function does not maintain any state. The block
+///   the caller passes to `update_after_block` / `record_block`
+///   must be the `bs` copies of `μ_chan` the decoder will
+///   reconstruct, not the source samples (the two are equal by the
+///   caller-responsibility rule above).
+///
+/// This function never fails — there is no per-block parameter
+/// outside the function code. (Callers that want to know how many
+/// bits the command consumes can compute it as the cost of
+/// `uvar(FNSIZE = 2)` over `8`: prefix-zero count `⌊8/4⌋ = 2`,
+/// terminator `1`, mantissa `00` → 5 bits total.)
+pub fn write_zero_block(writer: &mut BitWriter) {
+    writer.write_uvar(FN_ZERO, FNSIZE);
 }
 
 #[cfg(test)]
@@ -2570,5 +2626,146 @@ mod tests {
         assert_eq!(dec.channels.len(), 2);
         assert_eq!(dec.channels[0], ch0);
         assert_eq!(dec.channels[1], ch1);
+    }
+
+    // -------------------------------------------------------------
+    // Round 18 — BLOCK_FN_ZERO predictor encoder tests
+    // (spec/03 §3.9 + spec/04 §6 + spec/05 §2.4).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn fn_zero_constant_matches_spec() {
+        // spec/03 §3 + spec/04 §6 function-code table:
+        // BLOCK_FN_ZERO = 8.
+        assert_eq!(FN_ZERO, 8);
+    }
+
+    #[test]
+    fn write_zero_block_emits_uvar_of_eight_five_bits() {
+        // uvar(FNSIZE = 2) over value 8:
+        //   prefix-zero count = ⌊8/4⌋ = 2 → "00"
+        //   terminator = "1"
+        //   mantissa = 8 mod 4 = 0 over 2 bits → "00"
+        // Total bits = 2 + 1 + 2 = 5; pattern = 0b00100.
+        let mut w = BitWriter::new();
+        write_zero_block(&mut w);
+        assert_eq!(w.bits_written(), 5);
+
+        // Pad to byte then verify the high 5 bits of the first byte
+        // are 0b00100 (the low 3 bits are zero padding).
+        w.pad_to_byte();
+        let bytes = w.into_bytes();
+        assert_eq!(bytes.len(), 1);
+        assert_eq!(bytes[0] & 0b1111_1000, 0b0010_0000);
+    }
+
+    #[test]
+    fn write_zero_block_roundtrips_through_read_function_code() {
+        use crate::bitreader::BitReader;
+        use crate::block::{read_function_code, FunctionCode};
+
+        let mut w = BitWriter::new();
+        write_zero_block(&mut w);
+        let bits = w.bits_written();
+        w.pad_to_byte();
+        let bytes = w.into_bytes();
+
+        let mut r = BitReader::new(&bytes);
+        let fc = read_function_code(&mut r).expect("read fn");
+        assert_eq!(fc, FunctionCode::Zero);
+        assert_eq!(bits, 5);
+    }
+
+    #[test]
+    fn write_zero_block_via_decode_stream_mono_meanblocks_zero() {
+        // Mono, H_meanblocks = 0 → mu_chan = 0 for the channel.
+        // A single BLOCK_FN_ZERO block contributes `bs` zero samples.
+        let header = synth_header(2, 5, 1, 4, 0, 0, 0);
+
+        let mut out = Vec::new();
+        write_byte_aligned_prefix(&mut out, header.version).expect("prefix");
+        let mut writer = BitWriter::new();
+        write_parameter_block(&mut writer, &header);
+        write_zero_block(&mut writer);
+        write_quit_command(&mut writer);
+        writer.pad_to_byte();
+        out.extend(writer.into_bytes());
+
+        let dec = decode_stream(&out).expect("decode");
+        assert_eq!(dec.header, header);
+        assert_eq!(dec.channels.len(), 1);
+        assert_eq!(dec.channels[0], vec![0i32; 4]);
+    }
+
+    #[test]
+    fn write_zero_block_stereo_round_robin_via_decode_stream() {
+        // Stereo: each channel emits one BLOCK_FN_ZERO block. The
+        // per-channel round-robin cursor advances on both, so the
+        // resulting decoded stream has `bs` zeros per channel.
+        let header = synth_header(2, 5, 2, 4, 0, 0, 0);
+
+        let mut out = Vec::new();
+        write_byte_aligned_prefix(&mut out, header.version).expect("prefix");
+        let mut writer = BitWriter::new();
+        write_parameter_block(&mut writer, &header);
+        write_zero_block(&mut writer); // ch 0
+        write_zero_block(&mut writer); // ch 1
+        write_quit_command(&mut writer);
+        writer.pad_to_byte();
+        out.extend(writer.into_bytes());
+
+        let dec = decode_stream(&out).expect("decode");
+        assert_eq!(dec.channels.len(), 2);
+        assert_eq!(dec.channels[0], vec![0i32; 4]);
+        assert_eq!(dec.channels[1], vec![0i32; 4]);
+    }
+
+    #[test]
+    fn write_zero_block_then_diff0_continues_channel_cursor() {
+        // Mono channel emits ZERO, then a DIFF0 block follows on the
+        // same channel (cursor wraps back to ch 0 since H_channels = 1).
+        // DIFF0 residuals are with respect to mu_chan = 0 (H_meanblocks
+        // = 0); the decoder reconstructs s(t) = e0(t) + 0 = e0(t).
+        let header = synth_header(2, 5, 1, 4, 0, 0, 0);
+        let diff0_samples: Vec<i32> = vec![3, -2, 5, -1];
+        let energy =
+            min_energy_for_diff0(&diff0_samples.iter().map(|&s| s as i64).collect::<Vec<_>>())
+                .expect("residuals fit");
+
+        let mut out = Vec::new();
+        write_byte_aligned_prefix(&mut out, header.version).expect("prefix");
+        let mut writer = BitWriter::new();
+        write_parameter_block(&mut writer, &header);
+        write_zero_block(&mut writer);
+        write_diff0_block(&mut writer, energy, &diff0_samples, 0).expect("diff0");
+        write_quit_command(&mut writer);
+        writer.pad_to_byte();
+        out.extend(writer.into_bytes());
+
+        let dec = decode_stream(&out).expect("decode");
+        let mut expected: Vec<i32> = vec![0i32; 4];
+        expected.extend(diff0_samples.iter());
+        assert_eq!(dec.channels[0], expected);
+    }
+
+    #[test]
+    fn write_zero_block_three_consecutive_via_decode_stream() {
+        // Mono channel, three back-to-back ZERO blocks. Total decoded
+        // length should be 3 * bs zeros (H_meanblocks = 0).
+        let header = synth_header(2, 5, 1, 4, 0, 0, 0);
+
+        let mut out = Vec::new();
+        write_byte_aligned_prefix(&mut out, header.version).expect("prefix");
+        let mut writer = BitWriter::new();
+        write_parameter_block(&mut writer, &header);
+        for _ in 0..3 {
+            write_zero_block(&mut writer);
+        }
+        write_quit_command(&mut writer);
+        writer.pad_to_byte();
+        out.extend(writer.into_bytes());
+
+        let dec = decode_stream(&out).expect("decode");
+        assert_eq!(dec.channels[0], vec![0i32; 12]);
     }
 }

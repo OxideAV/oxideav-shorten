@@ -177,6 +177,22 @@
 //!   [`min_energy_for_diff2`] picks the smallest natural energy under
 //!   the same svar-prefix-zero rule as DIFF0 / DIFF1.
 //!
+//! * Round 18 — the **`BLOCK_FN_ZERO` sentinel encoder**
+//!   ([`write_zero_block`]) per `spec/03` §3.9 + `spec/04` §6 +
+//!   `spec/05` §2.4. Emits the constant-block command (function code
+//!   8) as a bare `uvar(FNSIZE = 2)` field with no further payload.
+//!   The decoder side ([`fill_zero_block`] + the round-7 driver's
+//!   `FunctionCode::Zero` arm) reconstructs `bs` samples all equal
+//!   to the channel's running-mean estimate `μ_chan` (zero when
+//!   `H_meanblocks = 0`). The block advances the channel cursor on
+//!   decode. The total encoded cost is 5 bits — the cheapest sample-
+//!   producing command in the format, hence its name. The caller is
+//!   responsible for only emitting ZERO when the source block
+//!   genuinely consists of `bs` copies of the current `μ_chan` at
+//!   the producer end; the encoder does not verify this because the
+//!   per-block `μ_chan` value is the higher-level sequencer's
+//!   knowledge, not the writer primitive's.
+//!
 //! * Round 16 — the **`BLOCK_FN_DIFF3` predictor encoder**
 //!   ([`write_diff3_block`]) per `spec/03` §3.4 + `spec/05` §1 + §3.
 //!   Emits the order-3 polynomial-difference predictor's per-block
@@ -210,7 +226,8 @@
 //! [`min_energy_for_diff0`], round-14 [`write_diff1_block`] /
 //! [`min_energy_for_diff1`], round-15 [`write_diff2_block`] /
 //! [`min_energy_for_diff2`], and round-16 [`write_diff3_block`] /
-//! [`min_energy_for_diff3`] predictor encoders. The
+//! [`min_energy_for_diff3`] predictor encoders plus the round-18
+//! [`write_zero_block`] sentinel encoder. The
 //! [`Error::NotImplemented`] sentinel remains available for any API
 //! the orphan-rebuild scaffold has not yet wired up.
 //!
@@ -264,8 +281,9 @@ pub use crate::encoder::{
     min_energy_for_diff3, min_energy_for_qlpc, qlpc_residuals, write_byte_aligned_prefix,
     write_diff0_block, write_diff1_block, write_diff2_block, write_diff3_block,
     write_parameter_block, write_qlpc_block, write_quit_command, write_stream_header,
-    write_verbatim_block, EncodeError, EncodeResult, ENCODER_VERSION, FN_DIFF0, FN_DIFF1, FN_DIFF2,
-    FN_DIFF3, FN_QLPC, FN_QUIT, FN_VERBATIM, MAX_NATURAL_ENERGY, MAX_QLPC_ORDER,
+    write_verbatim_block, write_zero_block, EncodeError, EncodeResult, ENCODER_VERSION, FN_DIFF0,
+    FN_DIFF1, FN_DIFF2, FN_DIFF3, FN_QLPC, FN_QUIT, FN_VERBATIM, FN_ZERO, MAX_NATURAL_ENERGY,
+    MAX_QLPC_ORDER,
 };
 pub use crate::error::{Error, Result};
 pub use crate::header::{

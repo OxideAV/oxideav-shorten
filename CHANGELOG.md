@@ -6,6 +6,44 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Round 18 clean-room rebuild.** `BLOCK_FN_ZERO` sentinel encoder
+  (`spec/03` §3.9 + `spec/04` §6 + `spec/05` §2.4) — the constant-
+  block command, extending the round-13..17 predictor-encoder push
+  with the format's cheapest sample-producing command:
+  - `write_zero_block(writer)` — emits a bare `BLOCK_FN_ZERO`
+    command (function code 8) as `uvar(FNSIZE = 2)` over value 8;
+    no further wire fields follow. Total encoded bit count is
+    five bits — the cheapest sample-producing command in the
+    format, packing four ZERO commands tightly into 20 bits.
+  - The decoder side (`fill_zero_block` + the round-7 driver's
+    `FunctionCode::Zero` arm) emits `bs` samples all equal to the
+    channel's current running-mean estimate `μ_chan` per `spec/05`
+    §2.4 — zero when `H_meanblocks = 0`, the running mean of the
+    last `H_meanblocks` per-channel block-means otherwise. The
+    block advances the channel cursor per `spec/03` §3.9.
+  - Caller responsibility: emit ZERO only when the source block
+    consists of exactly `bs` copies of the current `μ_chan` value
+    at the producer end. The writer does not verify this — the
+    `μ_chan` value is the higher-level sequencer's knowledge, not
+    the writer primitive's. (`MeanEstimator::mu_chan` is the
+    matching read accessor on the decoder side.)
+  - `FN_ZERO = 8` constant added to the encoder's public surface,
+    matching the existing `FN_DIFF0..3`, `FN_QUIT`, `FN_QLPC`,
+    `FN_VERBATIM` constants for the other commands.
+  - Tests: 6 new in-crate unit tests covering (a) the `FN_ZERO = 8`
+    function-code numeric value, (b) the 5-bit emitted size and
+    the `0b00100` bit pattern, (c) round-trip through
+    `read_function_code` returning `FunctionCode::Zero`, (d) the
+    mono / stereo / mixed-with-DIFF0 / three-consecutive shapes
+    end-to-end through `decode_stream`. Plus 7 new integration
+    tests in `tests/encoder_zero_pipeline.rs` covering single-
+    block, multi-channel round-robin, many-consecutive-ZERO,
+    ZERO-then-DIFF0 continuity, ZERO with VERBATIM envelope
+    splice, three-channel ZERO + DIFF0 + ZERO interleave, and
+    per-command 5-bit packing density verification.
+
 ### Changed
 
 - **Round 203 in-place scrub.** Removed pre-existing enumerated denials

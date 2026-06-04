@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 17 (2026-06-04).** The crate was
+**Clean-room rebuild — round 18 (2026-06-04).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -586,8 +586,57 @@ Wayne Stielau's seek-table utility:
     `BLOCK_FN_DIFFn` / `BLOCK_FN_QLPC` from a per-block
     statistical objective likewise remains pending.
 
-The combined surface is exercised by **288 tests** (225 in-module
-unit + 63 integration tests across 14 integration binaries). The
+- **Round 18** — the `BLOCK_FN_ZERO` sentinel encoder
+  (`spec/03` §3.9 + `spec/04` §6 + `spec/05` §2.4):
+  * `write_zero_block(writer)` — emits the bare constant-block
+    command as `uvar(FNSIZE = 2)` over `FN_ZERO = 8`. No further
+    wire fields follow the function code; the command is a single
+    5-bit token in the bit stream (prefix `00` + terminator `1` +
+    mantissa `00`). Four ZERO commands pack tightly into 20 bits;
+    five ZERO commands plus a single `BLOCK_FN_QUIT` plus its
+    byte-alignment padding fit inside four bytes total. This is
+    the cheapest sample-producing command in the format.
+  * Decode semantics. The decoder side (`fill_zero_block` + the
+    round-7 driver's `FunctionCode::Zero` arm) emits `bs` samples
+    all equal to the channel's current running-mean estimate
+    `μ_chan` per `spec/05` §2.4 — zero when `H_meanblocks = 0`,
+    the running mean of the last `H_meanblocks` per-channel
+    block-means otherwise. The block advances the channel cursor
+    per `spec/03` §3.9, so a multi-channel stream's per-channel
+    state advances on every ZERO.
+  * Caller responsibility. The writer does not verify that the
+    source block consists of `bs` copies of the current `μ_chan`
+    at the producer end — the `μ_chan` value is the higher-level
+    sequencer's knowledge, not the writer primitive's. An over-
+    eager ZERO would produce wrong samples on decode (`bs`
+    `μ_chan` values where the producer intended something else).
+  * `FN_ZERO = 8` (`spec/03` §3 + `spec/04` §6) — new public
+    encoder constant, matching the existing per-command numeric
+    `FN_DIFF0..3 / FN_QUIT / FN_QLPC / FN_VERBATIM`.
+  * 6 new in-module unit tests + 7 new integration tests
+    (`tests/encoder_zero_pipeline.rs`) confirm: function-code
+    constant matches `spec/04` §6; emitted bit pattern is `0b00100`
+    over 5 bits; round-trip through `read_function_code` returns
+    `FunctionCode::Zero`; mono / stereo / three-channel
+    interleaved-with-DIFF0 round-trips through `decode_stream`;
+    many-consecutive-ZERO mass test (16 back-to-back ZERO blocks
+    decoding to 128 zeros via `bs = 8`); ZERO with VERBATIM
+    envelope splice; ZERO-then-DIFF0 sample-history-carry
+    continuity (the DIFF0 block sees `μ_chan = 0` after a ZERO
+    block on the same channel under `H_meanblocks = 0`); per-
+    command 5-bit packing-density verification using
+    `BitWriter::bits_written()` deltas.
+  * **Scope.** Round 18 lands the constant-block primitive. The
+    remaining unwritten encoder branches are the two housekeeping
+    commands `BLOCK_FN_BITSHIFT` (`spec/03` §3.7) and
+    `BLOCK_FN_BLOCKSIZE` (`spec/03` §3.6) — both per-stream state
+    mutators with no payload beyond a single `uvar` field each —
+    and the higher-layer per-block channel-round sequencer that
+    picks the cheapest of DIFF0..3 / QLPC / ZERO per block under a
+    statistical objective.
+
+The combined surface is exercised by **302 tests** (232 in-module
+unit + 70 integration tests across 16 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
@@ -628,9 +677,14 @@ leaves the second block undecoded until the next pull) (round 10).
   not just prefix bits) is a refinement that doesn't change the wire
   format.
 * **Per-block predictor selection** — the channel-round command
-  sequencer that compares DIFF0..3 / QLPC per block under a
+  sequencer that compares DIFF0..3 / QLPC / ZERO per block under a
   statistical criterion and picks the cheapest predictor for each
   block.
+* **Encoder-side housekeeping commands** — `BLOCK_FN_BITSHIFT`
+  (`spec/03` §3.7 + `spec/04` §3) and `BLOCK_FN_BLOCKSIZE` (`spec/03`
+  §3.6 + `spec/04` §4). Both are per-stream state mutators with a
+  single `uvar` payload field; the decoder side already lands them
+  (round 6 — `read_bitshift_payload` / `read_blocksize_payload`).
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking
