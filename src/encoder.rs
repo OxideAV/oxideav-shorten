@@ -154,7 +154,9 @@
 //!   byte-alignment with zero padding).
 
 use crate::bitwriter::{natural_ulong_width, BitWriter};
-use crate::block::{FNSIZE, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE, VERBATIM_MAX_LEN};
+use crate::block::{
+    BITSHIFTSIZE, BITSHIFT_MAX, FNSIZE, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE, VERBATIM_MAX_LEN,
+};
 use crate::header::{ShortenStreamHeader, MAGIC};
 use crate::predictor::{ChannelCarry, ENERGYSIZE, LPCQSIZE, LPCQUANT};
 
@@ -195,6 +197,12 @@ pub const FN_DIFF3: u32 = 3;
 /// `ŝ_QLPC(t) = Σᵢ₌₁..order aᵢ · s(t − i)` (TR.156 §3.2 first
 /// equation), residual `e_QLPC(t) = s(t) − ŝ_QLPC(t)`.
 pub const FN_QLPC: u32 = 7;
+
+/// `BLOCK_FN_BITSHIFT` function-code numeric value (`spec/03` §3.7 /
+/// `spec/04` §3). Re-exported as a public constant so callers building
+/// per-command byte streams against the encoder's primitives can
+/// produce the same wire-format token the decoder reads.
+pub const FN_BITSHIFT: u32 = 6;
 
 /// `BLOCK_FN_ZERO` function-code numeric value (`spec/03` §3.9 /
 /// `spec/04` §6). The constant-block sentinel — a channel-cursor-
@@ -291,6 +299,12 @@ pub enum EncodeError {
     /// strict-natural-width mode.
     #[doc(hidden)]
     CoefficientOutOfRange(i64),
+    /// The caller's `bshift` parameter to [`write_bitshift_command`]
+    /// exceeded the implementation safety cap [`BITSHIFT_MAX`]. The
+    /// reader-side dual is [`crate::Error::BitshiftTooLarge`];
+    /// mirroring the cap on the encoder side prevents producing a
+    /// stream the decoder will immediately reject.
+    BitshiftOutOfRange(u32),
 }
 
 impl core::fmt::Display for EncodeError {
@@ -328,6 +342,10 @@ impl core::fmt::Display for EncodeError {
             EncodeError::CoefficientOutOfRange(c) => write!(
                 f,
                 "oxideav-shorten: QLPC coefficient {c} exceeds the natural svar(LPCQUANT) width"
+            ),
+            EncodeError::BitshiftOutOfRange(b) => write!(
+                f,
+                "oxideav-shorten: BITSHIFT bshift {b} exceeds the implementation safety cap"
             ),
         }
     }
@@ -1310,6 +1328,68 @@ pub fn write_qlpc_block(
 /// terminator `1`, mantissa `00` → 5 bits total.)
 pub fn write_zero_block(writer: &mut BitWriter) {
     writer.write_uvar(FN_ZERO, FNSIZE);
+}
+
+/// Emit a `BLOCK_FN_BITSHIFT` command (function-code numeric `6`) to
+/// `writer` per `spec/03` §3.7 + `spec/04` §3.
+///
+/// Wire layout:
+///
+/// * `uvar(FNSIZE = 2)` over the value `FN_BITSHIFT = 6`.
+/// * `uvar(BITSHIFTSIZE = 2)` over the `bshift` left-shift amount.
+///
+/// The decoder applies `sample << bshift` to every subsequent decoded
+/// sample emitted to the output stream (`spec/03` §3.7 + `spec/05`
+/// §1.4); the reconstruction recurrences and the channel-cursor /
+/// running-mean machinery remain in the pre-shift sample domain. A
+/// `bshift = 0` command is the explicit "no scaling" form and is a
+/// valid no-op the decoder accepts (the running `bshift` state is
+/// simply re-asserted as zero).
+///
+/// `spec/04` §3 pins the function-code numeric value to `6` by
+/// behavioural anchor against fixtures `F5..F8`, whose first
+/// `fn = 6` command's `bshift` parameter matches each fixture's
+/// filename-tagged `-q N` encoder invocation (1, 4, 8, 12) byte-exact
+/// (test `T10`). Cross-fixture corroboration on `F2` (an 8-bit
+/// unsigned AIFC stream) pins `bshift = 7` against FFmpeg's decoded
+/// PCM at the half-range step `128 = 1 << 7` (test `T11`).
+///
+/// Caller responsibilities:
+///
+/// * `bshift` must be `<= BITSHIFT_MAX` (the encoder-side dual of the
+///   decoder's [`crate::Error::BitshiftTooLarge`] cap). Larger values
+///   are admitted by the wire format in principle via the `uvar(2)`
+///   prefix-zeros mechanism, but the cap exists so the encoder cannot
+///   produce a stream the decoder will immediately reject. An
+///   over-cap `bshift` surfaces [`EncodeError::BitshiftOutOfRange`].
+/// * Higher-level encoders that want to emit lossy `-q N`-equivalent
+///   streams must arrange the residual production so that the
+///   intended PCM output corresponds to the pre-shift residuals
+///   left-shifted by `bshift` — the writer primitive does not touch
+///   the residual stream. (`spec/04` §3 + §3.1 pin the dual: the
+///   reference encoder's `-q N` invocation produces a `BLOCK_FN_BITSHIFT`
+///   command whose `bshift` parameter equals `N`, with the
+///   quantisation-by-truncation applied to the residual stream before
+///   `BLOCK_FN_DIFFn` encoding.)
+///
+/// Total encoded bit count is `4 + uvar(2)_bits(bshift)`. The function-
+/// code prefix `uvar(FNSIZE = 2)` over value 6 is the 4-bit pattern
+/// `0110` (one leading zero + terminator + 2-bit mantissa `10`, per
+/// `spec/02` §2.1's `⌊6/4⌋ = 1, (1 << 2) | 2 = 6` decomposition).
+/// The payload `uvar(BITSHIFTSIZE = 2)` over `bshift` adds
+/// `⌊bshift / 4⌋ + 1 + 2` bits. For the four anchor-fixture `bshift`
+/// values 1 / 4 / 8 / 12 (the `F5..F8` `-q N` invocations pinned by
+/// `spec/04` §3.1 test T10) the payload contributes 3 / 4 / 5 / 6
+/// bits, so the totals are 7 / 8 / 9 / 10 bits respectively, matching
+/// the `spec/02` §2.1 worked-examples length formula
+/// `⌊v / 2^n⌋ + 1 + n`.
+pub fn write_bitshift_command(writer: &mut BitWriter, bshift: u32) -> EncodeResult<()> {
+    if bshift > BITSHIFT_MAX {
+        return Err(EncodeError::BitshiftOutOfRange(bshift));
+    }
+    writer.write_uvar(FN_BITSHIFT, FNSIZE);
+    writer.write_uvar(bshift, BITSHIFTSIZE);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2767,5 +2847,74 @@ mod tests {
 
         let dec = decode_stream(&out).expect("decode");
         assert_eq!(dec.channels[0], vec![0i32; 12]);
+    }
+
+    // -------------------------------------------------------------
+    // Round 238 — BLOCK_FN_BITSHIFT housekeeping encoder
+    // (spec/03 §3.7 + spec/04 §3 + spec/05 §1.4).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn fn_bitshift_constant_matches_spec() {
+        // spec/04 §3 function-code table: BLOCK_FN_BITSHIFT = 6.
+        assert_eq!(FN_BITSHIFT, 6);
+    }
+
+    #[test]
+    fn write_bitshift_command_bit_lengths_match_spec_02_formula() {
+        // spec/02 §2.1 length formula for uvar(n):
+        //   ⌊v / 2^n⌋ + 1 + n bits.
+        // The function-code prefix uvar(FNSIZE=2) over value 6 is the
+        // 4-bit pattern `0110` (⌊6/4⌋=1 leading zero + terminator +
+        // 2-bit mantissa "10"). The payload uvar(BITSHIFTSIZE=2) over
+        // bshift contributes ⌊bshift/4⌋ + 1 + 2 bits on top.
+        // Anchor-fixture bshift values from spec/04 §3.1 (T10):
+        //   1 → payload 3 bits → total 7 bits
+        //   4 → payload 4 bits → total 8 bits
+        //   8 → payload 5 bits → total 9 bits
+        //  12 → payload 6 bits → total 10 bits
+        for &(bshift, expected_total) in &[(1u32, 7u64), (4, 8), (8, 9), (12, 10)] {
+            let mut w = BitWriter::new();
+            write_bitshift_command(&mut w, bshift).expect("write");
+            assert_eq!(
+                w.bits_written(),
+                expected_total,
+                "bshift={bshift} total bits"
+            );
+        }
+    }
+
+    #[test]
+    fn write_bitshift_command_roundtrips_through_decoder_primitives() {
+        use crate::bitreader::BitReader;
+        use crate::block::{read_bitshift_payload, read_function_code, FunctionCode};
+
+        // Cover the anchor-fixture bshift values plus the boundary
+        // cases (0 = explicit no-op, BITSHIFT_MAX = cap-edge accept).
+        for &bshift in &[0u32, 1, 4, 7, 8, 12, BITSHIFT_MAX] {
+            let mut w = BitWriter::new();
+            write_bitshift_command(&mut w, bshift).expect("write");
+            w.pad_to_byte();
+            let bytes = w.into_bytes();
+
+            let mut r = BitReader::new(&bytes);
+            let fc = read_function_code(&mut r).expect("read fn");
+            assert_eq!(fc, FunctionCode::Bitshift, "bshift={bshift}");
+            let got = read_bitshift_payload(&mut r).expect("read payload");
+            assert_eq!(got, bshift, "bshift={bshift} roundtrip");
+        }
+    }
+
+    #[test]
+    fn write_bitshift_command_rejects_over_cap_bshift() {
+        // BITSHIFT_MAX + 1 must surface BitshiftOutOfRange and emit
+        // nothing on the writer (no partial command bytes).
+        let mut w = BitWriter::new();
+        let over_cap = BITSHIFT_MAX + 1;
+        assert_eq!(
+            write_bitshift_command(&mut w, over_cap),
+            Err(EncodeError::BitshiftOutOfRange(over_cap))
+        );
+        assert_eq!(w.bits_written(), 0);
     }
 }

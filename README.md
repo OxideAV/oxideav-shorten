@@ -635,7 +635,49 @@ Wayne Stielau's seek-table utility:
     picks the cheapest of DIFF0..3 / QLPC / ZERO per block under a
     statistical objective.
 
-The combined surface is exercised by **302 tests** (232 in-module
+- **Round 238** — the `BLOCK_FN_BITSHIFT` housekeeping encoder
+  (`spec/03` §3.7 + `spec/04` §3 + `spec/05` §1.4):
+  * `write_bitshift_command(writer, bshift)` — emits a complete
+    `BLOCK_FN_BITSHIFT` command as `uvar(FNSIZE = 2)` over
+    `FN_BITSHIFT = 6` followed by `uvar(BITSHIFTSIZE = 2)` over the
+    `bshift` payload. The encoder caps `bshift` at `BITSHIFT_MAX
+    = 31` (the decoder side's `Error::BitshiftTooLarge` dual);
+    over-cap values surface a new
+    `EncodeError::BitshiftOutOfRange(b)` without emitting any
+    partial bytes onto the writer.
+  * Bit-budget. Per `spec/02` §2.1 the function-code prefix is a
+    4-bit pattern (`uvar(FNSIZE = 2)` over value 6 is `0110`); the
+    payload `uvar(BITSHIFTSIZE = 2)` over `bshift` adds
+    `⌊bshift / 4⌋ + 1 + 2` bits. The four anchor-fixture `bshift`
+    values 1 / 4 / 8 / 12 (the `F5..F8` `-q N` invocations pinned by
+    `spec/04` §3.1 test T10) pack to 7 / 8 / 9 / 10 bits total
+    respectively; the `bshift = 0` no-op form is 7 bits.
+  * Decode semantics. The decoder applies `sample << bshift` to
+    every subsequent decoded sample emitted to the output stream
+    (`spec/03` §3.7 + `spec/05` §1.4); the reconstruction
+    recurrences and the channel-cursor / running-mean machinery
+    remain in the pre-shift sample domain.
+  * `FN_BITSHIFT = 6` (`spec/03` §3 + `spec/04` §3) — new public
+    encoder constant, matching the existing per-command numeric
+    `FN_DIFF0..3 / FN_QUIT / FN_QLPC / FN_VERBATIM / FN_ZERO`.
+  * 4 new in-module unit tests confirm: function-code constant
+    matches `spec/04` §3; emitted bit counts match the `spec/02`
+    §2.1 length formula for the four anchor-fixture `bshift`
+    values; round-trip through `read_function_code` +
+    `read_bitshift_payload` recovers the original `bshift` for
+    `{0, 1, 4, 7, 8, 12, BITSHIFT_MAX}` (the explicit no-op edge,
+    the four `F5..F8` anchor values, the `F2` 8-bit cross-fixture
+    corroborator `bshift = 7`, and the cap-edge); `BITSHIFT_MAX
+    + 1` over-cap rejection produces `EncodeError::BitshiftOutOfRange`
+    without partial writer state.
+  * **Scope.** Round 238 lands the `BLOCK_FN_BITSHIFT` writer
+    primitive only. The remaining unwritten encoder branch is the
+    `BLOCK_FN_BLOCKSIZE` housekeeping writer (`spec/03` §3.6 +
+    `spec/04` §4) — a per-stream block-size override carrying a
+    single `ulong()` payload — plus the higher-layer per-block
+    channel-round sequencer.
+
+The combined surface is exercised by **306 tests** (236 in-module
 unit + 70 integration tests across 16 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
@@ -680,11 +722,11 @@ leaves the second block undecoded until the next pull) (round 10).
   sequencer that compares DIFF0..3 / QLPC / ZERO per block under a
   statistical criterion and picks the cheapest predictor for each
   block.
-* **Encoder-side housekeeping commands** — `BLOCK_FN_BITSHIFT`
-  (`spec/03` §3.7 + `spec/04` §3) and `BLOCK_FN_BLOCKSIZE` (`spec/03`
-  §3.6 + `spec/04` §4). Both are per-stream state mutators with a
-  single `uvar` payload field; the decoder side already lands them
-  (round 6 — `read_bitshift_payload` / `read_blocksize_payload`).
+* **Encoder-side `BLOCK_FN_BLOCKSIZE` writer** (`spec/03` §3.6 +
+  `spec/04` §4). The per-stream block-size override carrying a single
+  `ulong()` payload; the decoder side already lands it (round 6 —
+  `read_blocksize_payload`). The companion `BLOCK_FN_BITSHIFT` writer
+  landed in round 238 (`write_bitshift_command`).
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking

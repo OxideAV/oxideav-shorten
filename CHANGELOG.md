@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 238 clean-room rebuild.** `BLOCK_FN_BITSHIFT` housekeeping
+  encoder (`spec/03` §3.7 + `spec/04` §3 + `spec/05` §1.4) — the
+  per-stream left-shift command that applies `sample << bshift` to
+  every subsequent decoded sample:
+  - `write_bitshift_command(writer, bshift)` — emits a complete
+    `BLOCK_FN_BITSHIFT` command as `uvar(FNSIZE = 2)` over value 6
+    followed by `uvar(BITSHIFTSIZE = 2)` over the `bshift` payload.
+    The encoder caps `bshift` at `BITSHIFT_MAX = 31` (the decoder
+    side's `Error::BitshiftTooLarge` dual); over-cap values surface
+    a new `EncodeError::BitshiftOutOfRange(b)` variant without
+    emitting any partial bytes onto the writer.
+  - `FN_BITSHIFT = 6` constant added to the encoder's public surface,
+    matching the existing `FN_DIFF0..3`, `FN_QUIT`, `FN_QLPC`,
+    `FN_VERBATIM`, `FN_ZERO` constants for the other commands.
+  - Tests: 4 new in-crate unit tests covering (a) the
+    `FN_BITSHIFT = 6` function-code numeric value, (b) the exact
+    bit-length budget for the four anchor-fixture `bshift` values
+    1 / 4 / 8 / 12 (totals 7 / 8 / 9 / 10 bits per `spec/02` §2.1
+    length formula), (c) round-trip through `read_function_code` +
+    `read_bitshift_payload` for `bshift ∈ {0, 1, 4, 7, 8, 12,
+    BITSHIFT_MAX}` (covering the explicit no-op edge, the four
+    anchor-fixture values, the `F2` cross-fixture corroborator
+    `bshift = 7`, and the cap-edge), (d) `BITSHIFT_MAX + 1`
+    over-cap rejection without partial writer state.
+
 - **Round 18 clean-room rebuild.** `BLOCK_FN_ZERO` sentinel encoder
   (`spec/03` §3.9 + `spec/04` §6 + `spec/05` §2.4) — the constant-
   block command, extending the round-13..17 predictor-encoder push
