@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 18 (2026-06-04).** The crate was
+**Clean-room rebuild — round 241 (2026-06-06).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -677,8 +677,47 @@ Wayne Stielau's seek-table utility:
     single `ulong()` payload — plus the higher-layer per-block
     channel-round sequencer.
 
-The combined surface is exercised by **306 tests** (236 in-module
-unit + 70 integration tests across 16 integration binaries). The
+- **Round 241** — typed `H_filetype` accessor surfacing the three
+  numeric codes `spec/05` §6 pins behaviourally:
+  * New `Filetype` enum with variants `U8` (wire value 2 / TR.156
+    label `u8` / fixture `F2`), `S16HL` (wire value 3 / `s16hl` /
+    fixture `F3`), and `S16LH` (wire value 5 / `s16lh` / fixture
+    `F1`). Marked `#[non_exhaustive]` so the remaining eight TR.156
+    labels (`ulaw`, `s8`, `s16`, `u16`, `s16x`, `u16x`, `u16hl`,
+    `u16lh`) can be added later — `spec/05` §8 candidate #3 — without
+    breaking callers.
+  * `ShortenStreamHeader::filetype_pinned() -> Option<Filetype>` —
+    instance method returning `Some(variant)` when the raw
+    `H_filetype: u32` field falls in the `{2, 3, 5}` pinned-by-fixture
+    set and `None` for every other numeric value. The accessor never
+    guesses a label for an unpinned code; the raw `filetype: u32`
+    field stays the source of truth.
+  * Per-variant accessors: `wire_value`, `label` (TR.156 textual
+    name `u8` / `s16hl` / `s16lh`), `bytes_per_sample` (1 / 2 / 2),
+    `is_signed` (false / true / true), and `is_little_endian`
+    (`None` for `U8`, `Some(false)` for `S16HL`, `Some(true)` for
+    `S16LH`). Plus the round-trip `Filetype::from_wire(u32) ->
+    Option<Self>` constructor.
+  * No wire-format change. The accessor is a typed window on top of
+    the existing raw `filetype: u32` field; the bit-level header
+    parse, the trait-side PCM-plane packing path, and the registered
+    `FILETYPE_U8 / FILETYPE_S16HL / FILETYPE_S16LH` constants are
+    unchanged.
+  * 8 new in-module unit tests in `header.rs` (real fixture-`F1`
+    byte sequence pinning the typed accessor to `Filetype::S16LH`;
+    the three pinned-code positive paths; the unpinned-code
+    negative path sweep `[0, 1, 4, 6, 7, 8, 9, 10, 11, 12, 255]`;
+    `from_wire ↔ wire_value` round-trip on each pinned variant;
+    TR.156 label match; per-variant `bytes_per_sample` width;
+    per-variant `is_signed`; per-variant `is_little_endian`) plus
+    6 integration tests in `tests/filetype_pinned_accessor.rs` that
+    re-exercise the same contract through `parse_stream_header()`
+    against (a) the real fixture-`F1` 11-byte prefix and (b)
+    synthetic v2 headers stamped with each pinned numeric code plus
+    five unpinned ones.
+
+The combined surface is exercised by **320 tests** (244 in-module
+unit + 76 integration tests across 17 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of

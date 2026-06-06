@@ -287,7 +287,7 @@ pub use crate::encoder::{
 };
 pub use crate::error::{Error, Result};
 pub use crate::header::{
-    parse_stream_header, ParsedHeader, ShortenStreamHeader, MAGIC, MIN_HEADER_BYTES,
+    parse_stream_header, Filetype, ParsedHeader, ShortenStreamHeader, MAGIC, MIN_HEADER_BYTES,
 };
 pub use crate::predictor::{
     decode_diff_block, decode_qlpc_block, fill_zero_block, ChannelCarry, MeanEstimator, PolyOrder,

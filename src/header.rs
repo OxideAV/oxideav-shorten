@@ -101,6 +101,123 @@ impl ShortenStreamHeader {
     pub fn sample_history_carry_len(&self) -> u32 {
         core::cmp::max(3, self.maxlpcorder)
     }
+
+    /// Resolve the raw `H_filetype` numeric value to the named
+    /// [`Filetype`] variant when `spec/05` §6 pins the code.
+    ///
+    /// Returns `Some(Filetype::U8)` for `2`, `Some(Filetype::S16HL)`
+    /// for `3`, `Some(Filetype::S16LH)` for `5` (the three codes
+    /// behaviourally anchored by fixtures `F2`, `F3`, `F1`
+    /// respectively per `spec/05` §6). All other numeric values
+    /// return `None`: the remaining eight TR.156 labels (`ulaw`,
+    /// `s8`, `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`) are
+    /// unpinned by the current fixture corpus (`spec/05` §8 open
+    /// §9.4 candidate #3) and the caller cannot infer the byte
+    /// packing for them safely.
+    pub fn filetype_pinned(&self) -> Option<Filetype> {
+        Filetype::from_wire(self.filetype)
+    }
+}
+
+/// Named sample-format codes carried by `H_filetype` whose numeric
+/// values are pinned in `docs/audio/shorten/spec/05-state-and-quirks.md`
+/// §6 by behavioural verification against the public fixture corpus.
+///
+/// The three variants correspond to the three numeric codes that
+/// fixtures `F1`, `F2`, `F3` force into the stream:
+///
+/// | Variant   | Wire value | TR.156 label | Pinning fixture |
+/// | --------- | ---------- | ------------ | --------------- |
+/// | [`Self::U8`]    | `2` | `u8`    | `F2` (AIFC u8 source). |
+/// | [`Self::S16HL`] | `3` | `s16hl` | `F3` (AIFC s16 big-endian source). |
+/// | [`Self::S16LH`] | `5` | `s16lh` | `F1` (WAV s16 little-endian source). |
+///
+/// `spec/05` §6 explicitly leaves the remaining eight TR.156 labels
+/// (`ulaw`, `s8`, `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`) with
+/// unpinned numeric codes; this enum is therefore `#[non_exhaustive]`
+/// so a later round can add their variants without breaking callers
+/// once the additional fixtures or reference-encoder observations
+/// pin them (`spec/05` §8 open §9.4 candidate #3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Filetype {
+    /// `H_filetype = 2`: 8-bit unsigned PCM (`u8`), one byte per
+    /// sample, byte order is not meaningful. Pinned by fixture
+    /// `F2` per `spec/05` §6.
+    U8,
+    /// `H_filetype = 3`: 16-bit signed PCM, high-byte-first (`s16hl`).
+    /// Two bytes per sample emitted big-endian on the host plane.
+    /// Pinned by fixture `F3` per `spec/05` §6.
+    S16HL,
+    /// `H_filetype = 5`: 16-bit signed PCM, low-byte-first (`s16lh`).
+    /// Two bytes per sample emitted little-endian on the host plane.
+    /// Pinned by fixture `F1` per `spec/05` §6.
+    S16LH,
+}
+
+impl Filetype {
+    /// Map a wire-level `H_filetype` numeric value to its named
+    /// variant when `spec/05` §6 pins the code, otherwise `None`.
+    pub fn from_wire(code: u32) -> Option<Self> {
+        match code {
+            2 => Some(Filetype::U8),
+            3 => Some(Filetype::S16HL),
+            5 => Some(Filetype::S16LH),
+            _ => None,
+        }
+    }
+
+    /// Wire-level `H_filetype` numeric value of this variant.
+    pub fn wire_value(self) -> u32 {
+        match self {
+            Filetype::U8 => 2,
+            Filetype::S16HL => 3,
+            Filetype::S16LH => 5,
+        }
+    }
+
+    /// TR.156 textual label (the encoder's `-t <label>` argument name).
+    pub fn label(self) -> &'static str {
+        match self {
+            Filetype::U8 => "u8",
+            Filetype::S16HL => "s16hl",
+            Filetype::S16LH => "s16lh",
+        }
+    }
+
+    /// Number of host bytes one decoded sample occupies on a packed
+    /// PCM plane: 1 for `u8`, 2 for `s16hl` / `s16lh`.
+    pub fn bytes_per_sample(self) -> usize {
+        match self {
+            Filetype::U8 => 1,
+            Filetype::S16HL | Filetype::S16LH => 2,
+        }
+    }
+
+    /// Whether the sample format is signed. `u8` is unsigned;
+    /// `s16hl` / `s16lh` are signed.
+    pub fn is_signed(self) -> bool {
+        match self {
+            Filetype::U8 => false,
+            Filetype::S16HL | Filetype::S16LH => true,
+        }
+    }
+
+    /// Host byte order the samples are packed in when emitted.
+    ///
+    /// * `Some(false)` for [`Self::S16HL`] (high-byte-first =
+    ///   big-endian).
+    /// * `Some(true)` for [`Self::S16LH`] (low-byte-first =
+    ///   little-endian).
+    /// * `None` for [`Self::U8`]: a single-byte sample has no
+    ///   byte-order distinction.
+    pub fn is_little_endian(self) -> Option<bool> {
+        match self {
+            Filetype::U8 => None,
+            Filetype::S16HL => Some(false),
+            Filetype::S16LH => Some(true),
+        }
+    }
 }
 
 /// Outcome of [`parse_stream_header`]: the parsed header plus the
@@ -357,6 +474,106 @@ mod tests {
         // parser should exhaust mid-`H_blocksize`.
         let buf = [0x61, 0x6A, 0x6B, 0x67, 0x02, 0xFB];
         assert_eq!(parse_stream_header(&buf), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn filetype_pinned_resolves_three_anchored_codes() {
+        // spec/05 §6 pins H_filetype = 2/u8 (F2), 3/s16hl (F3), 5/s16lh (F1).
+        let mut h = ShortenStreamHeader {
+            version: 2,
+            filetype: 2,
+            channels: 1,
+            blocksize: 256,
+            maxlpcorder: 0,
+            meanblocks: 4,
+            skipbytes: 0,
+        };
+        assert_eq!(h.filetype_pinned(), Some(Filetype::U8));
+        h.filetype = 3;
+        assert_eq!(h.filetype_pinned(), Some(Filetype::S16HL));
+        h.filetype = 5;
+        assert_eq!(h.filetype_pinned(), Some(Filetype::S16LH));
+    }
+
+    #[test]
+    fn filetype_pinned_returns_none_for_unpinned_labels() {
+        // spec/05 §6 + §8 candidate #3: eight TR.156 labels (`ulaw`,
+        // `s8`, `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`) have
+        // no pinned numeric code in the spec set. The accessor returns
+        // None for any value outside { 2, 3, 5 }.
+        let mut h = ShortenStreamHeader {
+            version: 2,
+            filetype: 0,
+            channels: 1,
+            blocksize: 256,
+            maxlpcorder: 0,
+            meanblocks: 4,
+            skipbytes: 0,
+        };
+        for unpinned in [0u32, 1, 4, 6, 7, 8, 9, 10, 11, 12, 255] {
+            h.filetype = unpinned;
+            assert_eq!(
+                h.filetype_pinned(),
+                None,
+                "wire value {unpinned} is unpinned by spec/05 §6 + §8"
+            );
+        }
+    }
+
+    #[test]
+    fn filetype_wire_value_round_trips() {
+        for ft in [Filetype::U8, Filetype::S16HL, Filetype::S16LH] {
+            assert_eq!(Filetype::from_wire(ft.wire_value()), Some(ft));
+        }
+    }
+
+    #[test]
+    fn filetype_label_matches_tr156_naming() {
+        assert_eq!(Filetype::U8.label(), "u8");
+        assert_eq!(Filetype::S16HL.label(), "s16hl");
+        assert_eq!(Filetype::S16LH.label(), "s16lh");
+    }
+
+    #[test]
+    fn filetype_bytes_per_sample_matches_pinned_widths() {
+        // spec/05 §6 row: u8 → 1 byte, s16hl / s16lh → 2 bytes.
+        assert_eq!(Filetype::U8.bytes_per_sample(), 1);
+        assert_eq!(Filetype::S16HL.bytes_per_sample(), 2);
+        assert_eq!(Filetype::S16LH.bytes_per_sample(), 2);
+    }
+
+    #[test]
+    fn filetype_is_signed_matches_tr156_label_prefix() {
+        // `u` prefix → unsigned, `s` prefix → signed per TR.156's
+        // file-type naming (spec/05 §6 narrative).
+        assert!(!Filetype::U8.is_signed());
+        assert!(Filetype::S16HL.is_signed());
+        assert!(Filetype::S16LH.is_signed());
+    }
+
+    #[test]
+    fn filetype_byte_order_matches_label_suffix() {
+        // `hl` = high-byte-first = big-endian; `lh` = low-byte-first =
+        // little-endian; single-byte u8 carries no byte-order
+        // distinction so the accessor returns None per the doc rule.
+        assert_eq!(Filetype::U8.is_little_endian(), None);
+        assert_eq!(Filetype::S16HL.is_little_endian(), Some(false));
+        assert_eq!(Filetype::S16LH.is_little_endian(), Some(true));
+    }
+
+    #[test]
+    fn filetype_pinned_on_real_f1_byte_sequence() {
+        // F1's header decodes to H_filetype = 5 (`s16lh`) per
+        // spec/02 §6.1; the typed accessor must agree.
+        let buf = [
+            0x61, 0x6A, 0x6B, 0x67, 0x02, 0xFB, 0xB1, 0x70, 0x09, 0xF9, 0x25,
+        ];
+        let parsed = parse_stream_header(&buf).expect("F1 header must parse");
+        assert_eq!(parsed.header.filetype_pinned(), Some(Filetype::S16LH));
+        let ft = parsed.header.filetype_pinned().unwrap();
+        assert_eq!(ft.bytes_per_sample(), 2);
+        assert!(ft.is_signed());
+        assert_eq!(ft.is_little_endian(), Some(true));
     }
 
     #[test]

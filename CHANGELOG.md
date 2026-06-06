@@ -8,6 +8,43 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 241 clean-room rebuild.** Typed `H_filetype` accessor
+  surfacing the three numeric codes `spec/05` §6 pins behaviourally:
+  - New public `Filetype` enum with variants `U8` (wire value 2 /
+    TR.156 label `u8` / fixture `F2`), `S16HL` (wire value 3 /
+    `s16hl` / fixture `F3`), and `S16LH` (wire value 5 / `s16lh` /
+    fixture `F1`). The enum is `#[non_exhaustive]` so a later round
+    can add the remaining eight TR.156 labels (`ulaw`, `s8`, `s16`,
+    `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`) once `spec/05` §8 open
+    §9.4 candidate #3 is closed — without breaking callers.
+  - New `ShortenStreamHeader::filetype_pinned() -> Option<Filetype>`
+    instance method that returns `Some(variant)` when the raw
+    `H_filetype` field falls in the `{2, 3, 5}` pinned-by-fixture
+    set and `None` for every other numeric value (no guessing for
+    unpinned labels). Round-trip helpers `Filetype::from_wire(u32)`
+    + `Filetype::wire_value()` plus typed `label()`,
+    `bytes_per_sample()`, `is_signed()`, and `is_little_endian()`
+    accessors mirror the `spec/05` §6 table row-by-row (`u8` → 1
+    byte / unsigned / byte-order-irrelevant; `s16hl` → 2 bytes /
+    signed / big-endian; `s16lh` → 2 bytes / signed /
+    little-endian).
+  - Tests: 8 new in-crate unit tests in `header.rs` covering the
+    real fixture-`F1` byte sequence, the three pinned-code positive
+    paths, the unpinned-code negative path (eleven sampled
+    `H_filetype` numeric values outside `{2, 3, 5}`), the
+    `from_wire ↔ wire_value` round-trip on each pinned variant, the
+    TR.156 label match, the per-variant `bytes_per_sample` width,
+    the `is_signed` sign convention, and the byte-order accessor's
+    `None`-for-u8 convention. Plus 6 integration tests in
+    `tests/filetype_pinned_accessor.rs` re-exercising the same
+    contract through `parse_stream_header()` against (a) the real
+    fixture-`F1` 11-byte prefix and (b) synthetic v2 headers
+    stamped with each pinned numeric code plus a sweep of unpinned
+    ones.
+  - No wire-format change. The accessor is a typed window on top of
+    the existing raw `filetype: u32` field, which remains the
+    source of truth and is unchanged.
+
 - **Round 238 clean-room rebuild.** `BLOCK_FN_BITSHIFT` housekeeping
   encoder (`spec/03` §3.7 + `spec/04` §3 + `spec/05` §1.4) — the
   per-stream left-shift command that applies `sample << bshift` to
