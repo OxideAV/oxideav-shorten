@@ -155,7 +155,8 @@
 
 use crate::bitwriter::{natural_ulong_width, BitWriter};
 use crate::block::{
-    BITSHIFTSIZE, BITSHIFT_MAX, FNSIZE, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE, VERBATIM_MAX_LEN,
+    BITSHIFTSIZE, BITSHIFT_MAX, BLOCKSIZE_MAX, FNSIZE, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE,
+    VERBATIM_MAX_LEN,
 };
 use crate::header::{ShortenStreamHeader, MAGIC};
 use crate::predictor::{ChannelCarry, ENERGYSIZE, LPCQSIZE, LPCQUANT};
@@ -203,6 +204,15 @@ pub const FN_QLPC: u32 = 7;
 /// per-command byte streams against the encoder's primitives can
 /// produce the same wire-format token the decoder reads.
 pub const FN_BITSHIFT: u32 = 6;
+
+/// `BLOCK_FN_BLOCKSIZE` function-code numeric value (`spec/03` §3.6 /
+/// `spec/04` §4). Per-block sub-block-size override; the reference
+/// encoder emits this at the tail of a stream when the trailing input
+/// samples form a partial block of fewer than `H_blocksize` samples.
+/// Fixture `F2` carries a single `BLOCK_FN_BLOCKSIZE` command at
+/// command index 11,377 with `new_bs = 155` per the `spec/04` §4 T12
+/// behavioural anchor.
+pub const FN_BLOCKSIZE: u32 = 5;
 
 /// `BLOCK_FN_ZERO` function-code numeric value (`spec/03` §3.9 /
 /// `spec/04` §6). The constant-block sentinel — a channel-cursor-
@@ -305,6 +315,21 @@ pub enum EncodeError {
     /// mirroring the cap on the encoder side prevents producing a
     /// stream the decoder will immediately reject.
     BitshiftOutOfRange(u32),
+    /// The caller's `new_bs` parameter to [`write_blocksize_command`]
+    /// was zero. The decoder rejects a zero-sample BLOCKSIZE override
+    /// via [`crate::Error::ZeroBlockSize`] (the residual loop would be
+    /// empty, defeating the override's purpose), and `spec/03` §3.6
+    /// pins that the reference encoder never emits this form. Mirror
+    /// the rejection on the encoder side so callers cannot construct a
+    /// stream the decoder will immediately reject.
+    ZeroBlocksize,
+    /// The caller's `new_bs` parameter to [`write_blocksize_command`]
+    /// exceeded the implementation safety cap [`BLOCKSIZE_MAX`]. The
+    /// reader-side dual is [`crate::Error::BlockTooLarge`]; the cap is
+    /// a defensive bound preventing a malformed sub-block-size from
+    /// driving multi-gigabyte allocations downstream when the override
+    /// is consumed by the next predictor command.
+    BlocksizeOutOfRange(u32),
 }
 
 impl core::fmt::Display for EncodeError {
@@ -346,6 +371,13 @@ impl core::fmt::Display for EncodeError {
             EncodeError::BitshiftOutOfRange(b) => write!(
                 f,
                 "oxideav-shorten: BITSHIFT bshift {b} exceeds the implementation safety cap"
+            ),
+            EncodeError::ZeroBlocksize => f.write_str(
+                "oxideav-shorten: BLOCKSIZE new_bs is zero (spec/03 §3.6 forbids a zero-sample override)",
+            ),
+            EncodeError::BlocksizeOutOfRange(n) => write!(
+                f,
+                "oxideav-shorten: BLOCKSIZE new_bs {n} exceeds the implementation safety cap"
             ),
         }
     }
@@ -1389,6 +1421,68 @@ pub fn write_bitshift_command(writer: &mut BitWriter, bshift: u32) -> EncodeResu
     }
     writer.write_uvar(FN_BITSHIFT, FNSIZE);
     writer.write_uvar(bshift, BITSHIFTSIZE);
+    Ok(())
+}
+
+/// Emit a `BLOCK_FN_BLOCKSIZE` command (function-code numeric `5`) to
+/// `writer` per `spec/03` §3.6 + `spec/04` §4.
+///
+/// Wire layout:
+///
+/// * `uvar(FNSIZE = 2)` over the value `FN_BLOCKSIZE = 5`.
+/// * `ulong()` over the new sub-block-size `new_bs`. The encoder picks
+///   the smallest natural mantissa width for `new_bs` via
+///   [`natural_ulong_width`] (the same minimum-width rule
+///   [`write_parameter_block`] applies to the six header fields).
+///
+/// The decoder installs the returned value as its running sub-block
+/// size; subsequent predictor commands (`DIFF0..3` / `QLPC` / `ZERO`)
+/// produce blocks of `new_bs` samples per channel until the next
+/// `BLOCK_FN_BLOCKSIZE` command or the end of the stream
+/// (`spec/03` §3.6). The command does **not** advance the channel
+/// cursor; the per-channel dispatch resumes on the same channel after
+/// the override takes effect.
+///
+/// `spec/04` §4 pins the function-code numeric value to `5` by
+/// behavioural anchor against fixture `F2`: a single `fn = 5` command
+/// at command index 11,377 carrying `ulong()`-encoded `new_bs = 155`
+/// followed by the `BLOCK_FN_QUIT` sentinel at command 11,380 (test
+/// `T12`). The 155-sample tail block is the partition remainder of the
+/// trailing input samples against the default `H_blocksize = 256` —
+/// the encoder's natural choice for the partial trailing block.
+///
+/// Caller responsibilities:
+///
+/// * `new_bs` must be non-zero. A zero-sample override surfaces
+///   [`EncodeError::ZeroBlocksize`]; `spec/03` §3.6 pins that the
+///   reference encoder never emits this form (the residual loop would
+///   be empty, defeating the override's purpose). The decoder-side
+///   dual is [`crate::Error::ZeroBlockSize`].
+/// * `new_bs` must be `<= BLOCKSIZE_MAX` (the encoder-side dual of the
+///   decoder's [`crate::Error::BlockTooLarge`] cap). An over-cap value
+///   surfaces [`EncodeError::BlocksizeOutOfRange`].
+/// * Higher-level encoders that want to emit a tail-block override
+///   must arrange the subsequent predictor commands to produce blocks
+///   of exactly `new_bs` samples per channel until either the next
+///   `BLOCK_FN_BLOCKSIZE` command or `BLOCK_FN_QUIT`. The writer
+///   primitive does not track block-size state.
+///
+/// Total encoded bit count is
+/// `4 + 2 + ⌊w / 2^2⌋ + 1 + 2 + ⌊new_bs / 2^w⌋ + 1 + w`
+/// where `w = natural_ulong_width(new_bs)` — the function-code prefix
+/// `uvar(FNSIZE = 2)` over value 5 is the 4-bit pattern `0101`
+/// (`⌊5/4⌋ = 1` leading zero + terminator + 2-bit mantissa `01`, per
+/// `spec/02` §2.1's `⌊5/4⌋ = 1, (1 << 2) | 1 = 5` decomposition),
+/// followed by the two-stage `ulong()` form of `spec/02` §3.
+pub fn write_blocksize_command(writer: &mut BitWriter, new_bs: u32) -> EncodeResult<()> {
+    if new_bs == 0 {
+        return Err(EncodeError::ZeroBlocksize);
+    }
+    if new_bs > BLOCKSIZE_MAX {
+        return Err(EncodeError::BlocksizeOutOfRange(new_bs));
+    }
+    writer.write_uvar(FN_BLOCKSIZE, FNSIZE);
+    writer.write_ulong(new_bs, natural_ulong_width(new_bs));
     Ok(())
 }
 
@@ -2916,5 +3010,135 @@ mod tests {
             Err(EncodeError::BitshiftOutOfRange(over_cap))
         );
         assert_eq!(w.bits_written(), 0);
+    }
+
+    // -------------------------------------------------------------
+    // Round 244 — BLOCK_FN_BLOCKSIZE housekeeping encoder
+    // (spec/03 §3.6 + spec/04 §4 + spec/02 §3).
+    // -------------------------------------------------------------
+
+    #[test]
+    fn fn_blocksize_constant_matches_spec() {
+        // spec/04 §4 function-code table: BLOCK_FN_BLOCKSIZE = 5.
+        assert_eq!(FN_BLOCKSIZE, 5);
+    }
+
+    #[test]
+    fn write_blocksize_command_bit_lengths_match_spec_02_formula() {
+        // spec/02 §2.1 length formula for uvar(n):
+        //   ⌊v / 2^n⌋ + 1 + n bits.
+        // The function-code prefix uvar(FNSIZE=2) over value 5 is the
+        // 4-bit pattern `0101` (⌊5/4⌋=1 leading zero + terminator +
+        // 2-bit mantissa "01"). The ulong() payload contributes
+        //   uvar(ULONGSIZE=2) over w (3..n bits) +
+        //   uvar(w) over new_bs.
+        //
+        // Anchor case: F2's tail-block override has new_bs = 155
+        // (spec/04 §4.1 / T12). 155 = 0b10011011 needs 8 bits (w = 8).
+        //   width-field uvar(2) over 8:    ⌊8/4⌋ + 1 + 2 = 5 bits
+        //   value-field uvar(8) over 155:  ⌊155/256⌋ + 1 + 8 = 9 bits
+        //   payload total = 14 bits
+        // Function-code prefix = 4 bits → grand total = 18 bits.
+        let mut w = BitWriter::new();
+        write_blocksize_command(&mut w, 155).expect("write");
+        assert_eq!(w.bits_written(), 18, "F2 tail-block anchor new_bs=155");
+
+        // Default H_blocksize = 256. 256 = 0b100000000 needs 9 bits.
+        //   width-field uvar(2) over 9:    ⌊9/4⌋ + 1 + 2 = 5 bits
+        //   value-field uvar(9) over 256:  ⌊256/512⌋ + 1 + 9 = 10 bits
+        //   payload total = 15 bits
+        // Plus 4-bit function-code prefix → 19 bits.
+        let mut w = BitWriter::new();
+        write_blocksize_command(&mut w, 256).expect("write");
+        assert_eq!(w.bits_written(), 19, "default H_blocksize=256");
+
+        // Smallest valid new_bs = 1 (degenerate single-sample blocks).
+        // 1 needs 1 bit (w = 1).
+        //   width-field uvar(2) over 1: ⌊1/4⌋ + 1 + 2 = 3 bits
+        //   value-field uvar(1) over 1: ⌊1/2⌋ + 1 + 1 = 2 bits
+        //   payload total = 5 bits
+        // Plus 4-bit function-code prefix → 9 bits.
+        let mut w = BitWriter::new();
+        write_blocksize_command(&mut w, 1).expect("write");
+        assert_eq!(w.bits_written(), 9, "minimum new_bs=1");
+    }
+
+    #[test]
+    fn write_blocksize_command_roundtrips_through_decoder_primitives() {
+        use crate::bitreader::BitReader;
+        use crate::block::{read_blocksize_payload, read_function_code, FunctionCode};
+
+        // Cover the spec/04 §4 anchor value (F2's `new_bs = 155`),
+        // the default H_blocksize (256 — appears in fixture F1 header
+        // per spec/01 §3), the BLOCKSIZE_MAX cap-edge, the minimum
+        // (1), and a representative spread in between.
+        for &new_bs in &[1u32, 2, 64, 155, 256, 1024, 65536, BLOCKSIZE_MAX] {
+            let mut w = BitWriter::new();
+            write_blocksize_command(&mut w, new_bs).expect("write");
+            w.pad_to_byte();
+            let bytes = w.into_bytes();
+
+            let mut r = BitReader::new(&bytes);
+            let fc = read_function_code(&mut r).expect("read fn");
+            assert_eq!(fc, FunctionCode::Blocksize, "new_bs={new_bs}");
+            assert!(
+                !fc.advances_channel_cursor(),
+                "BLOCKSIZE is housekeeping (spec/03 §3.6)"
+            );
+            let got = read_blocksize_payload(&mut r).expect("read payload");
+            assert_eq!(got, new_bs, "new_bs={new_bs} roundtrip");
+        }
+    }
+
+    #[test]
+    fn write_blocksize_command_rejects_zero_new_bs() {
+        // spec/03 §3.6 forbids zero-sample BLOCKSIZE overrides; the
+        // encoder mirrors the decoder-side ZeroBlockSize rejection.
+        // The writer must surface ZeroBlocksize without emitting any
+        // partial command bytes.
+        let mut w = BitWriter::new();
+        assert_eq!(
+            write_blocksize_command(&mut w, 0),
+            Err(EncodeError::ZeroBlocksize)
+        );
+        assert_eq!(w.bits_written(), 0);
+    }
+
+    #[test]
+    fn write_blocksize_command_rejects_over_cap_new_bs() {
+        // BLOCKSIZE_MAX + 1 must surface BlocksizeOutOfRange and emit
+        // nothing on the writer (no partial command bytes). The cap
+        // mirrors the decoder-side BlockTooLarge rejection.
+        let mut w = BitWriter::new();
+        let over_cap = BLOCKSIZE_MAX + 1;
+        assert_eq!(
+            write_blocksize_command(&mut w, over_cap),
+            Err(EncodeError::BlocksizeOutOfRange(over_cap))
+        );
+        assert_eq!(w.bits_written(), 0);
+    }
+
+    #[test]
+    fn write_blocksize_command_prefix_byte_matches_uvar_decomposition() {
+        // Verify the function-code prefix is exactly the 4-bit pattern
+        // `0101` per spec/02 §2.1 uvar(FNSIZE=2) over the value 5:
+        //   ⌊5/4⌋ = 1 leading zero, terminator `1`, mantissa `01`.
+        // Pair with a small new_bs (1) so the whole command packs into
+        // two bytes under pad_to_byte:
+        //   prefix:        0101  (4 bits, uvar(2) over 5)
+        //   width uvar(2): 101   (3 bits — w = 1, ⌊1/4⌋=0 prefix zeros
+        //                        + terminator + 2-bit mantissa "01")
+        //   value uvar(1): 11    (2 bits — new_bs = 1, ⌊1/2⌋=0 prefix
+        //                        zeros + terminator + 1-bit mantissa "1")
+        //   total: 9 bits → pad to 16 bits.
+        // Concatenated MSB-first:
+        //   bit string: 0101 101 11 0000000  (16 bits = 2 bytes)
+        //              = 0101_1011 1000_0000
+        //              = 0x5B 0x80
+        let mut w = BitWriter::new();
+        write_blocksize_command(&mut w, 1).expect("write");
+        w.pad_to_byte();
+        let bytes = w.into_bytes();
+        assert_eq!(bytes, vec![0x5B, 0x80]);
     }
 }

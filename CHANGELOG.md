@@ -8,6 +8,57 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 244 clean-room rebuild.** Encoder-side `BLOCK_FN_BLOCKSIZE`
+  housekeeping writer (`spec/03` §3.6 + `spec/04` §4):
+  - New `write_blocksize_command(writer, new_bs)` primitive emits the
+    full `<fn=5> <new_bs>` command. The function code is written as
+    `uvar(FNSIZE = 2)` over `FN_BLOCKSIZE = 5`; the `new_bs` payload
+    is the two-stage `ulong()` form of `spec/02` §3
+    (`uvar(ULONGSIZE = 2)` over the per-value mantissa width followed
+    by `uvar(width)` over the value), with the mantissa width chosen
+    by the same `natural_ulong_width` minimum-width rule
+    `write_parameter_block` applies to the six header fields.
+  - New public constant `FN_BLOCKSIZE: u32 = 5` (matching the
+    existing per-command numeric `FN_BITSHIFT` / `FN_QUIT` /
+    `FN_DIFF0..3` / `FN_QLPC` / `FN_VERBATIM` / `FN_ZERO`).
+  - New `EncodeError` variants `ZeroBlocksize` (rejection mirror of
+    the decoder-side `Error::ZeroBlockSize` per `spec/03` §3.6's
+    "encoder never emits zero-sample overrides") and
+    `BlocksizeOutOfRange(u32)` (rejection mirror of the decoder-side
+    `Error::BlockTooLarge` at the `BLOCKSIZE_MAX = 1 MiB`
+    implementation safety cap). A rejected writer call surfaces the
+    error without committing any partial command bytes.
+  - Decode semantics on the round-7 driver side: the decoder installs
+    the returned value as its running sub-block size; subsequent
+    predictor commands (`DIFF0..3` / `QLPC` / `ZERO`) produce blocks
+    of `new_bs` samples per channel until the next
+    `BLOCK_FN_BLOCKSIZE` command or end-of-stream. The command does
+    **not** advance the channel cursor; the per-channel dispatch
+    resumes on the same channel after the override takes effect
+    (`spec/03` §3.6).
+  - Tests: 6 new in-module unit tests + 5 new integration tests
+    (`tests/encoder_blocksize_pipeline.rs`) cover: function-code
+    constant matches `spec/04` §4 (`FN_BLOCKSIZE = 5`); bit counts
+    match the `spec/02` §2.1 / §3 length formulas for the F2 T12
+    anchor value (`new_bs = 155` → 18 bits total), the default
+    `H_blocksize = 256` (19 bits), and the minimum `new_bs = 1`
+    (9 bits); a representative spread (1, 2, 64, 155, 256, 1024,
+    65536, `BLOCKSIZE_MAX`) round-trips through `read_function_code`
+    + `read_blocksize_payload`; `new_bs = 0` rejection produces
+    `ZeroBlocksize` with zero bits committed; `BLOCKSIZE_MAX + 1`
+    rejection produces `BlocksizeOutOfRange` with zero bits
+    committed; an exact byte-pattern pin (`new_bs = 1` → `0x5B 0x80`)
+    corroborates the `uvar(FNSIZE = 2)` + `ulong()` MSB-first packing
+    against `spec/02` §2.1's `0101` function-code prefix
+    decomposition. Integration: mono shrinking override (default
+    `H_blocksize = 8` → `new_bs = 3` tail block) round-trips
+    byte-exact through `decode_stream`; stereo round-robin override
+    exercises the channel-cursor non-advancement rule of `spec/03`
+    §3.6; an override that resets `new_bs` to the same value as
+    `H_blocksize` is admissible and round-trips; the exact `spec/04`
+    §4.1 T12 anchor value `new_bs = 155` round-trips end-to-end;
+    the degenerate single-sample override `new_bs = 1` round-trips.
+
 - **Round 241 clean-room rebuild.** Typed `H_filetype` accessor
   surfacing the three numeric codes `spec/05` §6 pins behaviourally:
   - New public `Filetype` enum with variants `U8` (wire value 2 /

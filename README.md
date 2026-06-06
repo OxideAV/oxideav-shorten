@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 241 (2026-06-06).** The crate was
+**Clean-room rebuild — round 244 (2026-06-07).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -716,8 +716,66 @@ Wayne Stielau's seek-table utility:
     synthetic v2 headers stamped with each pinned numeric code plus
     five unpinned ones.
 
-The combined surface is exercised by **320 tests** (244 in-module
-unit + 76 integration tests across 17 integration binaries). The
+- **Round 244** — the `BLOCK_FN_BLOCKSIZE` housekeeping encoder
+  (`spec/03` §3.6 + `spec/04` §4 + `spec/02` §3):
+  * `write_blocksize_command(writer, new_bs)` emits the full
+    `<fn=5> <new_bs>` command. The function code is written as
+    `uvar(FNSIZE = 2)` over `FN_BLOCKSIZE = 5` (the 4-bit pattern
+    `0101`); the `new_bs` payload is the two-stage `ulong()` form
+    of `spec/02` §3 — `uvar(ULONGSIZE = 2)` over the per-value
+    mantissa width followed by `uvar(width)` over the value —
+    with the mantissa width chosen by the same `natural_ulong_width`
+    minimum-width rule [`write_parameter_block`] applies to the six
+    header fields.
+  * Decode semantics. The decoder installs the returned value as
+    its running sub-block size; subsequent predictor commands
+    (`DIFF0..3` / `QLPC` / `ZERO`) produce blocks of `new_bs`
+    samples per channel until the next `BLOCK_FN_BLOCKSIZE` command
+    or end-of-stream (`spec/03` §3.6). The command does **not**
+    advance the channel cursor; the per-channel dispatch resumes on
+    the same channel after the override takes effect.
+  * `FN_BLOCKSIZE = 5` (`spec/03` §3 + `spec/04` §4) — new public
+    encoder constant, matching the existing per-command numeric
+    `FN_DIFF0..3 / FN_QUIT / FN_QLPC / FN_BITSHIFT / FN_VERBATIM /
+    FN_ZERO`.
+  * New `EncodeError` variants `ZeroBlocksize` (rejection mirror of
+    the decoder-side `Error::ZeroBlockSize`; the wire layout admits
+    `new_bs = 0` in principle but `spec/03` §3.6 pins that the
+    reference encoder never emits it — the residual loop would be
+    empty, defeating the override's purpose) and
+    `BlocksizeOutOfRange(u32)` (rejection mirror of the decoder-side
+    `Error::BlockTooLarge` at the `BLOCKSIZE_MAX = 1 MiB`
+    implementation safety cap). A rejected writer call surfaces the
+    error without committing any partial command bytes.
+  * 6 new in-module unit tests + 5 new integration tests
+    (`tests/encoder_blocksize_pipeline.rs`) confirm: function-code
+    constant matches `spec/04` §4 / T12; emitted bit counts match
+    the `spec/02` §2.1 + §3 length formulas for the F2 anchor
+    `new_bs = 155` (18 bits), the default `H_blocksize = 256`
+    (19 bits), and the minimum `new_bs = 1` (9 bits); round-trip
+    through `read_function_code` + `read_blocksize_payload`
+    recovers the original `new_bs` for `{1, 2, 64, 155, 256, 1024,
+    65536, BLOCKSIZE_MAX}`; `new_bs = 0` rejection produces
+    `ZeroBlocksize` with zero bits committed; `BLOCKSIZE_MAX + 1`
+    rejection produces `BlocksizeOutOfRange` with zero bits
+    committed; an exact byte-pattern pin (`new_bs = 1` → `0x5B
+    0x80`) corroborates the MSB-first packing. Integration: mono
+    shrinking override (default `H_blocksize = 8` → `new_bs = 3`
+    tail block) round-trips byte-exact through `decode_stream`;
+    stereo round-robin override exercises the channel-cursor
+    non-advancement rule of `spec/03` §3.6; an override that
+    resets `new_bs` to the same value as `H_blocksize` is
+    admissible and round-trips; the exact `spec/04` §4.1 T12
+    anchor value `new_bs = 155` round-trips end-to-end; the
+    degenerate single-sample override `new_bs = 1` round-trips.
+  * **Scope.** Round 244 lands the `BLOCK_FN_BLOCKSIZE` writer
+    primitive only. The remaining encoder gap is the per-block
+    channel-round command sequencer (the higher layer that
+    compares the cheapest of `DIFF0..3` / `QLPC` / `ZERO` per
+    block and picks the predictor for each).
+
+The combined surface is exercised by **331 tests** (250 in-module
+unit + 81 integration tests across 18 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
@@ -760,12 +818,9 @@ leaves the second block undecoded until the next pull) (round 10).
 * **Per-block predictor selection** — the channel-round command
   sequencer that compares DIFF0..3 / QLPC / ZERO per block under a
   statistical criterion and picks the cheapest predictor for each
-  block.
-* **Encoder-side `BLOCK_FN_BLOCKSIZE` writer** (`spec/03` §3.6 +
-  `spec/04` §4). The per-stream block-size override carrying a single
-  `ulong()` payload; the decoder side already lands it (round 6 —
-  `read_blocksize_payload`). The companion `BLOCK_FN_BITSHIFT` writer
-  landed in round 238 (`write_bitshift_command`).
+  block. The full housekeeping-encoder surface (`BLOCK_FN_BLOCKSIZE`
+  + `BLOCK_FN_BITSHIFT` + `BLOCK_FN_ZERO`) is now in place and ready
+  to be driven by such a sequencer.
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking
