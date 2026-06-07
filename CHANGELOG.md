@@ -8,6 +8,60 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 254 clean-room rebuild.** Rice-`n` statistical-optimum
+  energy selection inside the per-block predictor-selection sequencer
+  (`spec/02` §2.1 + §4.2 + `spec/05` §3 + TR.156 §3.3):
+  - New public encoder helpers
+    `residual_bits_at_energy(residuals, encoded_energy) -> Option<u64>`
+    and `optimal_energy_for_residuals(residuals) -> Option<u32>`. The
+    bit-count helper sums the per-sample `⌊u / 2^width⌋ + 1 + width`
+    `svar` cost of `spec/02` §2.1 across a residual stream at any
+    encoded energy `e` such that `e + 1 ≤ MAX_RESIDUAL_WIDTH`. The
+    optimum helper sweeps `e ∈ 0..=MAX_NATURAL_ENERGY` and returns
+    whichever minimises the bit count — the empirical equivalent of
+    TR.156 §3.3 equation 21's `n ≈ log₂(log(2) · E(|x|))` over the
+    natural-band of encoded energies the `uvar(ENERGYSIZE = 3)` field
+    of `spec/02` §4.2 admits at its natural 4-bit width.
+  - Per-predictor wrappers
+    `optimal_energy_for_diff0` / `..diff1` / `..diff2` / `..diff3` /
+    `..qlpc` mirror the existing `min_energy_for_*` family for symmetry
+    at the call site; each one delegates to the shared scan.
+  - `select_predictor` (and `evaluate_candidates`) now score every
+    `BLOCK_FN_DIFFn` candidate at the Rice-`n` optimum rather than at
+    the natural energy. Observed effects on the new test corpus:
+    - Sparse seed-jump streams (e.g. `[3, 0, 0, 0]` from DIFF1 with
+      a fresh carry) move from `e = 2` / 23 bits to `e = 0` / 18
+      bits — a 22 % saving on this single block, equally for any
+      DIFFn block whose residual stream has a single outlier and a
+      long zero tail.
+    - Arithmetic-progression streams (the standard "linear ramp"
+      test case) move from `Diff1 { e = 3 }` (327-bit cost at
+      `N = 64`) to `Diff2 { e = 0 }` (140-bit cost) — DIFF2's
+      second-difference is non-zero in exactly one position, and
+      under Rice-`n` the optimum prefers the order-2 predictor's
+      sparser residual stream over DIFF1's constant non-zero one.
+  - `Choice::bits()` continues to reflect the **emitted** bit count
+    of the chosen `(predictor, energy)` pair; the writer side
+    consumes the choice unchanged. Higher-layer rate planners can
+    therefore continue to call `Choice::bits()` to budget per-block
+    cost without re-deriving the metric.
+  - Tests: 6 new in-module unit tests in `encoder.rs`
+    (`residual_bits_at_energy_matches_bitwriter_actual_count` —
+    crosschecks the cost helper against the BitWriter's actual
+    `write_svar` output across 7 streams × 8 energies; energy-cap
+    rejection; natural-coincidence on tight streams; sparse-stream
+    optimum strictly smaller than natural; per-predictor-wrapper
+    agreement; empty-stream rejection). Sequencer tests rewritten to
+    pin the new optimum behaviour explicitly: the seed-jump unit
+    test moves from natural to optimum cost; the arithmetic-ramp
+    selector test now asserts DIFF2 instead of DIFF1 with the
+    Rice-`n` rationale spelled out. The integration test
+    `mono_sequencer_picks_diff_for_arithmetic_ramp` is similarly
+    updated to assert DIFF2 and round-trips end-to-end through
+    `decode_stream`. The QLPC auto-selection follow-up (which
+    requires a candidate coefficient-quantisation pass) stays
+    deferred per the unchanged sequencer module-level note.
+
 - **Round 251 clean-room rebuild.** Per-block predictor-selection
   sequencer (`spec/03` §3.1..§3.4 + §3.9 + `spec/02` §2.1 + §2.2 +
   `spec/05` §2.3 + §2.4):

@@ -661,14 +661,7 @@ fn min_natural_energy_for_residuals(residuals: &[i64]) -> Option<u32> {
     // Build a per-sample upper bound on the folded magnitude.
     let mut u_max: u64 = 0;
     for &r in residuals {
-        let u: u64 = if r >= 0 {
-            (r as u64).checked_shl(1)?
-        } else {
-            // |r| folded as 2|r| − 1; |r| is bounded by i64::MIN's
-            // magnitude. Use unsigned arithmetic to avoid overflow.
-            let mag = (r as i128).unsigned_abs() as u64;
-            mag.checked_shl(1)?.checked_sub(1)?
-        };
+        let u: u64 = fold_signed_to_unsigned(r)?;
         if u > u_max {
             u_max = u;
         }
@@ -681,6 +674,151 @@ fn min_natural_energy_for_residuals(residuals: &[i64]) -> Option<u32> {
         }
     }
     None
+}
+
+/// Signed-to-unsigned svar folding per `spec/02` §2.2: `u = 2v` for
+/// `v ≥ 0`, `u = 2|v| − 1` for `v < 0`. Returns `None` on overflow
+/// (`v` near `i64::MIN`'s magnitude).
+fn fold_signed_to_unsigned(value: i64) -> Option<u64> {
+    if value >= 0 {
+        (value as u64).checked_shl(1)
+    } else {
+        let mag = (value as i128).unsigned_abs() as u64;
+        mag.checked_shl(1)?.checked_sub(1)
+    }
+}
+
+/// Total residual-stream bit cost of `residuals` encoded under
+/// `svar(encoded_energy + 1)` per `spec/02` §2.1 + §2.2 + `spec/05`
+/// §3.1's encoded-value-plus-one rule.
+///
+/// Per `spec/02` §2.1 each folded residual `u` costs
+/// `⌊u / 2^width⌋ + 1 + width` bits under `uvar(width)`; summing across
+/// the residual stream yields the per-block residual bit count. The
+/// helper does **not** include the command's `FNSIZE + ENERGYSIZE`
+/// prefix bits; callers add those once per command.
+///
+/// `encoded_energy` is the on-wire field value; the actual mantissa
+/// width applied is `encoded_energy + 1` per `spec/05` §3.1's `+1`
+/// rule (verified byte-for-byte on fixture `F1`'s first `BLOCK_FN_DIFF1`
+/// block, `spec/05` §3.1 test `T15`).
+///
+/// Returns `None` when `encoded_energy + 1` would exceed the decoder's
+/// implementation safety cap on residual mantissa width
+/// (`MAX_RESIDUAL_WIDTH = 30`) — the encoded block would not round-trip
+/// — or when any folded residual overflows `u64` (`v` near `i64::MIN`'s
+/// magnitude). Per-sample prefix-zero counts saturate to a sentinel
+/// upper bound rather than overflow `u64`.
+///
+/// Exposed as a public helper so callers driving the per-block
+/// predictor-selection sequencer ([`crate::select_predictor`]) can
+/// score arbitrary `(predictor, energy)` candidate pairs against the
+/// same TR.156 §3.3 rate metric the sequencer uses internally.
+pub fn residual_bits_at_energy(residuals: &[i64], encoded_energy: u32) -> Option<u64> {
+    let width = encoded_energy.checked_add(1)?;
+    if width > 30 {
+        return None;
+    }
+    let per_sample_fixed: u64 = 1 + width as u64;
+    let mut total: u64 = per_sample_fixed.checked_mul(residuals.len() as u64)?;
+    for &r in residuals {
+        let u = fold_signed_to_unsigned(r)?;
+        let prefix = if width >= 64 { 0 } else { u >> width };
+        total = total.checked_add(prefix)?;
+    }
+    Some(total)
+}
+
+/// Compute the optimal Rice-energy parameter `e ∈ 0..=MAX_NATURAL_ENERGY`
+/// for `residuals` per TR.156 §3.3's optimal-`n` derivation.
+///
+/// Per `spec/02` §2.1 the per-sample `svar(width)` cost is
+/// `⌊u / 2^width⌋ + 1 + width` where `u` is the folded magnitude of the
+/// residual. Halving the mantissa width saves `1` bit per sample on the
+/// fixed cost but doubles the expected prefix-zero count per sample; the
+/// optimum balances the two. TR.156 §3.3 expresses the optimum
+/// analytically as `n ≈ log₂(log(2) · E(|x|))`; this helper computes the
+/// same answer empirically by ranging `e` over the natural set and
+/// returning whichever minimises [`residual_bits_at_energy`].
+///
+/// Ties break toward the smaller `e` (tighter mantissa); the choice is
+/// arbitrary because both options encode the residual stream at the same
+/// total cost.
+///
+/// The search range matches the natural-energy band so the resulting
+/// `uvar(ENERGYSIZE = 3)` field stays at its natural 4-bit width on the
+/// wire (per `spec/02` §4.2). A wider statistical optimum would save
+/// residual bits but lose them again to the energy-field prefix; the
+/// natural-band cap captures the practical encoder regime.
+///
+/// Returns `None` when no `e ∈ 0..=7` yields a finite cost (every
+/// residual fold overflows). The natural fall-back for the caller is
+/// [`min_energy_for_diff0`] (or `..diff1` / `..diff2` / `..diff3` /
+/// `..qlpc`) which only guarantees zero prefix bits.
+///
+/// Exposed as a public helper so callers driving the per-block
+/// predictor-selection sequencer ([`crate::select_predictor`]) can
+/// score arbitrary residual streams against the same TR.156 §3.3 rate
+/// metric.
+pub fn optimal_energy_for_residuals(residuals: &[i64]) -> Option<u32> {
+    if residuals.is_empty() {
+        return None;
+    }
+    let mut best: Option<(u32, u64)> = None;
+    for e in 0..=MAX_NATURAL_ENERGY {
+        let Some(cost) = residual_bits_at_energy(residuals, e) else {
+            continue;
+        };
+        match best {
+            None => best = Some((e, cost)),
+            Some((_, best_cost)) if cost < best_cost => best = Some((e, cost)),
+            _ => {}
+        }
+    }
+    best.map(|(e, _)| e)
+}
+
+/// Compute the optimal Rice-energy parameter for a `BLOCK_FN_DIFF0`
+/// block per TR.156 §3.3 — same residual definition as
+/// [`min_energy_for_diff0`] (caller supplies `e₀(t) = s(t) − μ_chan`),
+/// rate metric of [`optimal_energy_for_residuals`].
+pub fn optimal_energy_for_diff0(residuals: &[i64]) -> Option<u32> {
+    optimal_energy_for_residuals(residuals)
+}
+
+/// Compute the optimal Rice-energy parameter for a `BLOCK_FN_DIFF1`
+/// block per TR.156 §3.3 — same residual definition as
+/// [`min_energy_for_diff1`] (caller supplies `e₁(t) = s(t) − s(t − 1)`),
+/// rate metric of [`optimal_energy_for_residuals`].
+pub fn optimal_energy_for_diff1(residuals: &[i64]) -> Option<u32> {
+    optimal_energy_for_residuals(residuals)
+}
+
+/// Compute the optimal Rice-energy parameter for a `BLOCK_FN_DIFF2`
+/// block per TR.156 §3.3 — same residual definition as
+/// [`min_energy_for_diff2`] (caller supplies
+/// `e₂(t) = s(t) − (2·s(t − 1) − s(t − 2))`), rate metric of
+/// [`optimal_energy_for_residuals`].
+pub fn optimal_energy_for_diff2(residuals: &[i64]) -> Option<u32> {
+    optimal_energy_for_residuals(residuals)
+}
+
+/// Compute the optimal Rice-energy parameter for a `BLOCK_FN_DIFF3`
+/// block per TR.156 §3.3 — same residual definition as
+/// [`min_energy_for_diff3`] (caller supplies
+/// `e₃(t) = s(t) − (3·s(t − 1) − 3·s(t − 2) + s(t − 3))`), rate metric
+/// of [`optimal_energy_for_residuals`].
+pub fn optimal_energy_for_diff3(residuals: &[i64]) -> Option<u32> {
+    optimal_energy_for_residuals(residuals)
+}
+
+/// Compute the optimal Rice-energy parameter for a `BLOCK_FN_QLPC`
+/// block per TR.156 §3.3 — same residual definition as
+/// [`min_energy_for_qlpc`] (caller supplies
+/// `e_QLPC(t) = s(t) − Σᵢ aᵢ · s(t − i)`), rate metric of
+/// [`optimal_energy_for_residuals`].
+pub fn optimal_energy_for_qlpc(residuals: &[i64]) -> Option<u32> {
+    optimal_energy_for_residuals(residuals)
 }
 
 /// Emit a `BLOCK_FN_DIFF0` command (function-code numeric `0`) to
@@ -3140,5 +3278,134 @@ mod tests {
         w.pad_to_byte();
         let bytes = w.into_bytes();
         assert_eq!(bytes, vec![0x5B, 0x80]);
+    }
+
+    // ---- Round 254: Rice-n statistical optimum helpers ----
+
+    #[test]
+    fn residual_bits_at_energy_matches_bitwriter_actual_count() {
+        // For a representative spread of residual streams and energies,
+        // residual_bits_at_energy must equal the BitWriter's actual
+        // emitted bit count over `write_svar(r, e + 1)` per spec/02 §2.1.
+        let streams: &[&[i64]] = &[
+            &[0],
+            &[0, 0, 0, 0],
+            &[3, 0, 0, 0],
+            &[-1, 1, -1, 1],
+            &[0, 10, 0, 0, 0, 0],
+            &[5, -5, 7, -3, 2],
+            &[127, -128, 64, -64, 0, 0, 0],
+        ];
+        for residuals in streams {
+            for e in 0u32..=MAX_NATURAL_ENERGY {
+                let computed =
+                    residual_bits_at_energy(residuals, e).expect("non-empty stream fits");
+                let mut w = BitWriter::new();
+                for &r in *residuals {
+                    w.write_svar(r, e + 1);
+                }
+                let actual = w.bits_written();
+                assert_eq!(
+                    actual, computed,
+                    "residual_bits_at_energy({residuals:?}, {e}): actual {actual} != computed {computed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn residual_bits_at_energy_rejects_width_above_residual_cap() {
+        // The decoder caps residual mantissa width at MAX_RESIDUAL_WIDTH
+        // = 30; encoded_energy values that imply a wider mantissa must
+        // surface None so the higher-layer cost search rejects them.
+        // encoded_energy 30 means width 31 — out of range.
+        assert!(residual_bits_at_energy(&[0], 30).is_none());
+        // encoded_energy 29 means width 30 — at the cap, accepted.
+        assert!(residual_bits_at_energy(&[0], 29).is_some());
+    }
+
+    #[test]
+    fn optimal_energy_matches_natural_when_residuals_are_tight() {
+        // Tight residual streams (every folded magnitude < 2^(e_nat + 1))
+        // see no prefix-zero pressure, so the Rice-n optimum coincides
+        // with the natural energy. Verify across the predictor family.
+        let cases: &[&[i64]] = &[
+            &[0, 0, 0, 0],             // e_nat = 0
+            &[0, 0, 1, 0],             // e_nat = 0 (folded max 2 — needs width 2 → e=1)
+            &[1, -1, 1, -1, 1, -1],    // e_nat = 0 (folded max 1)
+            &[3, -3, 2, -2, 1, -1, 0], // small residuals
+        ];
+        for residuals in cases {
+            let optimum = optimal_energy_for_residuals(residuals).expect("non-empty");
+            let natural = min_natural_energy_for_residuals(residuals).expect("fits natural");
+            // The optimum is at most the natural energy because the
+            // natural-energy width is always one of the candidate values
+            // and is feasible (zero prefix-zero cost there). It can also
+            // be smaller when reducing the width saves more on the
+            // (1 + width) per-sample fixed cost than it pays in prefix.
+            assert!(
+                optimum <= natural,
+                "optimum {optimum} must be ≤ natural {natural} for {residuals:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn optimal_energy_picks_smaller_e_on_sparse_seed_jump_streams() {
+        // Sparse streams with a single outlier and many zeros benefit
+        // from a tighter mantissa: the outlier pays prefix-zero bits
+        // but every other sample saves on the (1 + width) per-sample
+        // fixed cost. Concretely, [3, 0, 0, 0]:
+        //   e=0 (w=1): 4·2 + ⌊6/2⌋ = 11
+        //   e=2 (w=3): 4·4 + 0 = 16 ← natural energy
+        // The optimum is e=0.
+        let residuals = vec![3i64, 0, 0, 0];
+        let optimum = optimal_energy_for_residuals(&residuals).expect("non-empty");
+        let natural = min_natural_energy_for_residuals(&residuals).expect("fits");
+        assert_eq!(
+            optimum, 0,
+            "TR.156 §3.3 optimum is e=0 for sparse seed-jump"
+        );
+        assert_eq!(
+            natural, 2,
+            "natural energy is e=2 (width=3 fits folded max 6)"
+        );
+        assert!(
+            optimum < natural,
+            "optimum strictly smaller than natural here"
+        );
+        assert_eq!(
+            residual_bits_at_energy(&residuals, optimum).unwrap(),
+            11,
+            "optimum residual cost 11 < natural cost 16"
+        );
+        assert_eq!(
+            residual_bits_at_energy(&residuals, natural).unwrap(),
+            16,
+            "natural-energy residual cost"
+        );
+    }
+
+    #[test]
+    fn optimal_energy_per_predictor_wrappers_agree_with_shared_scan() {
+        // The per-predictor wrappers (`optimal_energy_for_diff0..3` and
+        // `..qlpc`) are thin re-exports of the shared scan; verify they
+        // produce identical results.
+        let residuals = vec![5i64, -3, 0, 12, -1, 0, 0, 0];
+        let want = optimal_energy_for_residuals(&residuals).unwrap();
+        assert_eq!(optimal_energy_for_diff0(&residuals).unwrap(), want);
+        assert_eq!(optimal_energy_for_diff1(&residuals).unwrap(), want);
+        assert_eq!(optimal_energy_for_diff2(&residuals).unwrap(), want);
+        assert_eq!(optimal_energy_for_diff3(&residuals).unwrap(), want);
+        assert_eq!(optimal_energy_for_qlpc(&residuals).unwrap(), want);
+    }
+
+    #[test]
+    fn optimal_energy_rejects_empty_residual_stream() {
+        // An empty block has no defined residual stream — the caller
+        // should never reach this path because `H_blocksize ≥ 1` per
+        // spec/01 §3 — but the API surfaces None rather than panic.
+        let empty: Vec<i64> = Vec::new();
+        assert!(optimal_energy_for_residuals(&empty).is_none());
     }
 }

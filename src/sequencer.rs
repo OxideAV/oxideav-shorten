@@ -1,10 +1,15 @@
-//! Shorten per-block predictor-selection sequencer — round 251.
+//! Shorten per-block predictor-selection sequencer — rounds 251 + 254.
 //!
-//! Round 251 adds the higher-layer encoder routine that compares the
+//! Round 251 added the higher-layer encoder routine that compares the
 //! cheapest of `BLOCK_FN_DIFF0..3` and `BLOCK_FN_ZERO` for a given
 //! channel-block and picks the predictor with the smallest encoded
-//! bit cost. The five lower-level predictor writers ([`crate::write_diff0_block`]
-//! / [`crate::write_diff1_block`] / [`crate::write_diff2_block`] /
+//! bit cost. Round 254 lifts the per-predictor cost from the natural
+//! energy (zero prefix-zero bits) to the **Rice-n statistical optimum**
+//! of TR.156 §3.3, sweeping every encoded energy in `0..=MAX_NATURAL_ENERGY`
+//! and picking whichever minimises the residual stream's total
+//! `⌊u / 2^width⌋ + 1 + width` per-sample cost. The five lower-level
+//! predictor writers ([`crate::write_diff0_block`] /
+//! [`crate::write_diff1_block`] / [`crate::write_diff2_block`] /
 //! [`crate::write_diff3_block`] / [`crate::write_zero_block`]) stay
 //! authoritative for the wire-format emission; this module sits one
 //! layer above them, takes a slice of samples plus the per-channel
@@ -27,14 +32,21 @@
 //! first because it's the smallest token at 5 bits total; the DIFFn
 //! order matches `spec/03` §3.1..§3.4 narrative).
 //!
-//! The bit cost is computed against the **natural energy** of each
-//! predictor's residual stream — the smallest `e ∈ 0..=MAX_NATURAL_ENERGY`
-//! such that every folded residual fits inside the `svar(e + 1)`
-//! mantissa with zero prefix-zero bits, exactly mirroring
-//! [`crate::min_energy_for_diff0`] / `..diff1` / `..diff2` / `..diff3`.
-//! A candidate whose residual stream does not fit any natural energy
-//! is skipped from consideration (the caller can still pick a wider
-//! energy explicitly through the per-predictor writer).
+//! The per-predictor cost is computed at the **Rice-n statistical
+//! optimum** of TR.156 §3.3 over `e ∈ 0..=MAX_NATURAL_ENERGY`. The
+//! sequencer ranges every encoded energy in the natural band and picks
+//! whichever minimises the residual stream's `⌊u / 2^width⌋ + 1 +
+//! width` per-sample cost summed across the block. For tightly-
+//! distributed residual streams the optimum coincides with the
+//! zero-prefix-bits natural energy of [`crate::min_energy_for_diff0`]
+//! / `..diff1` / `..diff2` / `..diff3`; for streams with a single
+//! outlier (e.g. a fresh-carry seed jump) the optimum picks a tighter
+//! mantissa and lets the outlier eat the prefix-zero cost because the
+//! savings on the other samples dominate.
+//!
+//! A candidate whose folded magnitudes overflow `u64` (`v` near
+//! `i64::MIN`'s magnitude) is skipped; the caller can still pick a
+//! wider energy explicitly through the per-predictor writer.
 //!
 //! ## ZERO eligibility
 //!
@@ -51,18 +63,21 @@
 //!   (the constant-block sentinel) + §3 narrative (the bit-budget
 //!   formula via the per-command wire layout).
 //! * `docs/audio/shorten/spec/02-variable-length-coding.md` §2.1
-//!   (`uvar(n)` length formula `⌊v / 2^n⌋ + 1 + n`) + §2.2
-//!   (`svar(n)` folding).
+//!   (`uvar(n)` length formula `⌊v / 2^n⌋ + 1 + n` — the source of
+//!   the Rice-n cost metric) + §2.2 (`svar(n)` folding) + §4.2
+//!   (per-block Rice-parameter width's TR.156 §3.3 anchor).
 //! * `docs/audio/shorten/spec/05-state-and-quirks.md` §2.3 (DIFF0
 //!   residual `e₀(t) = s(t) − μ_chan`) + §2.4 (ZERO emits `μ_chan`
 //!   for `bs` samples) + §3.1 (energy field's `+1` mantissa-width
-//!   rule).
+//!   rule and the consistency note that the smallest sensible width
+//!   is 1 not 0, anchoring the search at `e = 0`).
 
 use crate::bitwriter::BitWriter;
 use crate::block::FNSIZE;
 use crate::encoder::{
-    write_diff0_block, write_diff1_block, write_diff2_block, write_diff3_block, write_zero_block,
-    EncodeResult, FN_DIFF0, FN_DIFF1, FN_DIFF2, FN_DIFF3, FN_ZERO, MAX_NATURAL_ENERGY,
+    optimal_energy_for_residuals, residual_bits_at_energy, write_diff0_block, write_diff1_block,
+    write_diff2_block, write_diff3_block, write_zero_block, EncodeResult, FN_DIFF0, FN_DIFF1,
+    FN_DIFF2, FN_DIFF3, FN_ZERO,
 };
 use crate::predictor::{ChannelCarry, ENERGYSIZE};
 
@@ -159,46 +174,29 @@ fn svar_bits(value: i64, n: u32) -> Option<u64> {
     Some(uvar_bits(u as u32, n))
 }
 
-/// Smallest natural energy `e ∈ 0..=MAX_NATURAL_ENERGY` such that
-/// every folded residual fits in the `svar(e + 1)` mantissa with zero
-/// prefix-zero bits, plus the **total** encoded bit length of the
-/// residual stream at that energy. Returns `None` when no natural
-/// energy fits the largest folded residual.
+/// Optimal Rice energy `e ∈ 0..=MAX_NATURAL_ENERGY` for the residual
+/// stream per TR.156 §3.3's optimal-`n` rate metric, plus the **total**
+/// encoded bit length of the residual stream at that energy. Returns
+/// `None` when no `e` in the natural band yields a finite cost (every
+/// folded value overflows) or when `residuals` is empty.
+///
+/// The cost metric is the same `⌊u / 2^width⌋ + 1 + width` per-sample
+/// formula `svar(width)` uses, summed across the block; the optimum
+/// trades a wider mantissa against the prefix-zero count. For tightly-
+/// distributed residual streams (most blocks the encoder will see) the
+/// optimum coincides with the natural energy of
+/// [`crate::min_energy_for_diff0`] / `..diff1` / `..diff2` / `..diff3`;
+/// for sparse streams with a single outlier — e.g. the seed-jump
+/// residual at a fresh DIFF1/2/3 carry — the optimum chooses a
+/// tighter mantissa and lets the outlier eat the prefix-zero cost
+/// because the savings on the other samples dominate.
 ///
 /// The total cost includes only the residuals; the caller adds the
 /// command's `FNSIZE` + `ENERGYSIZE` prefix.
-fn natural_energy_and_residual_bits(residuals: &[i64]) -> Option<(u32, u64)> {
-    // Build a per-sample upper bound on the folded magnitude to
-    // pick the natural energy.
-    let mut u_max: u64 = 0;
-    for &r in residuals {
-        let u: u64 = if r >= 0 {
-            (r as u64).checked_shl(1)?
-        } else {
-            let mag = (r as i128).unsigned_abs() as u64;
-            mag.checked_shl(1)?.checked_sub(1)?
-        };
-        if u > u_max {
-            u_max = u;
-        }
-    }
-    let mut energy: Option<u32> = None;
-    for e in 0..=MAX_NATURAL_ENERGY {
-        let cap = 1u64 << (e + 1);
-        if u_max < cap {
-            energy = Some(e);
-            break;
-        }
-    }
-    let e = energy?;
-    let width = e + 1;
-    // Sum the per-sample svar lengths. By natural-energy construction
-    // every folded value satisfies `u < 2^width`, so `svar` cost is
-    // exactly `1 + width` bits per sample (zero prefix-zero bits +
-    // terminator + mantissa).
-    let per_sample: u64 = 1 + width as u64;
-    let total: u64 = per_sample.checked_mul(residuals.len() as u64)?;
-    Some((e, total))
+fn optimal_energy_and_residual_bits(residuals: &[i64]) -> Option<(u32, u64)> {
+    let e = optimal_energy_for_residuals(residuals)?;
+    let cost = residual_bits_at_energy(residuals, e)?;
+    Some((e, cost))
 }
 
 /// Bit cost of a `DIFFn` command's `FNSIZE + ENERGYSIZE` prefix at
@@ -224,7 +222,7 @@ fn evaluate_diff0(samples: &[i32], mu_chan: i64) -> Option<Choice> {
     for &s in samples {
         residuals.push((s as i64) - mu_chan);
     }
-    let (energy, residual_bits) = natural_energy_and_residual_bits(&residuals)?;
+    let (energy, residual_bits) = optimal_energy_and_residual_bits(&residuals)?;
     let bits = diffn_prefix_bits(FN_DIFF0, energy) + residual_bits;
     Some(Choice::Diff0 { energy, bits })
 }
@@ -240,7 +238,7 @@ fn evaluate_diff1(samples: &[i32], carry: &ChannelCarry) -> Option<Choice> {
         residuals.push(s_i64 - s_m1);
         s_m1 = s_i64;
     }
-    let (energy, residual_bits) = natural_energy_and_residual_bits(&residuals)?;
+    let (energy, residual_bits) = optimal_energy_and_residual_bits(&residuals)?;
     let bits = diffn_prefix_bits(FN_DIFF1, energy) + residual_bits;
     Some(Choice::Diff1 { energy, bits })
 }
@@ -263,7 +261,7 @@ fn evaluate_diff2(samples: &[i32], carry: &ChannelCarry) -> Option<Choice> {
         s_m2 = s_m1;
         s_m1 = s_i64;
     }
-    let (energy, residual_bits) = natural_energy_and_residual_bits(&residuals)?;
+    let (energy, residual_bits) = optimal_energy_and_residual_bits(&residuals)?;
     let bits = diffn_prefix_bits(FN_DIFF2, energy) + residual_bits;
     Some(Choice::Diff2 { energy, bits })
 }
@@ -292,7 +290,7 @@ fn evaluate_diff3(samples: &[i32], carry: &ChannelCarry) -> Option<Choice> {
         s_m2 = s_m1;
         s_m1 = s_i64;
     }
-    let (energy, residual_bits) = natural_energy_and_residual_bits(&residuals)?;
+    let (energy, residual_bits) = optimal_energy_and_residual_bits(&residuals)?;
     let bits = diffn_prefix_bits(FN_DIFF3, energy) + residual_bits;
     Some(Choice::Diff3 { energy, bits })
 }
@@ -534,20 +532,28 @@ mod tests {
     // ---- evaluate_diff1 ----
 
     #[test]
-    fn diff1_constant_input_with_zero_carry_emits_seed_jump() {
+    fn diff1_constant_input_with_zero_carry_picks_tight_mantissa_per_tr156_3_3() {
         // samples = [3, 3, 3, 3] with carry.at(0) = 0:
         // residuals = [3, 0, 0, 0]. Folded magnitudes [6, 0, 0, 0].
-        // Natural energy = 2 (cap 8 > 6), width = 3.
+        // Round-251's natural-energy rule picked e=2 (cap 8 > 6) for a
+        // 23-bit total. Round-254's TR.156 §3.3 statistical optimum
+        // recognises that three of the four samples are zero — a tighter
+        // mantissa width pays prefix bits on the seed-jump outlier but
+        // saves mantissa bits on the rest. Sweeping `e ∈ 0..=7`:
+        //   e=0 (w=1): per-sample fixed 2 bits; prefix ⌊6/2⌋ = 3 once.
+        //              total = 4·2 + 3 = 11 bits.
+        //   e=1 (w=2): per-sample 3; prefix ⌊6/4⌋ = 1. total = 13.
+        //   e=2 (w=3): per-sample 4; prefix 0. total = 16. ← old pick.
+        //   e≥3: monotonically worse.
+        // Optimum is e=0 at 11 residual bits; the encoder emits the
+        // command in 3 (fn) + 4 (energy uvar(3) over 0) + 11 = 18 bits.
         let samples = vec![3i32, 3, 3, 3];
         let carry = ChannelCarry::new(3);
         let choice = evaluate_diff1(&samples, &carry).unwrap();
         match choice {
             Choice::Diff1 { energy, bits } => {
-                assert_eq!(energy, 2);
-                // 3 (fn=1 uvar(2)=3 bits: '0 1 01') + 4 (energy=2 uvar(3))
-                //   + 4 × svar(3): per-sample 1 + 3 = 4 bits → 16 bits.
-                // Total = 3 + 4 + 16 = 23 bits.
-                assert_eq!(bits, 23);
+                assert_eq!(energy, 0, "TR.156 §3.3 optimum is e=0 for this stream");
+                assert_eq!(bits, 3 + 4 + 11);
             }
             _ => panic!("expected DIFF1 variant"),
         }
@@ -574,27 +580,44 @@ mod tests {
     }
 
     #[test]
-    fn selector_picks_diff1_when_ramp_has_smaller_first_differences() {
+    fn selector_picks_diff2_for_arithmetic_ramp_under_rice_n_optimum() {
         // samples = arithmetic progression 0, 5, 10, 15, ..., 5·(N-1)
         // with mu_chan = 0 (so ZERO ineligible).
-        // DIFF0 residuals = samples themselves; values grow without
-        //   bound (max 5·(N-1)) so natural-energy gets wide as N grows.
-        // DIFF1 residuals = [0, 5, 5, 5, ..., 5]; folded max 10 →
-        //   natural energy e=3 (cap 16 > 10), width 4. Per-sample 5
-        //   bits; cost 3 + 4 + N × 5.
-        // For N = 64 the DIFF0 residual max is 5·63 = 315, requiring
-        // a wider svar; DIFF1 wins by a comfortable margin.
+        //
+        // Round 251's natural-energy rule would have picked DIFF1 — the
+        // first-differences are [0, 5, 5, 5, ..., 5] (folded max 10,
+        // natural e=3, per-sample 5 bits → ~3 + 4 + 64·5 = 327 bits at
+        // N=64). Round 254's TR.156 §3.3 statistical optimum sees the
+        // second-differences of an arithmetic ramp are sparse:
+        //   DIFF2 residuals = [0, 5, 0, 0, ..., 0] (only the second
+        //   sample is non-zero — the recurrence stabilises at zero
+        //   after the seed window winds down).
+        // Folded magnitudes = [0, 10, 0, 0, ..., 0]. Sweeping `e`:
+        //   e=0 (w=1): per-sample 2; prefix ⌊10/2⌋ = 5 once. cost = 133.
+        //   e=1 (w=2): per-sample 3; prefix 2. cost = 194. monotone up.
+        // Plus 3 + 4 prefix = 140 bits — beats DIFF1's 327 comfortably.
+        // The optimum correctly chooses DIFF2.
         let samples: Vec<i32> = (0..64i32).map(|t| 5 * t).collect();
         let carry = ChannelCarry::new(3);
         let choice = select_predictor(&samples, 0, &carry).unwrap();
+        match choice {
+            Choice::Diff2 { energy, bits } => {
+                assert_eq!(
+                    energy, 0,
+                    "TR.156 §3.3 optimum is e=0 for this sparse stream"
+                );
+                assert_eq!(bits, 140);
+            }
+            _ => panic!("expected DIFF2 (sparse second-diff stream), got {choice:?}"),
+        }
+        // Sanity: DIFF0 is cheapest only when the raw samples are
+        // already tight; on the long-range ramp it cannot fit any
+        // natural energy and is dropped from the candidate set.
+        let cands = evaluate_candidates(&samples, 0, &carry);
         assert!(
-            matches!(choice, Choice::Diff1 { .. }),
-            "expected DIFF1, got {choice:?}"
+            cands.iter().any(|c| matches!(c, Choice::Diff2 { .. })),
+            "DIFF2 must be in the candidate set"
         );
-        // DIFF0 cost lower bound at N=64 with folded-max 630
-        //   → natural e=9 doesn't fit (max 7); evaluate_diff0 returns
-        //   None when residuals exceed natural-energy cap.
-        // Whatever DIFF1's exact bits are, they should beat that.
     }
 
     #[test]

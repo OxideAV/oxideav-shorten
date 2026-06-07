@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 251 (2026-06-07).** The crate was
+**Clean-room rebuild — round 254 (2026-06-08).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -824,11 +824,67 @@ Wayne Stielau's seek-table utility:
     mixed predictor streams; cost-equality property.
   * **Scope.** Round 251 lands the auto-selection layer above the
     DIFF0..3 + ZERO writers. The remaining gaps are QLPC auto-
-    selection (needs coefficient quantisation) and the Rice-`n`
-    statistical optimum of TR.156 §3.3 (which doesn't change the
-    wire format).
+    selection (needs coefficient quantisation) and — closed in
+    round 254 below — the Rice-`n` statistical optimum of
+    TR.156 §3.3.
 
-The combined surface is exercised by **353 tests** (265 in-module
+- **Round 254** — **Rice-`n` statistical-optimum energy selection**
+  inside the per-block predictor-selection sequencer (`spec/02` §2.1
+  + §4.2 + `spec/05` §3 + TR.156 §3.3):
+  * New public encoder helpers
+    `residual_bits_at_energy(residuals, encoded_energy) -> Option<u64>`
+    and `optimal_energy_for_residuals(residuals) -> Option<u32>`. The
+    bit-count helper sums the per-sample
+    `⌊u / 2^width⌋ + 1 + width` `svar` cost of `spec/02` §2.1 across
+    a residual stream at any encoded energy whose mantissa width
+    fits the decoder cap (`MAX_RESIDUAL_WIDTH = 30`). The optimum
+    helper sweeps `e ∈ 0..=MAX_NATURAL_ENERGY` and returns whichever
+    minimises the bit count — the empirical equivalent of TR.156
+    §3.3 equation 21's `n ≈ log₂(log(2) · E(|x|))` over the
+    natural-band of encoded energies the `uvar(ENERGYSIZE = 3)`
+    field of `spec/02` §4.2 admits at its natural 4-bit width.
+  * Per-predictor wrappers
+    `optimal_energy_for_diff0` / `..diff1` / `..diff2` / `..diff3` /
+    `..qlpc` mirror the existing `min_energy_for_*` family so the
+    call-site intent stays explicit.
+  * `select_predictor` (and `evaluate_candidates`) now score every
+    `BLOCK_FN_DIFFn` candidate at the Rice-`n` optimum rather than
+    at the natural energy. Observed effects:
+    - Sparse seed-jump streams (e.g. `[3, 0, 0, 0]` from DIFF1 with
+      a fresh carry) move from `e = 2` / 23 bits to `e = 0` / 18
+      bits — a 22 % saving on this single block.
+    - Arithmetic-progression streams move from `Diff1 { e = 3 }`
+      (~327-bit cost at `N = 64`) to `Diff2 { e = 0 }` (~140-bit
+      cost) — DIFF2's second-difference is non-zero in exactly
+      one position, and under Rice-`n` the optimum prefers the
+      order-2 predictor's sparser residual stream over DIFF1's
+      constant non-zero one.
+  * `Choice::bits()` continues to reflect the **emitted** bit count
+    of the chosen `(predictor, energy)` pair; the writer side
+    consumes the choice unchanged. Higher-layer rate planners can
+    therefore continue to call `Choice::bits()` to budget per-block
+    cost without re-deriving the metric.
+  * 6 new in-module unit tests in `encoder.rs`
+    (`residual_bits_at_energy_matches_bitwriter_actual_count` —
+    crosschecks the cost helper against the BitWriter's actual
+    `write_svar` output across 7 streams × 8 energies;
+    `..rejects_width_above_residual_cap`;
+    `optimal_energy_matches_natural_when_residuals_are_tight`;
+    `optimal_energy_picks_smaller_e_on_sparse_seed_jump_streams`;
+    `optimal_energy_per_predictor_wrappers_agree_with_shared_scan`;
+    `optimal_energy_rejects_empty_residual_stream`). Sequencer unit
+    tests and the
+    `tests/encoder_sequencer_pipeline.rs::mono_sequencer_picks_diff_for_arithmetic_ramp`
+    integration test are rewritten in the same commit to assert the
+    new optimum behaviour with the TR.156 §3.3 rationale spelled
+    out; the round-trips through `decode_stream` continue to be
+    byte-exact.
+  * **Scope.** Round 254 closes the Rice-`n` statistical-optimum
+    follow-up of round 251. The other round-251 follow-up — QLPC
+    auto-selection — still requires a candidate coefficient-
+    quantisation pass and remains future work.
+
+The combined surface is exercised by **359 tests** (271 in-module
 unit + 88 integration tests across 19 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
@@ -863,19 +919,18 @@ leaves the second block undecoded until the next pull) (round 10).
   quantised coefficient vector as `&[i64]`; the optimal-quantisation
   derivation from raw input samples per TR.156 §3.2 (the
   Laplacian-distribution rule) remains a higher-layer concern.
-* **Rice-`n` statistical optimum** (TR.156 §3.3). The five
-  `min_energy_for_*` helpers pick the smallest natural-width energy
-  that fits the largest folded residual with zero prefix-zero bits;
-  the statistical optimum (which minimises total encoded bit count,
-  not just prefix bits) is a refinement that doesn't change the wire
-  format.
 * **QLPC auto-selection** — the round-251 sequencer
   (`select_predictor`) covers `BLOCK_FN_DIFF0..3` and
   `BLOCK_FN_ZERO` but not `BLOCK_FN_QLPC`, because the caller
   still owns coefficient quantisation per `spec/03` §3.5 and
   TR.156 §3.2. A future round can extend the selector to compare a
   caller-supplied candidate coefficient vector against the DIFFn
-  family and pick QLPC when its residual stream wins on bit cost.
+  family and pick QLPC when its residual stream wins on bit cost
+  under the round-254 Rice-`n` statistical-optimum metric. The
+  encoder helper `optimal_energy_for_qlpc` already exposes the
+  metric so the QLPC-side change is purely the addition of a new
+  `Choice::Qlpc` variant and its candidate-evaluation path inside
+  the sequencer.
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking

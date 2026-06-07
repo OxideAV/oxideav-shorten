@@ -73,15 +73,25 @@ fn mono_sequencer_picks_zero_for_constant_zero_block() {
 
 #[test]
 fn mono_sequencer_picks_diff_for_arithmetic_ramp() {
-    // An arithmetic progression makes DIFF1 the cheap choice (constant
-    // first-difference). Verify round-trip.
+    // An arithmetic progression has sparse higher-order differences:
+    //   first-differences  = [0, 3, 3, 3, ..., 3]    (constant after seed)
+    //   second-differences = [0, 3, 0, 0, ..., 0]    (one-shot non-zero)
+    // Round 251's natural-energy rule picked DIFF1 (constant non-zero
+    // first-diff stream). Round 254's TR.156 §3.3 statistical optimum
+    // beats it with DIFF2: a single non-zero second-difference outlier
+    // sits inside an e=0 (width=1) svar mantissa and pays a small
+    // prefix-zero count, while the other 31 samples cost only 2 bits
+    // each. Verify the selector picks DIFF2 and the stream round-trips.
     let header = synth_header(2, 5, 1, 32, 0, 0, 0);
     let mut carry = ChannelCarry::new(3);
     let samples: Vec<i32> = (0..32i32).map(|t| 3 * t).collect();
 
     let choice = select_predictor(&samples, 0, &carry).expect("choice");
-    // For this signal, DIFF1 should win.
-    assert!(matches!(choice, Choice::Diff1 { .. }));
+    // TR.156 §3.3 optimum picks DIFF2 on a sparse second-diff stream.
+    assert!(
+        matches!(choice, Choice::Diff2 { .. }),
+        "TR.156 §3.3 optimum should pick DIFF2 on an arithmetic ramp, got {choice:?}"
+    );
 
     let mut out = Vec::new();
     write_byte_aligned_prefix(&mut out, header.version).expect("prefix");
