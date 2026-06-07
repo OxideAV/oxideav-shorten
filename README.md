@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 244 (2026-06-07).** The crate was
+**Clean-room rebuild — round 251 (2026-06-07).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -774,8 +774,62 @@ Wayne Stielau's seek-table utility:
     compares the cheapest of `DIFF0..3` / `QLPC` / `ZERO` per
     block and picks the predictor for each).
 
-The combined surface is exercised by **331 tests** (250 in-module
-unit + 81 integration tests across 18 integration binaries). The
+- **Round 251** — the **per-block predictor-selection sequencer**
+  (`spec/03` §3.1..§3.4 + §3.9 + `spec/02` §2.1 + §2.2 +
+  `spec/05` §2.3 + §2.4):
+  * `select_predictor(samples, mu_chan, carry) -> Option<Choice>`
+    — compares the natural-energy total encoded bit cost of every
+    eligible candidate among `BLOCK_FN_DIFF0..3` and `BLOCK_FN_ZERO`
+    and returns the cheapest. The bit cost is computed using the
+    `spec/02` §2.1 `uvar(n)` length formula `⌊v / 2^n⌋ + 1 + n`
+    plus the `spec/02` §2.2 svar folding; with natural-energy
+    selection every residual lands at zero prefix-zero bits so each
+    `svar(width)` costs exactly `1 + width` bits. Ties break in
+    priority order `ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3`. Returns
+    `None` for an empty block and for blocks whose residuals
+    overflow every natural-energy width while ZERO is ineligible.
+  * `Choice` enum — variants `Zero { bits }`, `Diff0 { energy,
+    bits }`, `Diff1 { energy, bits }`, `Diff2 { energy, bits }`,
+    `Diff3 { energy, bits }`. Each variant carries the natural
+    energy parameter the writer will use plus the total encoded
+    bit count of the command.
+  * `write_selected_block(writer, choice, samples, mu_chan,
+    carry)` — dispatches the [`Choice`] to the matching per-
+    predictor writer ([`write_zero_block`] / [`write_diff0_block`]
+    / [`write_diff1_block`] / [`write_diff2_block`] /
+    [`write_diff3_block`]). The integration test
+    `sequencer_emission_cost_matches_choice_bits` pins
+    `bits_written` delta to `Choice::bits()` exactly — load-
+    bearing for any higher-layer rate planner.
+  * `evaluate_candidates` — debug-friendly accessor returning every
+    eligible candidate in priority order, useful for inspecting
+    why a particular block selects a particular predictor.
+  * `BLOCK_FN_QLPC` is **not** auto-selected; the caller still
+    owns coefficient quantisation per `spec/03` §3.5 and TR.156
+    §3.2's Laplacian-distribution rule. A future round can layer
+    QLPC into the selector by accepting a candidate coefficient
+    vector and computing the same residual + natural-energy scan.
+  * 15 new in-module unit tests + 7 new integration tests
+    (`tests/encoder_sequencer_pipeline.rs`) confirm: `uvar_bits`
+    matches `spec/02` §2.1 worked examples; `svar_bits` matches
+    [`BitWriter::write_svar`]'s actual emitted bit count across
+    a spread of widths + values; the ZERO token costs exactly 5
+    bits; ZERO eligibility requires every sample to equal
+    `mu_chan`; selector tie-break priority; DIFF0 / DIFF1 / DIFF3
+    candidate evaluation; selector picks `Choice::Zero` for an
+    all-zero block (with `mu_chan = 0`); selector picks
+    `Choice::Diff1` for an arithmetic-progression input where the
+    first-difference stream is small; full round-trip through
+    `decode_stream` for mono / stereo / back-to-back blocks /
+    mixed predictor streams; cost-equality property.
+  * **Scope.** Round 251 lands the auto-selection layer above the
+    DIFF0..3 + ZERO writers. The remaining gaps are QLPC auto-
+    selection (needs coefficient quantisation) and the Rice-`n`
+    statistical optimum of TR.156 §3.3 (which doesn't change the
+    wire format).
+
+The combined surface is exercised by **353 tests** (265 in-module
+unit + 88 integration tests across 19 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
@@ -815,12 +869,13 @@ leaves the second block undecoded until the next pull) (round 10).
   the statistical optimum (which minimises total encoded bit count,
   not just prefix bits) is a refinement that doesn't change the wire
   format.
-* **Per-block predictor selection** — the channel-round command
-  sequencer that compares DIFF0..3 / QLPC / ZERO per block under a
-  statistical criterion and picks the cheapest predictor for each
-  block. The full housekeeping-encoder surface (`BLOCK_FN_BLOCKSIZE`
-  + `BLOCK_FN_BITSHIFT` + `BLOCK_FN_ZERO`) is now in place and ready
-  to be driven by such a sequencer.
+* **QLPC auto-selection** — the round-251 sequencer
+  (`select_predictor`) covers `BLOCK_FN_DIFF0..3` and
+  `BLOCK_FN_ZERO` but not `BLOCK_FN_QLPC`, because the caller
+  still owns coefficient quantisation per `spec/03` §3.5 and
+  TR.156 §3.2. A future round can extend the selector to compare a
+  caller-supplied candidate coefficient vector against the DIFFn
+  family and pick QLPC when its residual stream wins on bit cost.
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking

@@ -8,6 +8,51 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 251 clean-room rebuild.** Per-block predictor-selection
+  sequencer (`spec/03` §3.1..§3.4 + §3.9 + `spec/02` §2.1 + §2.2 +
+  `spec/05` §2.3 + §2.4):
+  - New `select_predictor(samples, mu_chan, carry) -> Option<Choice>`
+    higher-layer entry point. Computes the natural-energy total
+    encoded bit cost of every eligible candidate among
+    `BLOCK_FN_DIFF0..3` and `BLOCK_FN_ZERO`, picks the cheapest, and
+    returns a `Choice` enum the caller hands to
+    `write_selected_block`. Ties break in priority order
+    `ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3`. Returns `None` for an
+    empty block and for blocks whose residuals overflow every natural
+    energy while ZERO is ineligible (the caller can still encode such
+    a block manually by picking an explicit wider energy through the
+    per-predictor writer).
+  - New public `Choice` enum with variants `Zero { bits }`,
+    `Diff0 { energy, bits }`, `Diff1 { energy, bits }`,
+    `Diff2 { energy, bits }`, `Diff3 { energy, bits }`. Each variant
+    carries the natural energy parameter the writer will use plus
+    the total encoded bit count of the command. `Choice::bits()` and
+    `Choice::function_code()` accessors.
+  - New `write_selected_block(writer, choice, samples, mu_chan,
+    carry)` — dispatches the `Choice` to the matching per-predictor
+    writer (`write_zero_block` / `write_diff0_block` /
+    `write_diff1_block` / `write_diff2_block` / `write_diff3_block`).
+  - New `evaluate_candidates(samples, mu_chan, carry) -> Vec<Choice>`
+    accessor returning every eligible candidate in priority order;
+    useful for inspecting why a particular block selects a
+    particular predictor.
+  - `BLOCK_FN_QLPC` is **not** part of auto-selection because the
+    caller still owns coefficient quantisation per `spec/03` §3.5
+    and TR.156 §3.2's Laplacian-distribution rule; a future round
+    can extend the selector to accept a candidate coefficient
+    vector.
+  - Tests: 15 new in-module unit tests + 7 new integration tests
+    (`tests/encoder_sequencer_pipeline.rs`) cover: `uvar_bits` /
+    `svar_bits` length formulas against `spec/02` §2.1 worked
+    examples and `BitWriter`'s actual emitted bit count; ZERO-token
+    5-bit cost; ZERO eligibility against `mu_chan`; tie-break
+    priority (ZERO wins over DIFF0 when both fit); selector picks
+    DIFF1 for an arithmetic-progression input where the first-
+    difference stream is small; full round-trip through
+    `decode_stream` for mono / stereo / back-to-back blocks / mixed
+    predictor streams; bits-written delta equals `Choice::bits()`
+    exactly (load-bearing for higher-layer rate planners).
+
 - **Round 244 clean-room rebuild.** Encoder-side `BLOCK_FN_BLOCKSIZE`
   housekeeping writer (`spec/03` §3.6 + `spec/04` §4):
   - New `write_blocksize_command(writer, new_bs)` primitive emits the

@@ -214,6 +214,23 @@
 //!   side; the `BLOCK_FN_QLPC` predictor encoder + the per-block
 //!   channel-round sequencer remain unwritten.
 //!
+//! * Round 251 — the **per-block predictor-selection sequencer**
+//!   per `spec/03` §3.1..§3.4 + §3.9 + `spec/02` §2.1 + §2.2 +
+//!   `spec/05` §2.3 + §2.4. [`select_predictor`] compares the
+//!   cheapest of `BLOCK_FN_DIFF0..3` and `BLOCK_FN_ZERO` for a
+//!   given channel block by computing each candidate's natural-
+//!   energy total encoded bit count (function code + energy field +
+//!   per-sample `svar(energy + 1)` residuals) and picks the
+//!   candidate with the smallest cost. Ties break in priority order
+//!   `ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3`. [`write_selected_block`]
+//!   dispatches the returned [`Choice`] to the matching per-
+//!   predictor writer; [`evaluate_candidates`] returns every
+//!   eligible candidate in priority order for inspection.
+//!   `BLOCK_FN_QLPC` is not part of auto-selection because the
+//!   caller still owns coefficient quantisation per `spec/03` §3.5;
+//!   a future round can layer it in by accepting a candidate
+//!   coefficient vector.
+//!
 //! The public entry points are [`decode_stream`], [`parse_stream_header`],
 //! [`read_function_code`], [`read_verbatim_payload`],
 //! [`read_blocksize_payload`], [`read_bitshift_payload`],
@@ -259,6 +276,7 @@ mod encoder;
 mod error;
 mod header;
 mod predictor;
+mod sequencer;
 mod sidecar;
 mod stream_iter;
 
@@ -293,6 +311,7 @@ pub use crate::predictor::{
     decode_diff_block, decode_qlpc_block, fill_zero_block, ChannelCarry, MeanEstimator, PolyOrder,
     CARRY_LEN_FLOOR, ENERGYSIZE, LPCQSIZE, LPCQUANT,
 };
+pub use crate::sequencer::{evaluate_candidates, select_predictor, write_selected_block, Choice};
 pub use crate::sidecar::{
     detect_shnampsk_trailer, split_off_shnampsk_trailer, ShnampskTrailer, MIN_SIDECAR_LEN,
     SEEK_MAGIC, SHNAMPSK_SIGNATURE, SIDECAR_LEN_CAP, TRAILER_TAIL_LEN,
