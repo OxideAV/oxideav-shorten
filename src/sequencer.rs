@@ -1,4 +1,5 @@
-//! Shorten per-block predictor-selection sequencer — rounds 251 + 254.
+//! Shorten per-block predictor-selection sequencer — rounds 251 + 254
+//! + 266.
 //!
 //! Round 251 added the higher-layer encoder routine that compares the
 //! cheapest of `BLOCK_FN_DIFF0..3` and `BLOCK_FN_ZERO` for a given
@@ -7,30 +8,39 @@
 //! energy (zero prefix-zero bits) to the **Rice-n statistical optimum**
 //! of TR.156 §3.3, sweeping every encoded energy in `0..=MAX_NATURAL_ENERGY`
 //! and picking whichever minimises the residual stream's total
-//! `⌊u / 2^width⌋ + 1 + width` per-sample cost. The five lower-level
-//! predictor writers ([`crate::write_diff0_block`] /
+//! `⌊u / 2^width⌋ + 1 + width` per-sample cost. Round 266 extends the
+//! selector with optional **`BLOCK_FN_QLPC`** auto-selection via the
+//! new entry points [`select_predictor_with_qlpc`] and
+//! [`evaluate_candidates_with_qlpc`]: a caller supplies a candidate
+//! quantised-coefficient vector and the selector scores it under the
+//! same Rice-n cost metric as the DIFFn family, picking QLPC when its
+//! residual stream wins on bit cost. The six lower-level predictor
+//! writers ([`crate::write_diff0_block`] /
 //! [`crate::write_diff1_block`] / [`crate::write_diff2_block`] /
-//! [`crate::write_diff3_block`] / [`crate::write_zero_block`]) stay
-//! authoritative for the wire-format emission; this module sits one
-//! layer above them, takes a slice of samples plus the per-channel
-//! `μ_chan` and `ChannelCarry`, and returns the cheapest [`Choice`]
-//! a caller can hand to [`write_selected_block`].
+//! [`crate::write_diff3_block`] / [`crate::write_zero_block`] /
+//! [`crate::write_qlpc_block`]) stay authoritative for the wire-format
+//! emission; this module sits one layer above them, takes a slice of
+//! samples plus the per-channel `μ_chan` and `ChannelCarry` (plus the
+//! optional QLPC candidate), and returns the cheapest [`Choice`] a
+//! caller can hand to [`write_selected_block`].
 //!
-//! `BLOCK_FN_QLPC` is **not** part of the auto-selection because the
-//! caller still owns coefficient quantisation per `spec/03` §3.5 and
-//! TR.156 §3.2's Laplacian-distribution rule; a future round can
-//! layer QLPC into the selector by accepting a `&[i64]` candidate
-//! coefficient vector.
+//! Coefficient quantisation itself is **not** in scope — the caller
+//! still owns the per-block coefficient derivation per `spec/03` §3.5
+//! and TR.156 §3.2's Laplacian-distribution rule, and the selector
+//! either receives a candidate or skips QLPC entirely.
 //!
 //! ## Selection criterion
 //!
 //! For each candidate predictor the sequencer computes the **total
 //! encoded bit count** of its `BLOCK_FN_*` command (function code +
-//! optional energy field + per-sample residuals folded under
-//! `svar(energy + 1)`). The cheapest candidate wins; ties break in
-//! the priority order `ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3` (ZERO
-//! first because it's the smallest token at 5 bits total; the DIFFn
-//! order matches `spec/03` §3.1..§3.4 narrative).
+//! optional `order` + `coefs` fields + optional energy field + per-
+//! sample residuals folded under `svar(energy + 1)`). The cheapest
+//! candidate wins; ties break in the priority order
+//! `ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3 > QLPC` (ZERO first because
+//! it's the smallest token at 5 bits total; the DIFFn order matches
+//! `spec/03` §3.1..§3.4 narrative; QLPC last because of its larger
+//! fixed overhead — order field + coefficient field — so on an exact
+//! cost tie a smaller-fixed-overhead command wins).
 //!
 //! The per-predictor cost is computed at the **Rice-n statistical
 //! optimum** of TR.156 §3.3 over `e ∈ 0..=MAX_NATURAL_ENERGY`. The
@@ -59,27 +69,34 @@
 //! ## Clean-room provenance
 //!
 //! * `docs/audio/shorten/spec/03-block-and-predictor.md` §3.1..§3.4
-//!   (the four polynomial-difference residual definitions) + §3.9
-//!   (the constant-block sentinel) + §3 narrative (the bit-budget
-//!   formula via the per-command wire layout).
+//!   (the four polynomial-difference residual definitions) + §3.5
+//!   (the `BLOCK_FN_QLPC` wire layout — order + coefficients +
+//!   energy + residuals; the predictor recurrence
+//!   `s(t) = Σᵢ aᵢ · s(t − i) + e_QLPC(t)`) + §3.9 (the constant-
+//!   block sentinel) + §3 narrative (the bit-budget formula via the
+//!   per-command wire layout).
 //! * `docs/audio/shorten/spec/02-variable-length-coding.md` §2.1
 //!   (`uvar(n)` length formula `⌊v / 2^n⌋ + 1 + n` — the source of
 //!   the Rice-n cost metric) + §2.2 (`svar(n)` folding) + §4.2
-//!   (per-block Rice-parameter width's TR.156 §3.3 anchor).
-//! * `docs/audio/shorten/spec/05-state-and-quirks.md` §2.3 (DIFF0
-//!   residual `e₀(t) = s(t) − μ_chan`) + §2.4 (ZERO emits `μ_chan`
-//!   for `bs` samples) + §3.1 (energy field's `+1` mantissa-width
-//!   rule and the consistency note that the smallest sensible width
-//!   is 1 not 0, anchoring the search at `e = 0`).
+//!   (per-block Rice-parameter width's TR.156 §3.3 anchor) + §4.3
+//!   (`LPCQSIZE = 2`, the per-block-order field width) + §4.4
+//!   (`LPCQUANT = 2`, the per-coefficient field width).
+//! * `docs/audio/shorten/spec/05-state-and-quirks.md` §2 (the
+//!   mean-invariance argument that anchors QLPC's no-`mu_chan`
+//!   signature alongside DIFF1..3) + §2.3 (DIFF0 residual
+//!   `e₀(t) = s(t) − μ_chan`) + §2.4 (ZERO emits `μ_chan` for `bs`
+//!   samples) + §3.1 (energy field's `+1` mantissa-width rule and the
+//!   consistency note that the smallest sensible width is 1 not 0,
+//!   anchoring the search at `e = 0`).
 
 use crate::bitwriter::BitWriter;
 use crate::block::FNSIZE;
 use crate::encoder::{
-    optimal_energy_for_residuals, residual_bits_at_energy, write_diff0_block, write_diff1_block,
-    write_diff2_block, write_diff3_block, write_zero_block, EncodeResult, FN_DIFF0, FN_DIFF1,
-    FN_DIFF2, FN_DIFF3, FN_ZERO,
+    optimal_energy_for_residuals, qlpc_residuals, residual_bits_at_energy, write_diff0_block,
+    write_diff1_block, write_diff2_block, write_diff3_block, write_qlpc_block, write_zero_block,
+    EncodeResult, FN_DIFF0, FN_DIFF1, FN_DIFF2, FN_DIFF3, FN_QLPC, FN_ZERO, MAX_QLPC_ORDER,
 };
-use crate::predictor::{ChannelCarry, ENERGYSIZE};
+use crate::predictor::{ChannelCarry, ENERGYSIZE, LPCQSIZE, LPCQUANT};
 
 /// A predictor-selection outcome the sequencer returns.
 ///
@@ -120,6 +137,38 @@ pub enum Choice {
     /// (`spec/03` §3.4,
     /// residual `e₃(t) = s(t) − (3·s(t − 1) − 3·s(t − 2) + s(t − 3))`).
     Diff3 { energy: u32, bits: u64 },
+    /// `BLOCK_FN_QLPC` — quantised-LPC predictor (`spec/03` §3.5,
+    /// residual `e_QLPC(t) = s(t) − Σᵢ coefs[i] · s(t − i − 1)`).
+    ///
+    /// The variant carries the caller-supplied quantised coefficient
+    /// vector so [`write_selected_block`] can dispatch the command
+    /// without a separate coefficient parameter. The variant's
+    /// `energy` is the Rice-n statistical optimum over the QLPC
+    /// residual stream (TR.156 §3.3), matching the DIFFn family's
+    /// `energy` semantics.
+    ///
+    /// Selected only when [`select_predictor_with_qlpc`] or
+    /// [`evaluate_candidates_with_qlpc`] is called with
+    /// `qlpc_candidate = Some(coefs)`; the round-251 entry points
+    /// [`select_predictor`] / [`evaluate_candidates`] never produce
+    /// this variant.
+    Qlpc {
+        /// Per-block quantised LPC coefficients (`coefs[i] = aᵢ₊₁`,
+        /// applied to `s(t − i − 1)` per `spec/03` §3.5). Carried by
+        /// value so the dispatch path is self-contained — the caller
+        /// supplies the vector once to the selector, and
+        /// [`write_selected_block`] consumes it from the variant
+        /// without a second hand-off.
+        coefs: Vec<i64>,
+        /// Encoded energy parameter the writer will use; the
+        /// per-sample mantissa width is `energy + 1`.
+        energy: u32,
+        /// Total encoded bit count (function code + per-block
+        /// `uvar(LPCQSIZE)` order field + `order × svar(LPCQUANT)`
+        /// coefficient fields + `uvar(ENERGYSIZE)` energy field +
+        /// `bs × svar(energy + 1)` residuals).
+        bits: u64,
+    },
 }
 
 impl Choice {
@@ -131,10 +180,12 @@ impl Choice {
             Self::Diff1 { bits, .. } => bits,
             Self::Diff2 { bits, .. } => bits,
             Self::Diff3 { bits, .. } => bits,
+            Self::Qlpc { bits, .. } => bits,
         }
     }
 
-    /// Function-code numeric value (one of `FN_DIFF0..3` / `FN_ZERO`).
+    /// Function-code numeric value (one of `FN_DIFF0..3` / `FN_ZERO`
+    /// / `FN_QLPC`).
     pub fn function_code(&self) -> u32 {
         match self {
             Self::Zero { .. } => FN_ZERO,
@@ -142,6 +193,7 @@ impl Choice {
             Self::Diff1 { .. } => FN_DIFF1,
             Self::Diff2 { .. } => FN_DIFF2,
             Self::Diff3 { .. } => FN_DIFF3,
+            Self::Qlpc { .. } => FN_QLPC,
         }
     }
 }
@@ -160,7 +212,6 @@ fn uvar_bits(value: u32, n: u32) -> u64 {
 ///
 /// Returns `None` if the folded magnitude overflows `u32` (the
 /// natural-energy auto-selection rejects such residuals upstream).
-#[cfg(test)]
 fn svar_bits(value: i64, n: u32) -> Option<u64> {
     let u: u64 = if value >= 0 {
         (value as u64).checked_shl(1)?
@@ -311,6 +362,74 @@ fn evaluate_zero(samples: &[i32], mu_chan: i64) -> Option<Choice> {
     })
 }
 
+/// Compute the `QLPC` candidate for a block per `spec/03` §3.5.
+///
+/// Wire layout (matches [`crate::write_qlpc_block`]): `uvar(FNSIZE)`
+/// over `FN_QLPC` + `uvar(LPCQSIZE)` over `coefs.len()` +
+/// `coefs.len() × svar(LPCQUANT)` over each quantised coefficient +
+/// `uvar(ENERGYSIZE)` over the chosen energy + `bs × svar(energy + 1)`
+/// over the residuals. The energy is the Rice-n statistical optimum
+/// over the residual stream (TR.156 §3.3, identical to the DIFFn
+/// family's selection rule).
+///
+/// Returns `None` when:
+/// * `samples.is_empty()` — no residuals to score.
+/// * `coefs.len()` exceeds [`MAX_QLPC_ORDER`] or `carry.len()` (matches
+///   [`crate::write_qlpc_block`]'s `LpcOrderTooLarge` precondition).
+/// * Any quantised coefficient overflows the `svar(LPCQUANT)` folding
+///   (the writer would reject it; the sequencer must skip the
+///   candidate so the selector falls back to DIFFn).
+/// * Computing the residual stream surfaces an error from
+///   [`qlpc_residuals`] (mirrors the writer's eligibility).
+/// * No `e ∈ 0..=MAX_NATURAL_ENERGY` yields a finite residual bit
+///   count (every folded residual would overflow).
+///
+/// `coefs` is cloned into the returned `Choice::Qlpc` so the variant
+/// is self-contained for the [`write_selected_block`] dispatch path —
+/// the caller hands the vector to the selector once, and the writer
+/// reads it back from the variant.
+fn evaluate_qlpc(samples: &[i32], coefs: &[i64], carry: &ChannelCarry) -> Option<Choice> {
+    if samples.is_empty() {
+        return None;
+    }
+    let order = coefs.len();
+    if order > MAX_QLPC_ORDER as usize || order > carry.len() {
+        return None;
+    }
+    // Cost of the per-block-order field: uvar(LPCQSIZE = 2) over
+    // `order`. The decoder reads it before the coefficient stream, so
+    // an order outside the field's representable range would also be
+    // a wire-format violation — but the MAX_QLPC_ORDER cap above
+    // pre-emptively bounds us well under the field's natural
+    // representation.
+    let order_field_bits = uvar_bits(order as u32, LPCQSIZE);
+    // Cost of the coefficient stream: each coefficient is svar(LPCQUANT).
+    // A coefficient whose folded magnitude overflows u32 is skipped —
+    // the writer would surface CoefficientOutOfRange; the sequencer
+    // mirrors that by dropping the candidate so the selector falls
+    // back to DIFFn.
+    let mut coef_bits: u64 = 0;
+    for &c in coefs {
+        coef_bits = coef_bits.checked_add(svar_bits(c, LPCQUANT)?)?;
+    }
+    // Residual stream: e_QLPC(t) = s(t) − Σᵢ coefs[i] · s(t − i − 1).
+    let residuals = qlpc_residuals(samples, coefs, carry).ok()?;
+    let (energy, residual_bits) = optimal_energy_and_residual_bits(&residuals)?;
+    // Function-code + energy prefix matches the DIFFn family.
+    let fn_prefix_bits = uvar_bits(FN_QLPC, FNSIZE);
+    let energy_field_bits = uvar_bits(energy, ENERGYSIZE);
+    let bits = fn_prefix_bits
+        .checked_add(order_field_bits)?
+        .checked_add(coef_bits)?
+        .checked_add(energy_field_bits)?
+        .checked_add(residual_bits)?;
+    Some(Choice::Qlpc {
+        coefs: coefs.to_vec(),
+        energy,
+        bits,
+    })
+}
+
 /// Compute every candidate's bit cost for the block and return them
 /// in priority order (ZERO first, then DIFF0..3). Useful for
 /// inspection / debugging; [`select_predictor`] picks the cheapest.
@@ -318,8 +437,49 @@ fn evaluate_zero(samples: &[i32], mu_chan: i64) -> Option<Choice> {
 /// A candidate that doesn't fit a natural energy or doesn't satisfy
 /// its eligibility predicate (ZERO requires the all-`mu_chan`
 /// invariant) is dropped from the returned list.
+///
+/// This entry point does **not** evaluate `BLOCK_FN_QLPC`. Use
+/// [`evaluate_candidates_with_qlpc`] (passing a candidate coefficient
+/// vector) to add QLPC to the listing.
 pub fn evaluate_candidates(samples: &[i32], mu_chan: i64, carry: &ChannelCarry) -> Vec<Choice> {
-    let mut out: Vec<Choice> = Vec::with_capacity(5);
+    evaluate_candidates_with_qlpc(samples, mu_chan, carry, None)
+}
+
+/// Compute every candidate's bit cost for the block, including the
+/// optional `BLOCK_FN_QLPC` candidate, and return them in priority
+/// order `ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3 > QLPC`.
+///
+/// When `qlpc_candidate` is `Some(coefs)`, the sequencer scores the
+/// QLPC command at the Rice-n optimum over the residual stream
+/// `e_QLPC(t) = s(t) − Σᵢ coefs[i] · s(t − i − 1)` (TR.156 §3.3 +
+/// `spec/03` §3.5) and appends it to the candidate list. The caller
+/// retains ownership of coefficient quantisation per `spec/03` §3.5
+/// and TR.156 §3.2; the sequencer treats `coefs` as opaque.
+///
+/// When `qlpc_candidate` is `None`, the behaviour is identical to
+/// [`evaluate_candidates`] — a load-bearing backward-compat invariant
+/// the in-module test
+/// `select_with_qlpc_none_matches_legacy_select_predictor` pins
+/// directly.
+///
+/// A QLPC candidate is dropped from the list (and the selector falls
+/// back to DIFFn) when any of:
+/// * `coefs.len() > MAX_QLPC_ORDER` ([`crate::write_qlpc_block`]'s
+///   cap).
+/// * `coefs.len() > carry.len()` (the predictor cannot seed enough
+///   past samples; mirrors
+///   [`crate::EncodeError::LpcOrderTooLarge`]).
+/// * Any coefficient overflows the `svar(LPCQUANT)` folding.
+/// * The residual stream contains a value the `svar` folding
+///   overflows.
+/// * No `e ∈ 0..=MAX_NATURAL_ENERGY` fits the residual stream.
+pub fn evaluate_candidates_with_qlpc(
+    samples: &[i32],
+    mu_chan: i64,
+    carry: &ChannelCarry,
+    qlpc_candidate: Option<&[i64]>,
+) -> Vec<Choice> {
+    let mut out: Vec<Choice> = Vec::with_capacity(6);
     if let Some(c) = evaluate_zero(samples, mu_chan) {
         out.push(c);
     }
@@ -334,6 +494,11 @@ pub fn evaluate_candidates(samples: &[i32], mu_chan: i64, carry: &ChannelCarry) 
     }
     if let Some(c) = evaluate_diff3(samples, carry) {
         out.push(c);
+    }
+    if let Some(coefs) = qlpc_candidate {
+        if let Some(c) = evaluate_qlpc(samples, coefs, carry) {
+            out.push(c);
+        }
     }
     out
 }
@@ -366,6 +531,10 @@ pub fn evaluate_candidates(samples: &[i32], mu_chan: i64, carry: &ChannelCarry) 
 /// the DIFF1..3 residual scans seed their recurrence windows from
 /// `carry.at(0)` / `carry.at(1)` / `carry.at(2)` respectively.
 ///
+/// This entry point does **not** evaluate `BLOCK_FN_QLPC`. Use
+/// [`select_predictor_with_qlpc`] (passing a candidate coefficient
+/// vector) to add QLPC to the selection.
+///
 /// ## Empty block
 ///
 /// An empty `samples` slice returns `None` because no predictor's
@@ -374,13 +543,48 @@ pub fn evaluate_candidates(samples: &[i32], mu_chan: i64, carry: &ChannelCarry) 
 /// (`spec/03` §3.6 rejects `new_bs = 0` and `spec/01` §3 pins
 /// `H_blocksize ≥ 1`).
 pub fn select_predictor(samples: &[i32], mu_chan: i64, carry: &ChannelCarry) -> Option<Choice> {
+    select_predictor_with_qlpc(samples, mu_chan, carry, None)
+}
+
+/// Pick the cheapest predictor for the block among `DIFF0..3`,
+/// `ZERO`, and (when `qlpc_candidate` is `Some`) `QLPC`, and return a
+/// [`Choice`] the caller hands to [`write_selected_block`].
+///
+/// Per the selection criterion the candidate with the smallest total
+/// encoded bit count wins; ties break in priority order
+/// `ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3 > QLPC`. QLPC sits last
+/// because of its larger fixed overhead — the `uvar(LPCQSIZE)` order
+/// field plus the `order × svar(LPCQUANT)` coefficient field add a
+/// per-block constant the DIFFn family doesn't pay — so a tied total
+/// cost is broken in favour of the simpler command.
+///
+/// `qlpc_candidate` carries the caller's already-quantised per-block
+/// coefficient vector (`coefs[i] = aᵢ₊₁`, applied to `s(t − i − 1)`
+/// per `spec/03` §3.5 / TR.156 §3.2 first equation). The selector
+/// treats the vector as opaque: deriving the optimal quantised
+/// coefficients from raw samples is a separate, higher-layer concern
+/// per TR.156 §3.2's Laplacian-distribution rule.
+///
+/// When `qlpc_candidate` is `None`, the behaviour is identical to
+/// [`select_predictor`] — a load-bearing backward-compat invariant
+/// the in-module test
+/// `select_with_qlpc_none_matches_legacy_select_predictor` pins
+/// directly.
+///
+/// Returns `None` when no candidate fits.
+pub fn select_predictor_with_qlpc(
+    samples: &[i32],
+    mu_chan: i64,
+    carry: &ChannelCarry,
+    qlpc_candidate: Option<&[i64]>,
+) -> Option<Choice> {
     if samples.is_empty() {
         return None;
     }
-    let candidates = evaluate_candidates(samples, mu_chan, carry);
+    let candidates = evaluate_candidates_with_qlpc(samples, mu_chan, carry, qlpc_candidate);
     // Tie-breaker: stable min_by returns the first element on a tie,
-    // and `evaluate_candidates` produces candidates in priority order
-    // ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3.
+    // and `evaluate_candidates_with_qlpc` produces candidates in
+    // priority order ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3 > QLPC.
     candidates
         .into_iter()
         .min_by(|a, b| a.bits().cmp(&b.bits()))
@@ -404,15 +608,18 @@ pub fn write_selected_block(
     mu_chan: i64,
     carry: &ChannelCarry,
 ) -> EncodeResult<()> {
-    match *choice {
+    match choice {
         Choice::Zero { .. } => {
             write_zero_block(writer);
             Ok(())
         }
-        Choice::Diff0 { energy, .. } => write_diff0_block(writer, energy, samples, mu_chan),
-        Choice::Diff1 { energy, .. } => write_diff1_block(writer, energy, samples, carry),
-        Choice::Diff2 { energy, .. } => write_diff2_block(writer, energy, samples, carry),
-        Choice::Diff3 { energy, .. } => write_diff3_block(writer, energy, samples, carry),
+        Choice::Diff0 { energy, .. } => write_diff0_block(writer, *energy, samples, mu_chan),
+        Choice::Diff1 { energy, .. } => write_diff1_block(writer, *energy, samples, carry),
+        Choice::Diff2 { energy, .. } => write_diff2_block(writer, *energy, samples, carry),
+        Choice::Diff3 { energy, .. } => write_diff3_block(writer, *energy, samples, carry),
+        Choice::Qlpc { coefs, energy, .. } => {
+            write_qlpc_block(writer, *energy, coefs, samples, carry)
+        }
     }
 }
 
@@ -686,5 +893,290 @@ mod tests {
         let samples: Vec<i32> = vec![];
         let carry = ChannelCarry::new(3);
         assert!(select_predictor(&samples, 0, &carry).is_none());
+    }
+
+    // ---- round 266: QLPC auto-selection ----
+
+    #[test]
+    fn select_with_qlpc_none_matches_legacy_select_predictor() {
+        // Backward-compat invariant: passing `None` to
+        // select_predictor_with_qlpc must produce a Choice equal to
+        // the legacy select_predictor on the same inputs across a
+        // representative spread of blocks.
+        let carry = ChannelCarry::new(3);
+        let test_blocks: Vec<Vec<i32>> = vec![
+            vec![0; 8],                          // ZERO-eligible
+            vec![7; 6],                          // DIFF0 only (mu = 0)
+            vec![0, 1, 2, 3, 4, 5, 6, 7],        // small ramp
+            (0..32i32).map(|t| 5 * t).collect(), // arithmetic ramp
+            vec![3, 0, 0, 0],                    // sparse seed-jump
+            vec![1, -1, 2, -2, 3, -3, 4, -4],    // alternating
+        ];
+        for (i, samples) in test_blocks.iter().enumerate() {
+            for &mu in &[0i64, 3, 7] {
+                let legacy = select_predictor(samples, mu, &carry);
+                let with_none = select_predictor_with_qlpc(samples, mu, &carry, None);
+                assert_eq!(
+                    legacy, with_none,
+                    "block {i} mu {mu}: select_predictor != select_predictor_with_qlpc(.., None)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn qlpc_candidate_skipped_when_order_exceeds_carry_len() {
+        // carry has 3 slots; a 4-element coefficient vector cannot
+        // seed the predictor. evaluate_candidates_with_qlpc must drop
+        // the QLPC candidate so the selector falls back to DIFFn.
+        let carry = ChannelCarry::new(3);
+        let samples: Vec<i32> = (0..16i32).collect();
+        let coefs: Vec<i64> = vec![1, 0, 0, 0]; // 4-element vector
+        let cands = evaluate_candidates_with_qlpc(&samples, 0, &carry, Some(&coefs));
+        assert!(
+            !cands.iter().any(|c| matches!(c, Choice::Qlpc { .. })),
+            "QLPC candidate must be skipped when coefs.len() > carry.len(); got {cands:?}"
+        );
+        // Selector must still produce a non-QLPC choice.
+        let choice = select_predictor_with_qlpc(&samples, 0, &carry, Some(&coefs)).unwrap();
+        assert!(!matches!(choice, Choice::Qlpc { .. }));
+    }
+
+    #[test]
+    fn qlpc_candidate_skipped_when_order_exceeds_max_qlpc_order() {
+        // A coefs vector longer than MAX_QLPC_ORDER would be rejected
+        // by write_qlpc_block; evaluate_qlpc mirrors that rule and
+        // drops the candidate. Use a carry large enough that the
+        // carry-length check doesn't fire first.
+        let carry = ChannelCarry::new((MAX_QLPC_ORDER as usize) + 2);
+        let samples: Vec<i32> = vec![0; 16];
+        let coefs: Vec<i64> = vec![0; (MAX_QLPC_ORDER as usize) + 1];
+        let cands = evaluate_candidates_with_qlpc(&samples, 0, &carry, Some(&coefs));
+        assert!(
+            !cands.iter().any(|c| matches!(c, Choice::Qlpc { .. })),
+            "QLPC candidate must be skipped when coefs.len() > MAX_QLPC_ORDER"
+        );
+    }
+
+    #[test]
+    fn qlpc_candidate_skipped_on_empty_samples() {
+        let carry = ChannelCarry::new(3);
+        let samples: Vec<i32> = vec![];
+        let coefs: Vec<i64> = vec![1, -1];
+        assert!(evaluate_qlpc(&samples, &coefs, &carry).is_none());
+        // Selector still returns None overall.
+        assert!(select_predictor_with_qlpc(&samples, 0, &carry, Some(&coefs)).is_none());
+    }
+
+    #[test]
+    fn zero_still_wins_over_qlpc_on_constant_mu_block() {
+        // A constant-mu_chan block is ZERO-eligible; even with a
+        // tempting QLPC candidate the 5-bit ZERO token must win on
+        // total bit cost.
+        let carry = ChannelCarry::new(3);
+        let samples = vec![7i32; 8];
+        let coefs: Vec<i64> = vec![1, 0]; // any well-formed candidate
+        let choice = select_predictor_with_qlpc(&samples, 7, &carry, Some(&coefs)).unwrap();
+        assert!(matches!(choice, Choice::Zero { bits: 5 }));
+    }
+
+    #[test]
+    fn qlpc_chosen_when_residuals_beat_diff_family() {
+        // Construct a block where the QLPC candidate matches the
+        // underlying generating recurrence and produces all-zero
+        // residuals — the cheapest possible residual stream. The
+        // DIFFn family must NOT also match the recurrence, or it
+        // would win on its lower fixed overhead.
+        //
+        // Use a Fibonacci-style recurrence s(t) = s(t-1) + s(t-2)
+        // (coefs [1, 1]). With carry seed [10, 5] the stream is
+        //   s(0) = 10 + 5 = 15
+        //   s(1) = 15 + 10 = 25
+        //   s(2) = 25 + 15 = 40
+        //   s(3) = 40 + 25 = 65
+        //   s(4) = 65 + 40 = 105
+        //   ...
+        // QLPC residuals under coefs [1, 1] are zero by construction;
+        // DIFFn residuals (first / second / third differences of a
+        // Fibonacci-like stream) are themselves Fibonacci-like and
+        // grow without bound — not sparse enough to beat QLPC's
+        // all-zero residual stream even at QLPC's larger fixed
+        // overhead.
+        let mut carry = ChannelCarry::new(3);
+        carry.update_after_block(&[5, 10]); // carry.at(0)=10, at(1)=5
+        let mut samples: Vec<i32> = Vec::new();
+        let mut a = 5i32;
+        let mut b = 10i32;
+        for _ in 0..16 {
+            let next = a + b;
+            samples.push(next);
+            a = b;
+            b = next;
+        }
+        let coefs: Vec<i64> = vec![1, 1];
+
+        // Verify the QLPC residuals are all zero under the chosen coefs.
+        let residuals = qlpc_residuals(&samples, &coefs, &carry).unwrap();
+        assert!(
+            residuals.iter().all(|&r| r == 0),
+            "test setup: expected all-zero QLPC residuals, got {residuals:?}"
+        );
+
+        let choice = select_predictor_with_qlpc(&samples, 0, &carry, Some(&coefs)).unwrap();
+        match &choice {
+            Choice::Qlpc {
+                coefs: chosen,
+                energy,
+                bits,
+            } => {
+                assert_eq!(chosen, &coefs);
+                assert_eq!(*energy, 0);
+                // Residual cost at e=0 with all-zero folded values:
+                // svar(1) over 0 is 2 bits per sample.
+                let residual_bits = (samples.len() as u64) * 2;
+                // Fixed cost: fn(uvar(2) over 7) + order_field
+                // (uvar(2) over 2) + coef_stream (2 × svar(2) over
+                // signed coefficient 1) + energy_field (uvar(3)
+                // over 0).
+                let order_field_bits = uvar_bits(coefs.len() as u32, LPCQSIZE);
+                let coef_stream_bits: u64 =
+                    coefs.iter().map(|&c| svar_bits(c, LPCQUANT).unwrap()).sum();
+                let fn_prefix_bits = uvar_bits(FN_QLPC, FNSIZE);
+                let energy_field_bits = uvar_bits(0, ENERGYSIZE);
+                let expected = fn_prefix_bits
+                    + order_field_bits
+                    + coef_stream_bits
+                    + energy_field_bits
+                    + residual_bits;
+                assert_eq!(*bits, expected);
+            }
+            other => panic!("expected QLPC variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_wins_over_qlpc_when_qlpc_overhead_dominates() {
+        // A QLPC candidate that doesn't help (zero-coefficient vector
+        // → QLPC residuals equal the samples themselves) must not
+        // displace a cheaper DIFFn candidate. The exact DIFFn winner
+        // (DIFF1 / DIFF2 / DIFF3) depends on which polynomial order
+        // the sample stream collapses, but it must always beat QLPC's
+        // higher fixed overhead on the same residual stream.
+        let carry = ChannelCarry::new(3);
+        let samples: Vec<i32> = vec![0, 1, 2, 3, 4, 5, 6, 7];
+        let coefs: Vec<i64> = vec![0, 0]; // zero predictor → QLPC residuals == samples
+
+        let cands = evaluate_candidates_with_qlpc(&samples, 0, &carry, Some(&coefs));
+        // QLPC must be in the candidate list (well-formed).
+        let qlpc_cost = cands
+            .iter()
+            .find_map(|c| {
+                if let Choice::Qlpc { bits, .. } = c {
+                    Some(*bits)
+                } else {
+                    None
+                }
+            })
+            .expect("QLPC candidate present");
+        // Find the cheapest DIFFn candidate.
+        let cheapest_diff_cost = cands
+            .iter()
+            .filter_map(|c| match c {
+                Choice::Diff0 { bits, .. }
+                | Choice::Diff1 { bits, .. }
+                | Choice::Diff2 { bits, .. }
+                | Choice::Diff3 { bits, .. } => Some(*bits),
+                _ => None,
+            })
+            .min()
+            .expect("at least one DIFFn candidate present");
+        assert!(
+            cheapest_diff_cost < qlpc_cost,
+            "cheapest DIFFn ({cheapest_diff_cost} bits) must beat zero-predictor QLPC ({qlpc_cost} bits)"
+        );
+        let choice = select_predictor_with_qlpc(&samples, 0, &carry, Some(&coefs)).unwrap();
+        // The selector must pick a DIFFn, not the zero-predictor QLPC.
+        assert!(
+            !matches!(choice, Choice::Qlpc { .. }),
+            "selector must avoid the zero-predictor QLPC, got {choice:?}\ncandidates = {cands:?}"
+        );
+    }
+
+    #[test]
+    fn qlpc_tie_breaks_below_diff3() {
+        // Construct a scenario where DIFF3 and QLPC report identical
+        // total bit costs; the priority order requires DIFF3 to win.
+        // We don't need a natural construction — we can directly
+        // synthesise two candidates with equal bits and check the
+        // tie-break by feeding evaluate_candidates' output through
+        // min_by directly.
+        let d3 = Choice::Diff3 {
+            energy: 1,
+            bits: 100,
+        };
+        let q = Choice::Qlpc {
+            coefs: vec![1, -1],
+            energy: 1,
+            bits: 100,
+        };
+        // The candidate list as evaluate_candidates_with_qlpc would
+        // emit it (priority order).
+        let candidates = vec![d3.clone(), q.clone()];
+        let winner = candidates
+            .into_iter()
+            .min_by(|a, b| a.bits().cmp(&b.bits()))
+            .unwrap();
+        assert_eq!(
+            winner, d3,
+            "tie-break must favour DIFF3 (priority) over QLPC"
+        );
+    }
+
+    #[test]
+    fn write_selected_for_qlpc_emits_choice_bits_count() {
+        // After a QLPC selection, the actual writer bit count must
+        // equal Choice::bits() — load-bearing for higher-layer rate
+        // planners (round-251 precedent extended to QLPC).
+        //
+        // Use the same Fibonacci-style construction as
+        // qlpc_chosen_when_residuals_beat_diff_family so the
+        // selector actually picks QLPC.
+        let mut carry = ChannelCarry::new(3);
+        carry.update_after_block(&[5, 10]); // seed carry to [10, 5]
+        let mut samples: Vec<i32> = Vec::new();
+        let mut a = 5i32;
+        let mut b = 10i32;
+        for _ in 0..16 {
+            let next = a + b;
+            samples.push(next);
+            a = b;
+            b = next;
+        }
+        let coefs: Vec<i64> = vec![1, 1]; // matches the recurrence
+
+        let choice = select_predictor_with_qlpc(&samples, 0, &carry, Some(&coefs)).unwrap();
+        assert!(matches!(choice, Choice::Qlpc { .. }));
+        let mut writer = BitWriter::new();
+        let before = writer.bits_written();
+        write_selected_block(&mut writer, &choice, &samples, 0, &carry).unwrap();
+        let after = writer.bits_written();
+        assert_eq!(after - before, choice.bits());
+    }
+
+    #[test]
+    fn evaluate_candidates_with_qlpc_includes_qlpc_when_eligible() {
+        // The QLPC candidate must appear in the listing when supplied
+        // and eligible; positioned last per priority order.
+        let mut carry = ChannelCarry::new(3);
+        carry.update_after_block(&[5, 10]);
+        let samples: Vec<i32> = (0..16i32).map(|t| 15 + 5 * t).collect();
+        let coefs: Vec<i64> = vec![2, -1];
+
+        let cands = evaluate_candidates_with_qlpc(&samples, 0, &carry, Some(&coefs));
+        // The last candidate must be QLPC (priority order ends with it).
+        match cands.last().expect("non-empty candidate list") {
+            Choice::Qlpc { .. } => {}
+            other => panic!("expected QLPC last, got {other:?}"),
+        }
     }
 }

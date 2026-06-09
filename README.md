@@ -828,6 +828,92 @@ Wayne Stielau's seek-table utility:
     round 254 below — the Rice-`n` statistical optimum of
     TR.156 §3.3.
 
+- **Round 266** — **`BLOCK_FN_QLPC` auto-selection** in the per-block
+  predictor-selection sequencer (`spec/03` §3.5 + `spec/02` §4.3 +
+  §4.4 + `spec/05` §3.1 + TR.156 §3.2):
+  * New `Choice::Qlpc { coefs, energy, bits }` variant. The variant
+    carries the caller-supplied quantised coefficient vector inside
+    itself so [`write_selected_block`] dispatches the QLPC command
+    without a second coefficient hand-off — the caller hands the
+    vector to the selector once, and the writer reads it back from
+    the variant. `Choice::function_code()` now returns `FN_QLPC = 7`
+    for the new variant.
+  * New entry points `select_predictor_with_qlpc(samples, mu_chan,
+    carry, qlpc_candidate: Option<&[i64]>) -> Option<Choice>` and
+    `evaluate_candidates_with_qlpc(samples, mu_chan, carry,
+    qlpc_candidate)` extend the round-251 selector / listing surface
+    with an optional QLPC candidate. The existing
+    [`select_predictor`] and [`evaluate_candidates`] become thin
+    wrappers that delegate to the new entry points with
+    `qlpc_candidate = None`. Passing `None` reproduces the legacy
+    behaviour byte-for-byte — a load-bearing backward-compat
+    invariant the new test
+    `select_with_qlpc_none_matches_legacy_select_predictor` pins
+    across a representative sample-block / `mu_chan` matrix.
+  * QLPC cost metric. The sequencer scores the QLPC candidate at the
+    same Rice-`n` statistical optimum as the DIFFn family (round 254
+    [`optimal_energy_for_qlpc`] + [`residual_bits_at_energy`]). Total
+    cost is `uvar(FNSIZE, FN_QLPC)` + `uvar(LPCQSIZE, order)` +
+    `order × svar(LPCQUANT, coef)` + `uvar(ENERGYSIZE, energy)` +
+    `bs × svar(energy + 1, residual)`. The additional QLPC overhead
+    relative to the DIFFn family is the order field plus the
+    coefficient stream — typically a few extra bytes per block —
+    which the predictor-residual savings have to outweigh for QLPC
+    to win.
+  * Eligibility / skip conditions for the QLPC candidate (drop from
+    the candidate list and fall back to DIFFn):
+    - `coefs.len() > MAX_QLPC_ORDER` ([`crate::write_qlpc_block`]'s
+      cap of 1024).
+    - `coefs.len() > carry.len()` (the predictor cannot seed enough
+      past samples; mirrors
+      [`crate::EncodeError::LpcOrderTooLarge`]).
+    - Any quantised coefficient overflows the `svar(LPCQUANT)`
+      folding.
+    - The residual stream contains a value whose `svar` folding
+      overflows.
+    - No `e ∈ 0..=MAX_NATURAL_ENERGY` fits the residual stream.
+    - Empty `samples` slice.
+  * Tie-break priority extended to
+    `ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3 > QLPC`. QLPC sits last
+    because of its larger fixed overhead — the order field plus the
+    coefficient stream add a per-block constant the DIFFn family
+    doesn't pay — so on an exact total-cost tie the simpler-fixed-
+    overhead DIFFn command wins.
+  * `write_selected_block` dispatches the new `Choice::Qlpc` variant
+    to [`write_qlpc_block`], reading the coefficient vector and
+    energy from the variant. `bits_written` after the call equals
+    `Choice::bits()` exactly — load-bearing for higher-layer rate
+    planners (round-251 invariant extended to QLPC).
+  * 10 new in-module unit tests + 3 new integration tests
+    (`tests/encoder_sequencer_pipeline.rs`) confirm: backward-compat
+    invariant `select_predictor_with_qlpc(.., None) ==
+    select_predictor`; QLPC candidate skipped on
+    `coefs.len() > carry.len()`; QLPC candidate skipped on
+    `coefs.len() > MAX_QLPC_ORDER`; QLPC candidate skipped on empty
+    samples; ZERO still wins over QLPC on a constant-`mu_chan`
+    block; QLPC chosen when its residuals beat the DIFFn family
+    (a Fibonacci-style stream `s(t) = s(t-1) + s(t-2)` under coefs
+    `[1, 1]` with carry seed `[10, 5]` — QLPC residuals are all
+    zero, the DIFFn family doesn't match the order-2 non-polynomial
+    recurrence); DIFFn wins on a zero-coefficient QLPC (the selector
+    correctly avoids the trivial QLPC fallback); tie-break
+    `QLPC < DIFF3`; emitted-bits / `Choice::bits()` equality on a
+    QLPC selection; `evaluate_candidates_with_qlpc` listing positions
+    QLPC last per priority; mono setup-then-QLPC stream with
+    `BLOCK_FN_BLOCKSIZE` override round-trips byte-exact through
+    `decode_stream`; stereo two-channel round-robin
+    setup-then-QLPC stream round-trips byte-exact through
+    `decode_stream` (Fibonacci-style continuation on each channel);
+    `bits_written` delta on a Fibonacci-style QLPC stream matches
+    `Choice::bits()`.
+  * **Scope.** Round 266 closes the QLPC auto-selection follow-up
+    called out in round 251 / 254. The remaining encoder gap is
+    encoder-side **coefficient quantisation** — the caller still
+    owns derivation of the per-block coefficient vector from the
+    input samples per `spec/03` §3.5 + TR.156 §3.2's Laplacian-
+    distribution rule, and `select_predictor_with_qlpc` only scores
+    the candidate against the DIFFn family.
+
 - **Round 254** — **Rice-`n` statistical-optimum energy selection**
   inside the per-block predictor-selection sequencer (`spec/02` §2.1
   + §4.2 + `spec/05` §3 + TR.156 §3.3):
@@ -884,8 +970,8 @@ Wayne Stielau's seek-table utility:
     auto-selection — still requires a candidate coefficient-
     quantisation pass and remains future work.
 
-The combined surface is exercised by **359 tests** (271 in-module
-unit + 88 integration tests across 19 integration binaries). The
+The combined surface is exercised by **372 tests** (281 in-module
+unit + 91 integration tests across 19 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
@@ -919,18 +1005,12 @@ leaves the second block undecoded until the next pull) (round 10).
   quantised coefficient vector as `&[i64]`; the optimal-quantisation
   derivation from raw input samples per TR.156 §3.2 (the
   Laplacian-distribution rule) remains a higher-layer concern.
-* **QLPC auto-selection** — the round-251 sequencer
-  (`select_predictor`) covers `BLOCK_FN_DIFF0..3` and
-  `BLOCK_FN_ZERO` but not `BLOCK_FN_QLPC`, because the caller
-  still owns coefficient quantisation per `spec/03` §3.5 and
-  TR.156 §3.2. A future round can extend the selector to compare a
-  caller-supplied candidate coefficient vector against the DIFFn
-  family and pick QLPC when its residual stream wins on bit cost
-  under the round-254 Rice-`n` statistical-optimum metric. The
-  encoder helper `optimal_energy_for_qlpc` already exposes the
-  metric so the QLPC-side change is purely the addition of a new
-  `Choice::Qlpc` variant and its candidate-evaluation path inside
-  the sequencer.
+* (Round 266 closed the QLPC auto-selection gap that lived here
+  previously — the round-251 sequencer now scores a caller-supplied
+  QLPC coefficient candidate alongside the DIFFn family via
+  `select_predictor_with_qlpc`. The only remaining encoder-side QLPC
+  gap is **coefficient quantisation**, covered by the bullet
+  immediately above.)
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking

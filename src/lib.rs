@@ -313,7 +313,10 @@ pub use crate::predictor::{
     decode_diff_block, decode_qlpc_block, fill_zero_block, ChannelCarry, MeanEstimator, PolyOrder,
     CARRY_LEN_FLOOR, ENERGYSIZE, LPCQSIZE, LPCQUANT,
 };
-pub use crate::sequencer::{evaluate_candidates, select_predictor, write_selected_block, Choice};
+pub use crate::sequencer::{
+    evaluate_candidates, evaluate_candidates_with_qlpc, select_predictor,
+    select_predictor_with_qlpc, write_selected_block, Choice,
+};
 pub use crate::sidecar::{
     detect_shnampsk_trailer, split_off_shnampsk_trailer, ShnampskTrailer, MIN_SIDECAR_LEN,
     SEEK_MAGIC, SHNAMPSK_SIGNATURE, SIDECAR_LEN_CAP, TRAILER_TAIL_LEN,

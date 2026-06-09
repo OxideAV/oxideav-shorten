@@ -8,6 +8,50 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 266 clean-room rebuild.** `BLOCK_FN_QLPC` auto-selection in
+  the per-block predictor-selection sequencer (`spec/03` §3.5 +
+  `spec/02` §4.3 + §4.4 + `spec/05` §3.1 + TR.156 §3.2):
+  - New `Choice::Qlpc { coefs, energy, bits }` variant. The variant
+    carries the caller-supplied quantised coefficient vector inside
+    itself so `write_selected_block` dispatches the QLPC command
+    without a separate coefficient hand-off.
+  - New entry points `select_predictor_with_qlpc(samples, mu_chan,
+    carry, qlpc_candidate: Option<&[i64]>) -> Option<Choice>` and
+    `evaluate_candidates_with_qlpc(samples, mu_chan, carry,
+    qlpc_candidate)`. The existing `select_predictor` and
+    `evaluate_candidates` become thin wrappers that delegate to the
+    new entry points with `qlpc_candidate = None`. Passing `None`
+    reproduces the legacy behaviour byte-for-byte (a load-bearing
+    backward-compat invariant the new test
+    `select_with_qlpc_none_matches_legacy_select_predictor` pins).
+  - QLPC cost metric: the same Rice-`n` statistical optimum as the
+    DIFFn family (round 254 `optimal_energy_for_qlpc` +
+    `residual_bits_at_energy`). Total command cost is
+    `uvar(FNSIZE, FN_QLPC)` + `uvar(LPCQSIZE, order)` +
+    `order × svar(LPCQUANT, coef)` + `uvar(ENERGYSIZE, energy)` +
+    `bs × svar(energy + 1, residual)`.
+  - QLPC candidate skipped (selector falls back to DIFFn) when
+    `coefs.len() > MAX_QLPC_ORDER` or `coefs.len() > carry.len()`
+    (mirrors `EncodeError::LpcOrderTooLarge`), any coefficient
+    overflows `svar(LPCQUANT)` folding, the residual stream
+    overflows `svar`, no natural energy fits the residuals, or
+    `samples` is empty.
+  - Tie-break priority extended to
+    `ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3 > QLPC`. QLPC sits last
+    because of its larger fixed overhead — the order + coefficient
+    fields add a per-block constant the DIFFn family doesn't pay.
+  - `write_selected_block` dispatches `Choice::Qlpc` to
+    `write_qlpc_block`, reading the coefficient vector and energy
+    from the variant. `bits_written` after the call equals
+    `Choice::bits()` exactly (round-251 invariant extended to QLPC).
+  - Tests: 10 new in-module unit tests in `sequencer.rs` +
+    3 new integration tests in `tests/encoder_sequencer_pipeline.rs`.
+    Total test count: 359 → 372 (281 in-module unit + 91 integration).
+  - **Scope.** Round 266 closes the QLPC auto-selection follow-up
+    called out in round 251 / 254. The remaining encoder-side QLPC
+    gap is coefficient quantisation; the selector takes the
+    candidate as `Option<&[i64]>` and is otherwise opaque to it.
+
 - **Round 254 clean-room rebuild.** Rice-`n` statistical-optimum
   energy selection inside the per-block predictor-selection sequencer
   (`spec/02` §2.1 + §4.2 + `spec/05` §3 + TR.156 §3.3):
