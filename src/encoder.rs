@@ -490,8 +490,9 @@ pub fn write_verbatim_block(writer: &mut BitWriter, payload: &[u8]) -> EncodeRes
 /// Emit the `BLOCK_FN_QUIT` command (function-code numeric `4`) to
 /// `writer` per `spec/03` §3.8 + `spec/04` §2.
 ///
-/// The QUIT command is a bare function-code field (5 bits under
-/// `uvar(FNSIZE = 2)` for the value 4). It terminates the bit stream;
+/// The QUIT command is a bare function-code field (4 bits: `uvar(FNSIZE
+/// = 2)` of value 4 = `0100`, per `spec/04` §2 + `spec/02` §2.1). It
+/// terminates the bit stream;
 /// the caller should follow this call with [`BitWriter::pad_to_byte`]
 /// to satisfy `spec/05` §4's zero-padding requirement.
 pub fn write_quit_command(writer: &mut BitWriter) {
@@ -1778,8 +1779,9 @@ mod tests {
     #[test]
     fn envelope_stream_quit_padded_to_byte_boundary() {
         // The last byte of an envelope-only stream contains the QUIT
-        // command's 5-bit pattern plus zero padding to the next byte
-        // boundary. The QUIT pattern starts at some bit position
+        // command's 4-bit pattern (`uvar(2)` of value 4 = `0100`, per
+        // spec/04 §2) plus zero padding to the next byte boundary.
+        // The QUIT pattern starts at some bit position
         // within the byte; the padding zeros fill the rest.
         let header = synth_header(2, 5, 1, 256, 0, 0, 0);
         let bytes = encode_envelope_stream(&header, &[]).expect("encode");
@@ -2969,6 +2971,62 @@ mod tests {
         let bytes = w.into_bytes();
         assert_eq!(bytes.len(), 1);
         assert_eq!(bytes[0] & 0b1111_1000, 0b0010_0000);
+    }
+
+    #[test]
+    fn write_quit_command_emits_uvar_of_four_four_bits() {
+        // spec/04 §2 + spec/02 §2.1: `BLOCK_FN_QUIT = 4` encodes as
+        // `uvar(FNSIZE = 2)` of value 4:
+        //   prefix-zero count = ⌊4/4⌋ = 1 → "0"
+        //   terminator = "1"
+        //   mantissa = 4 mod 4 = 0 over 2 bits → "00"
+        // Total bits = 1 + 1 + 2 = 4; pattern = `0100`. This is
+        // distinct from `BLOCK_FN_ZERO = 8`'s 5-bit `00100` — the two
+        // must not be confused (the spec/04 §2 narrative was corrected
+        // to pin this 4-bit form after an earlier `00100` typo).
+        let mut w = BitWriter::new();
+        write_quit_command(&mut w);
+        assert_eq!(w.bits_written(), 4, "QUIT is exactly 4 bits");
+
+        // At a fresh byte boundary the QUIT field occupies bits 7..4 of
+        // the first byte; pad_to_byte zero-fills bits 3..0 → `0100 0000`.
+        assert_eq!(w.pad_to_byte(), 4);
+        let bytes = w.into_bytes();
+        assert_eq!(bytes, vec![0b0100_0000]);
+    }
+
+    #[test]
+    fn write_quit_command_at_nonzero_bit_offset_matches_spec04_f9_byte() {
+        // spec/04 §2.1's worked example on fixture `F9`: the final byte
+        // is `0x20 = 0010 0000`, where the QUIT field `0100` sits at
+        // bit positions 1..4 and bit position 0 is the trailing bit of
+        // the prior block's residual. Reproduce that exact byte by
+        // writing a single leading `0` (standing in for the residual's
+        // trailing bit) at the byte boundary, then the QUIT command,
+        // then zero-padding the remaining three bits to the boundary.
+        let mut w = BitWriter::new();
+        w.write_bits(0, 1); // residual tail bit at byte position 0
+        write_quit_command(&mut w); // `0100` at positions 1..4
+        assert_eq!(w.bits_written(), 5);
+        assert_eq!(w.pad_to_byte(), 3); // three padding bits to boundary
+        let bytes = w.into_bytes();
+        assert_eq!(bytes, vec![0x20], "F9 final byte is 0x20");
+    }
+
+    #[test]
+    fn write_quit_block_roundtrips_through_read_function_code() {
+        use crate::bitreader::BitReader;
+        use crate::block::{read_function_code, FunctionCode};
+
+        // Round-trip: the 4-bit `0100` the writer emits is dispatched
+        // to `FunctionCode::Quit` by the decoder, confirming writer and
+        // reader agree on the corrected spec/04 §2 encoding.
+        let mut w = BitWriter::new();
+        write_quit_command(&mut w);
+        w.pad_to_byte();
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(read_function_code(&mut r).unwrap(), FunctionCode::Quit);
     }
 
     #[test]

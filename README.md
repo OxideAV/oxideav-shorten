@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 254 (2026-06-08).** The crate was
+**Clean-room rebuild — round 273 (2026-06-10).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -914,6 +914,27 @@ Wayne Stielau's seek-table utility:
     distribution rule, and `select_predictor_with_qlpc` only scores
     the candidate against the DIFFn family.
 
+- **Round 273** — **`BLOCK_FN_QUIT` encoding pinned to the resolved
+  `spec/04` §2 errata** (`spec/04` §2 + §2.1 + `spec/02` §2.1):
+  * The QUIT function-code field `uvar(FNSIZE = 2)` of value 4 is the
+    **4-bit** pattern `0100`, distinct from `BLOCK_FN_ZERO = 8`'s
+    5-bit `00100`. The `write_uvar` / `read_uvar` primitives already
+    computed this correctly from the worked-example algorithm
+    `(k << n) + m`, so decode and round-trip behaviour are unchanged;
+    this round corrected the stale "5-bit `00100`" QUIT comments that
+    had mirrored an earlier arithmetic typo in the `spec/04` §2
+    narrative (now fixed by the docs collaborator), and rewrote the
+    `quit_command_at_byte_boundary_pads_to_zeroes` disclaimer to
+    record the contradiction's resolution.
+  * 3 new in-module tests pin the corrected encoding:
+    `write_quit_command_emits_uvar_of_four_four_bits` (4-bit field,
+    byte-boundary pack `0100 0000`),
+    `write_quit_command_at_nonzero_bit_offset_matches_spec04_f9_byte`
+    (reproduces the `spec/04` §2.1 fixture-`F9` final byte `0x20` with
+    the QUIT field at bit positions 1..4), and
+    `write_quit_block_roundtrips_through_read_function_code` (the
+    writer's `0100` dispatches to `FunctionCode::Quit`).
+
 - **Round 254** — **Rice-`n` statistical-optimum energy selection**
   inside the per-block predictor-selection sequencer (`spec/02` §2.1
   + §4.2 + `spec/05` §3 + TR.156 §3.3):
@@ -970,7 +991,7 @@ Wayne Stielau's seek-table utility:
     auto-selection — still requires a candidate coefficient-
     quantisation pass and remains future work.
 
-The combined surface is exercised by **372 tests** (281 in-module
+The combined surface is exercised by **375 tests** (284 in-module
 unit + 91 integration tests across 19 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-

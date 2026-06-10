@@ -37,7 +37,8 @@
 //!
 //! `spec/05` §4 pins the post-`BLOCK_FN_QUIT` byte alignment: the
 //! encoder appends zero bits up to the next byte boundary after the
-//! 5-bit `BLOCK_FN_QUIT` pattern is emitted. [`BitWriter::pad_to_byte`]
+//! 4-bit `BLOCK_FN_QUIT` pattern (`uvar(2)` of value 4 = `0100`) is
+//! emitted. [`BitWriter::pad_to_byte`]
 //! exposes this rule explicitly; the residual count of padding bits is
 //! always in `0..=7`, matching the verification on fixture `F9` (3
 //! padding bits) and the §4.1 observation across `F1`, `F4`, `F9`.
@@ -431,13 +432,14 @@ mod tests {
         // first byte, leaving bits 3..0 to be zero-filled per
         // `spec/05` §4. Final byte: `0100 0000 = 0x40`.
         //
-        // Note: `spec/04` §2's narrative incorrectly describes the
-        // QUIT command as a "5-bit `uvar(2)` pattern `00100`" which
-        // by `spec/02` §2.1's worked examples is the encoding of
-        // value 8 (= `BLOCK_FN_ZERO`), not 4. This is a §9.4-style
-        // docs inconsistency between `spec/02` §2.1 and `spec/04` §2;
-        // the decoder (which dispatches numeric `4` to Quit and `8`
-        // to Zero) is the source of truth this test follows.
+        // `spec/04` §2 now pins this 4-bit `0100` encoding directly,
+        // consistent with `spec/02` §2.1's worked-example list (`0100`
+        // = 4, `00100` = 8). An earlier revision of `spec/04` §2 had
+        // described QUIT as a "5-bit pattern `00100`", which `spec/02`
+        // §2.1 decodes to value 8 (= `BLOCK_FN_ZERO`), not 4; the
+        // decoder — which dispatches numeric `4` to Quit and `8` to
+        // Zero — was the source of truth, and the spec was corrected
+        // to match.
         let mut w = BitWriter::new();
         w.write_uvar(4, 2);
         assert_eq!(w.bits_written(), 4);

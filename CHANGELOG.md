@@ -6,6 +6,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`BLOCK_FN_QUIT` encoding documentation aligned with the resolved
+  `spec/04` §2 errata.** The function-code field `uvar(FNSIZE = 2)`
+  of the QUIT value 4 is the **4-bit** pattern `0100`, not the 5-bit
+  `00100` (which `spec/02` §2.1 decodes to value 8 = `BLOCK_FN_ZERO`).
+  An earlier revision of `spec/04` §2 carried that arithmetic typo;
+  the in-tree `write_uvar` / `read_uvar` primitives were always
+  correct (they compute `(k << n) + m` from the worked-example
+  algorithm), so the decode and round-trip behaviour are unchanged —
+  only stale "5-bit `00100`" QUIT comments in `bitwriter.rs`,
+  `block.rs`, and `encoder.rs` were corrected, and the prior
+  `quit_command_at_byte_boundary_pads_to_zeroes` disclaimer that
+  flagged the contradiction now records its resolution. The `ZERO`
+  (value 8 = `00100`, 5 bits) references are left untouched — those
+  were and remain correct.
+- New behavioural unit tests pin the corrected encoding directly:
+  - `write_quit_command_emits_uvar_of_four_four_bits` — asserts the
+    bare QUIT field is exactly 4 bits and, at a byte boundary, packs
+    to `0100 0000`.
+  - `write_quit_command_at_nonzero_bit_offset_matches_spec04_f9_byte`
+    — reproduces the `spec/04` §2.1 fixture-`F9` final byte `0x20`
+    (`0010 0000`): a prior-residual trailing bit at byte position 0,
+    the `0100` QUIT field at positions 1..4, three zero padding bits.
+  - `write_quit_block_roundtrips_through_read_function_code` — the
+    4-bit pattern the writer emits dispatches to `FunctionCode::Quit`
+    on decode, confirming writer/reader agreement on the errata form.
+
 ### Added
 
 - **Round 266 clean-room rebuild.** `BLOCK_FN_QLPC` auto-selection in

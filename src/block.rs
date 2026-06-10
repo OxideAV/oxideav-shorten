@@ -534,8 +534,8 @@ mod tests {
     #[test]
     fn quit_function_code_carries_no_payload() {
         // spec/03 §3.8 / spec/04 §2: `BLOCK_FN_QUIT` is the bare
-        // 5-bit pattern `00100`. The decoder reads the function code
-        // and is done.
+        // 4-bit pattern `0100` (`uvar(2)` of value 4 per spec/02
+        // §2.1). The decoder reads the function code and is done.
         let bits = encode_uvar(4, FNSIZE);
         let buf = pack_bits_msb_first(&bits);
         let mut r = BitReader::new(&buf);
