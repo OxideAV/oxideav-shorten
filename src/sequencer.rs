@@ -1,5 +1,5 @@
 //! Shorten per-block predictor-selection sequencer — rounds 251 + 254
-//! + 266.
+//! + 266 + 282.
 //!
 //! Round 251 added the higher-layer encoder routine that compares the
 //! cheapest of `BLOCK_FN_DIFF0..3` and `BLOCK_FN_ZERO` for a given
@@ -24,10 +24,21 @@
 //! optional QLPC candidate), and returns the cheapest [`Choice`] a
 //! caller can hand to [`write_selected_block`].
 //!
-//! Coefficient quantisation itself is **not** in scope — the caller
-//! still owns the per-block coefficient derivation per `spec/03` §3.5
-//! and TR.156 §3.2's Laplacian-distribution rule, and the selector
-//! either receives a candidate or skips QLPC entirely.
+//! Round 282 closes the remaining gap: **QLPC auto-derivation**. The
+//! new entry points [`select_predictor_auto`] /
+//! [`evaluate_candidates_auto`] no longer need a caller-supplied
+//! coefficient vector — [`derive_qlpc_coefs`] derives the quantised
+//! per-block coefficients itself (least-squares normal equations over
+//! the block's carry-seeded prediction contexts, rounded into the
+//! plain-signed-integer coefficient domain `spec/03` §3.5 pins for the
+//! wire), and [`derive_qlpc_candidate`] runs the per-block **order
+//! search** over `0..=max_lpc_order` (zero-anchored per `spec/02`
+//! §4.3's TR.156 anchor "for version 2 and above, the search is
+//! started at zero order"), scoring every order's candidate under the
+//! full cost model — function code + `uvar(LPCQSIZE)` order field +
+//! `order × svar(LPCQUANT)` coefficient-transmission overhead +
+//! energy field + Rice-n-optimal residual stream — so the selector
+//! picks QLPC only when it is genuinely cheapest end-to-end.
 //!
 //! ## Selection criterion
 //!
@@ -88,6 +99,23 @@
 //!   samples) + §3.1 (energy field's `+1` mantissa-width rule and the
 //!   consistency note that the smallest sensible width is 1 not 0,
 //!   anchoring the search at `e = 0`).
+//!
+//! Round-282 auto-derivation anchors:
+//!
+//! * `spec/03` §3.5 — the predictor model
+//!   `ŝ(t) = Σᵢ₌₁..order aᵢ · s(t − i)` the least-squares objective
+//!   minimises; the integer quantisation domain ("each `coef` is a
+//!   small signed integer that the decoder applies in the predictor
+//!   recurrence without scaling") that makes nearest-integer rounding
+//!   the projection onto the wire's representable coefficient set;
+//!   the `0..H_maxlpcorder` per-block order range; the
+//!   `H_maxlpcorder = 0` ⇒ no-QLPC rule.
+//! * `spec/02` §4.3 — the zero-anchored order search ("for version 2
+//!   and above, the search is started at zero order") + §4.4 (the
+//!   `svar(LPCQUANT = 2)` coefficient-transmission cost the order
+//!   search charges each candidate).
+//! * `spec/05` §1.1 — the carry-seeded prediction contexts the
+//!   normal-equation accumulation mirrors from [`qlpc_residuals`].
 
 use crate::bitwriter::BitWriter;
 use crate::block::FNSIZE;
@@ -211,7 +239,11 @@ fn uvar_bits(value: u32, n: u32) -> u64 {
 /// `uvar(u, n)` length formula.
 ///
 /// Returns `None` if the folded magnitude overflows `u32` (the
-/// natural-energy auto-selection rejects such residuals upstream).
+/// natural-energy auto-selection rejects such residuals upstream) or
+/// if the code's prefix-zero run would exceed the decoder's `uvar`
+/// prefix cap (32 leading zeros — the decoder's `read_uvar` rejects
+/// longer runs, so the value is unrepresentable on a decodable wire
+/// at this width and the candidate carrying it must be dropped).
 fn svar_bits(value: i64, n: u32) -> Option<u64> {
     let u: u64 = if value >= 0 {
         (value as u64).checked_shl(1)?
@@ -220,6 +252,10 @@ fn svar_bits(value: i64, n: u32) -> Option<u64> {
         mag.checked_shl(1)?.checked_sub(1)?
     };
     if u > u32::MAX as u64 {
+        return None;
+    }
+    let prefix = if n >= 32 { 0 } else { u >> n };
+    if prefix > crate::bitreader::UVAR_PREFIX_CAP as u64 {
         return None;
     }
     Some(uvar_bits(u as u32, n))
@@ -430,6 +466,238 @@ fn evaluate_qlpc(samples: &[i32], coefs: &[i64], carry: &ChannelCarry) -> Option
     })
 }
 
+/// Upper bound on the order the **auto-derivation** order search of
+/// [`derive_qlpc_candidate`] will visit, independent of the caller's
+/// `max_lpc_order`.
+///
+/// The wire format itself admits orders up to the stream header's
+/// `H_maxlpcorder` (`spec/03` §3.5, bounded implementation-side by
+/// [`MAX_QLPC_ORDER`]), and the explicit
+/// [`select_predictor_with_qlpc`] path accepts any caller-derived
+/// vector up to that cap. The auto-derivation path additionally caps
+/// its search because the normal-equation solve is `O(order³)` per
+/// order — a deliberately bounded encoder-side budget, not a format
+/// limit. TR.156's man-page bounds practical LPC orders to small
+/// integers (Appendix §"-p prediction order": "transmitting each
+/// filter coefficient requires about 7 bits", so high orders pay a
+/// linearly growing per-block overhead the residual savings rarely
+/// recover).
+pub const MAX_QLPC_AUTO_ORDER: u32 = 32;
+
+/// Past sample `s(t − i)` (`i ≥ 1`) for position `t` of the block,
+/// seeded from the per-channel carry for the pre-block window exactly
+/// as [`qlpc_residuals`] seeds it: `carry.at(k)` is `s(−1 − k)` per
+/// `spec/05` §1.1.
+fn qlpc_past_sample(samples: &[i32], carry: &ChannelCarry, t: usize, i: usize) -> f64 {
+    debug_assert!(i >= 1);
+    if t >= i {
+        samples[t - i] as f64
+    } else {
+        carry.at(i - t - 1) as f64
+    }
+}
+
+/// Derive a quantised per-block LPC coefficient vector of exactly
+/// `order` coefficients for the block, per `spec/03` §3.5's predictor
+/// model `ŝ(t) = Σᵢ₌₁..order aᵢ · s(t − i)`.
+///
+/// The derivation minimises the encode-side residual energy
+/// `Σₜ (s(t) − Σᵢ aᵢ · s(t − i))²` over the **actual** prediction
+/// contexts the residual computation uses — the per-sample history
+/// windows seeded from the channel carry (`spec/05` §1.1) and slid
+/// against the block's own samples, exactly mirroring
+/// [`qlpc_residuals`] — by solving the least-squares normal equations
+/// with Gaussian elimination (partial pivoting). The real-valued
+/// solution is then **quantised** by rounding each coefficient to the
+/// nearest integer: `spec/03` §3.5 pins the wire's quantisation domain
+/// as plain small signed integers "that the decoder applies in the
+/// predictor recurrence without scaling", so nearest-integer rounding
+/// is the projection onto the representable coefficient set. (The
+/// integer vector is what the residuals are recomputed against, so
+/// any rounding loss shows up only as residual cost — never as a
+/// reconstruction error; the scheme stays lossless by construction.)
+///
+/// Returns `None` when the block cannot support the derivation:
+///
+/// * `order == 0` (nothing to derive; the order-0 QLPC candidate has
+///   an empty coefficient vector and needs no derivation) or
+///   `samples.len() < order` (fewer equations than unknowns).
+/// * `order` exceeds [`MAX_QLPC_ORDER`] or `carry.len()` (the
+///   candidate could not be written anyway — mirrors
+///   [`crate::write_qlpc_block`]'s `LpcOrderTooLarge` precondition).
+/// * The normal-equation system is singular or numerically degenerate
+///   (e.g. an all-zero block, or a block whose past-sample lag
+///   vectors are linearly dependent because a lower order already
+///   models it exactly — the order search visits that lower order
+///   separately).
+/// * A solved coefficient is non-finite or too large to be a sane
+///   integer coefficient (the cost model would reject it regardless).
+pub fn derive_qlpc_coefs(samples: &[i32], carry: &ChannelCarry, order: usize) -> Option<Vec<i64>> {
+    if order == 0 || samples.len() < order {
+        return None;
+    }
+    if order > MAX_QLPC_ORDER as usize || order > carry.len() {
+        return None;
+    }
+    // Accumulate the normal equations M·a = b with
+    //   M[i][j] = Σₜ s(t − i − 1) · s(t − j − 1)
+    //   b[i]    = Σₜ s(t) · s(t − i − 1)
+    // over every block position t, history seeded from the carry.
+    let n = samples.len();
+    let mut m = vec![vec![0.0f64; order]; order];
+    let mut b = vec![0.0f64; order];
+    let mut row = vec![0.0f64; order];
+    for t in 0..n {
+        for (i, slot) in row.iter_mut().enumerate() {
+            *slot = qlpc_past_sample(samples, carry, t, i + 1);
+        }
+        let s_t = samples[t] as f64;
+        for i in 0..order {
+            b[i] += s_t * row[i];
+            for j in i..order {
+                m[i][j] += row[i] * row[j];
+            }
+        }
+    }
+    // Mirror the upper triangle (the accumulation above only filled
+    // j ≥ i; M is symmetric by construction).
+    for i in 1..order {
+        let (head, tail) = m.split_at_mut(i);
+        let row_i = &mut tail[0];
+        for (j, head_row) in head.iter().enumerate() {
+            row_i[j] = head_row[i];
+        }
+    }
+    // Scale-relative singularity threshold.
+    let mut scale = 0.0f64;
+    for r in &m {
+        for &v in r {
+            if v.abs() > scale {
+                scale = v.abs();
+            }
+        }
+    }
+    if scale == 0.0 {
+        return None; // all-zero contexts; ZERO / DIFF0 carry the block.
+    }
+    let pivot_eps = scale * 1e-12;
+    // Gaussian elimination with partial pivoting on [M | b].
+    for col in 0..order {
+        let mut pivot_row = col;
+        let mut pivot_mag = m[col][col].abs();
+        for (r, mr) in m.iter().enumerate().skip(col + 1) {
+            if mr[col].abs() > pivot_mag {
+                pivot_mag = mr[col].abs();
+                pivot_row = r;
+            }
+        }
+        if pivot_mag <= pivot_eps {
+            return None; // singular / degenerate at this order.
+        }
+        if pivot_row != col {
+            m.swap(col, pivot_row);
+            b.swap(col, pivot_row);
+        }
+        for r in (col + 1)..order {
+            // `r > col`, so splitting at `r` puts the pivot row in
+            // the head and the target row at the start of the tail.
+            let (head, tail) = m.split_at_mut(r);
+            let pivot_row = &head[col];
+            let target_row = &mut tail[0];
+            let factor = target_row[col] / pivot_row[col];
+            if factor != 0.0 {
+                for (t, &p) in target_row.iter_mut().zip(pivot_row.iter()).skip(col) {
+                    *t -= factor * p;
+                }
+                b[r] -= factor * b[col];
+            }
+        }
+    }
+    // Back-substitution.
+    let mut a = vec![0.0f64; order];
+    for i in (0..order).rev() {
+        let mut acc = b[i];
+        for j in (i + 1)..order {
+            acc -= m[i][j] * a[j];
+        }
+        a[i] = acc / m[i][i];
+    }
+    // Quantise into the spec/03 §3.5 integer coefficient domain.
+    let mut coefs: Vec<i64> = Vec::with_capacity(order);
+    for &v in &a {
+        if !v.is_finite() || v.abs() > 1e15 {
+            return None;
+        }
+        coefs.push(v.round() as i64);
+    }
+    Some(coefs)
+}
+
+/// Run the per-block **QLPC order search** and return the cheapest
+/// auto-derived `BLOCK_FN_QLPC` candidate, or `None` when no order in
+/// the search band yields a well-formed candidate.
+///
+/// The search visits every order in `0..=cap` where `cap` is the
+/// minimum of the caller's `max_lpc_order` (normally the stream
+/// header's `H_maxlpcorder`, which `spec/03` §3.5 pins as the
+/// per-block order's upper bound), `carry.len()`,
+/// [`MAX_QLPC_ORDER`], and the auto-derivation budget
+/// [`MAX_QLPC_AUTO_ORDER`]. The search is **zero-anchored** per
+/// `spec/02` §4.3's TR.156 anchor ("for version 2 and above, the
+/// search is started at zero order"): the order-0 candidate carries
+/// an empty coefficient vector (it predicts zero without consulting
+/// the mean estimator, so it is *not* residual-identical to DIFF0
+/// when `μ_chan ≠ 0`). Orders ≥ 1 derive their quantised coefficient
+/// vector through [`derive_qlpc_coefs`].
+///
+/// Every candidate is scored under the full per-command cost model of
+/// `evaluate_qlpc` — function code + `uvar(LPCQSIZE)` order field +
+/// `order × svar(LPCQUANT)` coefficient-transmission overhead +
+/// `uvar(ENERGYSIZE)` energy field + Rice-n-optimal residual stream
+/// (TR.156 §3.3) — so a higher order wins only when its residual
+/// savings genuinely repay the extra coefficient bits. Cost ties
+/// break toward the **lower** order (smaller fixed overhead is the
+/// established tie-break direction of the round-266 priority order).
+///
+/// `max_lpc_order = 0` returns `None`: per `spec/03` §3.5 a
+/// `BLOCK_FN_QLPC` block is well-formed only when `H_maxlpcorder > 0`,
+/// so a polynomial-difference-only stream must never grow a QLPC
+/// command.
+pub fn derive_qlpc_candidate(
+    samples: &[i32],
+    carry: &ChannelCarry,
+    max_lpc_order: u32,
+) -> Option<Choice> {
+    if samples.is_empty() || max_lpc_order == 0 {
+        return None;
+    }
+    let cap = max_lpc_order
+        .min(MAX_QLPC_AUTO_ORDER)
+        .min(MAX_QLPC_ORDER)
+        .min(carry.len() as u32);
+    let mut best: Option<Choice> = None;
+    for order in 0..=cap {
+        let candidate = if order == 0 {
+            evaluate_qlpc(samples, &[], carry)
+        } else {
+            match derive_qlpc_coefs(samples, carry, order as usize) {
+                Some(coefs) => evaluate_qlpc(samples, &coefs, carry),
+                None => None,
+            }
+        };
+        if let Some(c) = candidate {
+            let improves = match &best {
+                Some(current) => c.bits() < current.bits(),
+                None => true,
+            };
+            if improves {
+                best = Some(c);
+            }
+        }
+    }
+    best
+}
+
 /// Compute every candidate's bit cost for the block and return them
 /// in priority order (ZERO first, then DIFF0..3). Useful for
 /// inspection / debugging; [`select_predictor`] picks the cheapest.
@@ -501,6 +769,74 @@ pub fn evaluate_candidates_with_qlpc(
         }
     }
     out
+}
+
+/// Compute every candidate's bit cost for the block — `ZERO`,
+/// `DIFF0..3`, and the **auto-derived** `BLOCK_FN_QLPC` candidate of
+/// [`derive_qlpc_candidate`] — in priority order
+/// `ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3 > QLPC`.
+///
+/// Unlike [`evaluate_candidates_with_qlpc`], no caller-supplied
+/// coefficient vector is needed: the sequencer runs the zero-anchored
+/// order search over `0..=max_lpc_order` itself and appends the
+/// cheapest derived candidate (if any order yields one). Passing
+/// `max_lpc_order = 0` reproduces [`evaluate_candidates`] exactly —
+/// per `spec/03` §3.5 a stream with `H_maxlpcorder = 0` never carries
+/// a `BLOCK_FN_QLPC` command.
+pub fn evaluate_candidates_auto(
+    samples: &[i32],
+    mu_chan: i64,
+    carry: &ChannelCarry,
+    max_lpc_order: u32,
+) -> Vec<Choice> {
+    let mut out = evaluate_candidates_with_qlpc(samples, mu_chan, carry, None);
+    if let Some(c) = derive_qlpc_candidate(samples, carry, max_lpc_order) {
+        out.push(c);
+    }
+    out
+}
+
+/// Pick the cheapest predictor for the block among `DIFF0..3`,
+/// `ZERO`, and the **auto-derived** `BLOCK_FN_QLPC` candidate, and
+/// return a [`Choice`] the caller hands to [`write_selected_block`].
+///
+/// This is the round-282 closure of the selection sequencer: where
+/// [`select_predictor_with_qlpc`] required the caller to derive and
+/// quantise the per-block coefficient vector itself, this entry point
+/// owns the whole QLPC pipeline — order search over
+/// `0..=max_lpc_order` (zero-anchored per `spec/02` §4.3's TR.156
+/// anchor), least-squares coefficient derivation + integer
+/// quantisation ([`derive_qlpc_coefs`], `spec/03` §3.5's unscaled
+/// signed-integer coefficient domain), and the full cost model
+/// including the `uvar(LPCQSIZE)` order field and the
+/// `order × svar(LPCQUANT)` coefficient-transmission overhead — so
+/// `BLOCK_FN_QLPC` is selected exactly when it is genuinely cheapest.
+///
+/// `max_lpc_order` is normally the stream header's `H_maxlpcorder`;
+/// passing `0` reproduces [`select_predictor`] exactly (the
+/// backward-compat invariant the in-module test
+/// `select_auto_with_zero_max_order_matches_legacy` pins), because a
+/// `H_maxlpcorder = 0` stream is polynomial-difference-only per
+/// `spec/03` §3.5.
+///
+/// Ties break in the round-266 priority order
+/// `ZERO > DIFF0 > DIFF1 > DIFF2 > DIFF3 > QLPC`; within the QLPC
+/// order search, ties break toward the lower order.
+///
+/// Returns `None` when no candidate fits (empty block, or every
+/// candidate's residual stream overflows the natural-energy band).
+pub fn select_predictor_auto(
+    samples: &[i32],
+    mu_chan: i64,
+    carry: &ChannelCarry,
+    max_lpc_order: u32,
+) -> Option<Choice> {
+    if samples.is_empty() {
+        return None;
+    }
+    evaluate_candidates_auto(samples, mu_chan, carry, max_lpc_order)
+        .into_iter()
+        .min_by(|a, b| a.bits().cmp(&b.bits()))
 }
 
 /// Pick the cheapest predictor for the block among `DIFF0..3` and
@@ -647,15 +983,31 @@ mod tests {
     #[test]
     fn svar_bits_matches_writer_actual_length() {
         // Mirror against BitWriter::write_svar's actual bit count
-        // for a representative spread of values + widths.
+        // for a representative spread of values + widths. Values
+        // whose prefix-zero run at the given width exceeds the
+        // decoder's read_uvar cap (32) are unrepresentable on a
+        // decodable wire: svar_bits must return None for them.
         for &width in &[1u32, 2, 3, 4, 5] {
             for &v in &[
                 0i64, 1, -1, 2, -2, 3, -3, 7, -7, 8, -8, 15, -15, 16, -16, 31, -31, 64, -64,
             ] {
+                let folded: u64 = if v >= 0 {
+                    (v as u64) << 1
+                } else {
+                    ((v.unsigned_abs()) << 1) - 1
+                };
+                let computed = svar_bits(v, width);
+                if (folded >> width) > 32 {
+                    assert_eq!(
+                        computed, None,
+                        "svar({v}, {width}) must reject prefix runs beyond the decoder cap"
+                    );
+                    continue;
+                }
                 let mut w = BitWriter::new();
                 w.write_svar(v, width);
                 let actual = w.bits_written();
-                let computed = svar_bits(v, width).unwrap();
+                let computed = computed.unwrap();
                 assert_eq!(
                     actual, computed,
                     "svar({v}, {width}): actual {actual} != computed {computed}"
@@ -1177,6 +1529,249 @@ mod tests {
         match cands.last().expect("non-empty candidate list") {
             Choice::Qlpc { .. } => {}
             other => panic!("expected QLPC last, got {other:?}"),
+        }
+    }
+
+    // ---- round 282: QLPC auto-derivation (order search + quantised
+    //      coefficient derivation) ----
+
+    /// Generate a block from an exact integer linear recurrence
+    /// `s(t) = Σᵢ coefs[i] · s(t − i − 1)`, history seeded from
+    /// `carry` exactly as the encoder's residual computation seeds it.
+    fn recurrence_block(coefs: &[i64], carry: &ChannelCarry, len: usize) -> Vec<i32> {
+        let order = coefs.len();
+        let mut hist: Vec<i64> = (0..order).map(|i| carry.at(i) as i64).collect();
+        let mut out: Vec<i32> = Vec::with_capacity(len);
+        for _ in 0..len {
+            let mut next: i64 = 0;
+            for (c, h) in coefs.iter().zip(hist.iter()) {
+                next += c * h;
+            }
+            out.push(i32::try_from(next).expect("recurrence stays in i32"));
+            if order > 0 {
+                for i in (1..order).rev() {
+                    hist[i] = hist[i - 1];
+                }
+                hist[0] = next;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn derive_recovers_exact_two_term_recurrence() {
+        // s(t) = s(t − 1) − s(t − 2) is a bounded period-6 oscillation
+        // outside the DIFFn family. The least-squares solve over the
+        // carry-seeded contexts recovers [1, −1] exactly (the residual
+        // energy minimum is 0 there) and integer rounding keeps it.
+        let mut carry = ChannelCarry::new(3);
+        carry.update_after_block(&[50, 100]); // carry.at(0)=100, at(1)=50
+        let samples = recurrence_block(&[1, -1], &carry, 48);
+        let coefs = derive_qlpc_coefs(&samples, &carry, 2).expect("derivation");
+        assert_eq!(coefs, vec![1, -1]);
+        // Residuals under the derived vector are exactly zero.
+        let residuals = qlpc_residuals(&samples, &coefs, &carry).unwrap();
+        assert!(residuals.iter().all(|&r| r == 0), "got {residuals:?}");
+    }
+
+    #[test]
+    fn derive_recovers_exact_first_order_recurrence() {
+        // s(t) = 3·s(t − 1) from seed 1 stays in i32 for a short block.
+        let mut carry = ChannelCarry::new(3);
+        carry.update_after_block(&[1]); // carry.at(0) = 1
+        let samples = recurrence_block(&[3], &carry, 12);
+        let coefs = derive_qlpc_coefs(&samples, &carry, 1).expect("derivation");
+        assert_eq!(coefs, vec![3]);
+    }
+
+    #[test]
+    fn derive_rejects_degenerate_inputs() {
+        let carry = ChannelCarry::new(3);
+        // All-zero block: normal-equation matrix is all-zero.
+        assert!(derive_qlpc_coefs(&[0i32; 16], &carry, 1).is_none());
+        // Order 0: nothing to derive.
+        assert!(derive_qlpc_coefs(&[1i32, 2, 3], &carry, 0).is_none());
+        // Fewer equations than unknowns.
+        assert!(derive_qlpc_coefs(&[1i32, 2], &carry, 3).is_none());
+        // Order beyond the carry length.
+        assert!(derive_qlpc_coefs(&(0..16i32).collect::<Vec<_>>(), &carry, 4).is_none());
+        // Empty block.
+        assert!(derive_qlpc_coefs(&[], &carry, 1).is_none());
+    }
+
+    #[test]
+    fn order_search_prefers_lowest_adequate_order() {
+        // A pure first-order recurrence: order 1 already drives the
+        // residuals to zero; order 2 can only tie on residual cost and
+        // pays an extra svar(LPCQUANT) coefficient field, so the
+        // strict-< order search keeps order 1.
+        let mut carry = ChannelCarry::new(3);
+        carry.update_after_block(&[1]);
+        let samples = recurrence_block(&[3], &carry, 12);
+        let choice = derive_qlpc_candidate(&samples, &carry, 3).expect("candidate");
+        match &choice {
+            Choice::Qlpc { coefs, .. } => assert_eq!(coefs, &vec![3]),
+            other => panic!("expected QLPC candidate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn order_search_is_zero_anchored_per_spec_02_4_3() {
+        // spec/02 §4.3: "for version 2 and above, the search is
+        // started at zero order". Order-0 QLPC predicts zero WITHOUT
+        // consulting the mean estimator, so on an all-zero block with
+        // a non-zero μ_chan (ZERO ineligible, DIFF0 residuals all
+        // −μ_chan) the empty-coefficient candidate is the cheapest
+        // QLPC order and must be visited by the search.
+        let carry = ChannelCarry::new(3);
+        let samples = vec![0i32; 32];
+        let choice = derive_qlpc_candidate(&samples, &carry, 3).expect("candidate");
+        match &choice {
+            Choice::Qlpc { coefs, energy, .. } => {
+                assert!(coefs.is_empty(), "expected order-0, got {coefs:?}");
+                assert_eq!(*energy, 0);
+            }
+            other => panic!("expected QLPC candidate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn derive_candidate_respects_max_order_zero() {
+        // spec/03 §3.5: H_maxlpcorder = 0 streams never carry QLPC.
+        let mut carry = ChannelCarry::new(3);
+        carry.update_after_block(&[50, 100]);
+        let samples = recurrence_block(&[1, -1], &carry, 48);
+        assert!(derive_qlpc_candidate(&samples, &carry, 0).is_none());
+    }
+
+    #[test]
+    fn select_auto_with_zero_max_order_matches_legacy() {
+        // Backward-compat invariant: max_lpc_order = 0 must reproduce
+        // the legacy selector exactly across a representative spread.
+        let carry = ChannelCarry::new(3);
+        let test_blocks: Vec<Vec<i32>> = vec![
+            vec![0; 8],
+            vec![7; 6],
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+            (0..32i32).map(|t| 5 * t).collect(),
+            vec![3, 0, 0, 0],
+            vec![1, -1, 2, -2, 3, -3, 4, -4],
+        ];
+        for (i, samples) in test_blocks.iter().enumerate() {
+            for &mu in &[0i64, 3, 7] {
+                let legacy = select_predictor(samples, mu, &carry);
+                let auto = select_predictor_auto(samples, mu, &carry, 0);
+                assert_eq!(
+                    legacy, auto,
+                    "block {i} mu {mu}: select_predictor != select_predictor_auto(.., 0)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn select_auto_picks_qlpc_on_non_polynomial_recurrence() {
+        // The period-6 oscillation s(t) = s(t − 1) − s(t − 2) defeats
+        // every DIFFn predictor (its differences stay full-amplitude
+        // oscillations) but the auto-derived [1, −1] QLPC candidate
+        // drives the residuals to zero — 2 bits per sample at e = 0
+        // plus the fixed QLPC overhead, the genuine cheapest pick.
+        let mut carry = ChannelCarry::new(3);
+        carry.update_after_block(&[50, 100]);
+        let samples = recurrence_block(&[1, -1], &carry, 64);
+        let choice = select_predictor_auto(&samples, 0, &carry, 2).expect("choice");
+        match &choice {
+            Choice::Qlpc { coefs, energy, .. } => {
+                assert_eq!(coefs, &vec![1, -1]);
+                assert_eq!(*energy, 0);
+            }
+            other => panic!("expected QLPC, got {other:?}"),
+        }
+        // The auto pick must be genuinely cheapest: strictly cheaper
+        // than every DIFFn / ZERO candidate on the same block.
+        let base = evaluate_candidates(&samples, 0, &carry);
+        for cand in &base {
+            assert!(
+                choice.bits() < cand.bits(),
+                "QLPC ({} bits) must beat {cand:?}",
+                choice.bits()
+            );
+        }
+    }
+
+    #[test]
+    fn select_auto_falls_back_to_diffn_when_overhead_dominates() {
+        // An arithmetic ramp is an exact second-order polynomial: the
+        // auto-derived order-2 vector is [2, −1] — residual-identical
+        // to DIFF2 (same carry seeding) — so QLPC can only tie DIFF2's
+        // residual stream while paying the order + coefficient fields.
+        // The selector must keep DIFF2.
+        let carry = ChannelCarry::new(3);
+        let samples: Vec<i32> = (0..64i32).map(|t| 5 * t).collect();
+        let choice = select_predictor_auto(&samples, 0, &carry, 3).expect("choice");
+        assert!(
+            matches!(choice, Choice::Diff2 { .. }),
+            "DIFF2 must win on overhead, got {choice:?}"
+        );
+        // And it must equal the legacy pick bit-for-bit.
+        assert_eq!(choice, select_predictor(&samples, 0, &carry).unwrap());
+    }
+
+    #[test]
+    fn select_auto_zero_still_wins_on_constant_mu_block() {
+        let carry = ChannelCarry::new(3);
+        let samples = vec![7i32; 16];
+        let choice = select_predictor_auto(&samples, 7, &carry, 3).expect("choice");
+        assert!(matches!(choice, Choice::Zero { bits: 5 }));
+    }
+
+    #[test]
+    fn select_auto_handles_empty_block() {
+        let carry = ChannelCarry::new(3);
+        assert!(select_predictor_auto(&[], 0, &carry, 3).is_none());
+    }
+
+    #[test]
+    fn evaluate_candidates_auto_appends_qlpc_last() {
+        let mut carry = ChannelCarry::new(3);
+        carry.update_after_block(&[50, 100]);
+        let samples = recurrence_block(&[1, -1], &carry, 32);
+        let cands = evaluate_candidates_auto(&samples, 0, &carry, 2);
+        match cands.last().expect("non-empty candidate list") {
+            Choice::Qlpc { .. } => {}
+            other => panic!("expected auto QLPC last, got {other:?}"),
+        }
+        // Base (max 0) listing must carry no QLPC entry.
+        let base = evaluate_candidates_auto(&samples, 0, &carry, 0);
+        assert!(!base.iter().any(|c| matches!(c, Choice::Qlpc { .. })));
+    }
+
+    #[test]
+    fn write_selected_for_auto_qlpc_emits_choice_bits_count() {
+        // Round-251 invariant extended through the auto path: the
+        // writer's actual bit delta equals Choice::bits() exactly.
+        let mut carry = ChannelCarry::new(3);
+        carry.update_after_block(&[50, 100]);
+        let samples = recurrence_block(&[1, -1], &carry, 64);
+        let choice = select_predictor_auto(&samples, 0, &carry, 2).expect("choice");
+        assert!(matches!(choice, Choice::Qlpc { .. }));
+        let mut writer = BitWriter::new();
+        write_selected_block(&mut writer, &choice, &samples, 0, &carry).unwrap();
+        assert_eq!(writer.bits_written(), choice.bits());
+    }
+
+    #[test]
+    fn auto_order_search_caps_at_carry_length() {
+        // carry.len() = 3 caps the search even when the caller allows
+        // more; the search must not produce a vector longer than the
+        // carry can seed (write_qlpc_block would reject it).
+        let mut carry = ChannelCarry::new(3);
+        carry.update_after_block(&[50, 100]);
+        let samples = recurrence_block(&[1, -1], &carry, 32);
+        let choice = derive_qlpc_candidate(&samples, &carry, 100).expect("candidate");
+        match &choice {
+            Choice::Qlpc { coefs, .. } => assert!(coefs.len() <= 3),
+            other => panic!("expected QLPC candidate, got {other:?}"),
         }
     }
 }

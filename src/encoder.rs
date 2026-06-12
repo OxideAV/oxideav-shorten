@@ -153,6 +153,7 @@
 //! * `docs/audio/shorten/spec/05-state-and-quirks.md` §4 (post-QUIT
 //!   byte-alignment with zero padding).
 
+use crate::bitreader::UVAR_PREFIX_CAP;
 use crate::bitwriter::{natural_ulong_width, BitWriter};
 use crate::block::{
     BITSHIFTSIZE, BITSHIFT_MAX, BLOCKSIZE_MAX, FNSIZE, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE,
@@ -708,8 +709,12 @@ fn fold_signed_to_unsigned(value: i64) -> Option<u64> {
 /// implementation safety cap on residual mantissa width
 /// (`MAX_RESIDUAL_WIDTH = 30`) — the encoded block would not round-trip
 /// — or when any folded residual overflows `u64` (`v` near `i64::MIN`'s
-/// magnitude). Per-sample prefix-zero counts saturate to a sentinel
-/// upper bound rather than overflow `u64`.
+/// magnitude), or when any per-sample prefix-zero run would exceed the
+/// decoder's `uvar` prefix cap (32 leading zeros): the decoder's
+/// `read_uvar` rejects longer runs, so an energy that needs one is
+/// just as unrepresentable as an over-cap mantissa width and must be
+/// excluded from the rate sweep rather than selected and emitted as a
+/// stream the decoder refuses.
 ///
 /// Exposed as a public helper so callers driving the per-block
 /// predictor-selection sequencer ([`crate::select_predictor`]) can
@@ -725,6 +730,12 @@ pub fn residual_bits_at_energy(residuals: &[i64], encoded_energy: u32) -> Option
     for &r in residuals {
         let u = fold_signed_to_unsigned(r)?;
         let prefix = if width >= 64 { 0 } else { u >> width };
+        if prefix > UVAR_PREFIX_CAP as u64 {
+            // The decoder's read_uvar caps the leading-zero run; a
+            // residual needing a longer prefix at this width would
+            // produce a stream the decoder rejects.
+            return None;
+        }
         total = total.checked_add(prefix)?;
     }
     Some(total)
@@ -3356,8 +3367,30 @@ mod tests {
         ];
         for residuals in streams {
             for e in 0u32..=MAX_NATURAL_ENERGY {
-                let computed =
-                    residual_bits_at_energy(residuals, e).expect("non-empty stream fits");
+                // A residual whose prefix-zero run at this width
+                // exceeds the decoder's read_uvar cap (32) makes the
+                // (stream, energy) pair unrepresentable on a decodable
+                // wire: residual_bits_at_energy must return None for
+                // it rather than a cost the decoder would refuse.
+                let width = e + 1;
+                let over_cap = residuals.iter().any(|&r| {
+                    let u: u64 = if r >= 0 {
+                        (r as u64) << 1
+                    } else {
+                        ((r.unsigned_abs()) << 1) - 1
+                    };
+                    (u >> width) > 32
+                });
+                let computed = residual_bits_at_energy(residuals, e);
+                if over_cap {
+                    assert_eq!(
+                        computed, None,
+                        "residual_bits_at_energy({residuals:?}, {e}) must reject \
+                         prefix runs beyond the decoder cap"
+                    );
+                    continue;
+                }
+                let computed = computed.expect("non-empty in-cap stream fits");
                 let mut w = BitWriter::new();
                 for &r in *residuals {
                     w.write_svar(r, e + 1);

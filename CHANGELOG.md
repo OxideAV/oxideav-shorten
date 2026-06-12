@@ -6,7 +6,57 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Round 282 clean-room rebuild.** QLPC auto-derivation in the
+  per-block predictor-selection sequencer (`spec/03` §3.5 + `spec/02`
+  §4.3 + §4.4 + `spec/05` §1.1):
+  - New public `select_predictor_auto(samples, mu_chan, carry,
+    max_lpc_order)` / `evaluate_candidates_auto(..)`: the sequencer
+    now derives and quantises the per-block LPC coefficient vector
+    itself and runs the per-block order search, so `BLOCK_FN_QLPC`
+    is auto-selected exactly when it is genuinely cheapest under the
+    full cost model (function code + `uvar(LPCQSIZE)` order field +
+    `order × svar(LPCQUANT)` coefficient-transmission overhead +
+    energy field + Rice-n-optimal residuals). `max_lpc_order = 0`
+    reproduces `select_predictor` bit-for-bit per `spec/03` §3.5's
+    `H_maxlpcorder = 0` ⇒ polynomial-difference-only rule.
+  - New public `derive_qlpc_coefs(samples, carry, order)`:
+    least-squares normal equations over the block's carry-seeded
+    prediction contexts (Gaussian elimination, partial pivoting),
+    rounded to nearest integer — the projection onto `spec/03`
+    §3.5's unscaled signed-integer coefficient domain. Degenerate
+    systems drop the candidate.
+  - New public `derive_qlpc_candidate(samples, carry,
+    max_lpc_order)`: zero-anchored order search (`spec/02` §4.3's
+    TR.156 anchor) over `0..=min(max_lpc_order, carry.len(),
+    MAX_QLPC_ORDER, MAX_QLPC_AUTO_ORDER = 32)`; cost ties break
+    toward the lower order. New public `MAX_QLPC_AUTO_ORDER`.
+  - Measured on a 16-block period-6 integer-recurrence signal:
+    8,768 bits via auto-QLPC vs 34,240 bits via the DIFFn-only
+    selector (74 % saving, QLPC on 16/16 blocks); never worse than
+    the legacy pick on any block (superset candidate set).
+  - +13 in-module unit tests, +5 integration tests
+    (`tests/encoder_qlpc_autoselect_pipeline.rs`) including
+    bit-exact decode parity of auto-selected QLPC streams through
+    `decode_stream` and byte-identical legacy reproduction at
+    `max_lpc_order = 0`. Combined surface now 394 tests (was 376).
+
 ### Fixed
+
+- **Rice-n energy sweep could select codes the decoder rejects**
+  (latent since round 254, surfaced by the round-282 QLPC work but
+  reachable through plain DIFFn selection): a sparse residual stream
+  with one large outlier (e.g. a constant-50 block over a cold carry
+  → DIFF1 residuals `[50, 0, …]`) drove the sweep to `e = 0`, whose
+  outlier code needs a prefix-zero run beyond the decoder's 32-zero
+  `uvar` cap — the emitted stream failed to decode with
+  `OverflowingUvar`. `residual_bits_at_energy` and the sequencer's
+  coefficient costing now treat over-cap codes as unrepresentable
+  (`None`), so the sweep settles on a decodable energy; regression
+  pinned by
+  `rice_optimum_respects_decoder_prefix_cap_regression` with a full
+  encode → decode roundtrip.
 
 - **`BLOCK_FN_QUIT` encoding documentation aligned with the resolved
   `spec/04` §2 errata.** The function-code field `uvar(FNSIZE = 2)`

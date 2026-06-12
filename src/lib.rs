@@ -226,10 +226,23 @@
 //!   dispatches the returned [`Choice`] to the matching per-
 //!   predictor writer; [`evaluate_candidates`] returns every
 //!   eligible candidate in priority order for inspection.
-//!   `BLOCK_FN_QLPC` is not part of auto-selection because the
-//!   caller still owns coefficient quantisation per `spec/03` §3.5;
-//!   a future round can layer it in by accepting a candidate
-//!   coefficient vector.
+//!   `BLOCK_FN_QLPC` is not part of round-251 auto-selection; round
+//!   266 layered it in behind a caller-supplied candidate coefficient
+//!   vector ([`select_predictor_with_qlpc`]).
+//!
+//! * Round 282 — **QLPC auto-derivation** in the selection sequencer
+//!   per `spec/03` §3.5 + `spec/02` §4.3 + §4.4.
+//!   [`select_predictor_auto`] / [`evaluate_candidates_auto`] run the
+//!   zero-anchored per-block order search over `0..=max_lpc_order`
+//!   themselves; [`derive_qlpc_coefs`] derives each order's quantised
+//!   coefficient vector (least-squares normal equations over the
+//!   carry-seeded prediction contexts, rounded into `spec/03` §3.5's
+//!   unscaled signed-integer coefficient domain) and
+//!   [`derive_qlpc_candidate`] scores every order under the full cost
+//!   model — order field + coefficient-transmission overhead + Rice-n
+//!   optimal residual stream — so `BLOCK_FN_QLPC` is picked exactly
+//!   when it is genuinely cheapest. `max_lpc_order = 0` reproduces
+//!   [`select_predictor`] bit-for-bit.
 //!
 //! The public entry points are [`decode_stream`], [`parse_stream_header`],
 //! [`read_function_code`], [`read_verbatim_payload`],
@@ -314,8 +327,9 @@ pub use crate::predictor::{
     CARRY_LEN_FLOOR, ENERGYSIZE, LPCQSIZE, LPCQUANT,
 };
 pub use crate::sequencer::{
-    evaluate_candidates, evaluate_candidates_with_qlpc, select_predictor,
-    select_predictor_with_qlpc, write_selected_block, Choice,
+    derive_qlpc_candidate, derive_qlpc_coefs, evaluate_candidates, evaluate_candidates_auto,
+    evaluate_candidates_with_qlpc, select_predictor, select_predictor_auto,
+    select_predictor_with_qlpc, write_selected_block, Choice, MAX_QLPC_AUTO_ORDER,
 };
 pub use crate::sidecar::{
     detect_shnampsk_trailer, split_off_shnampsk_trailer, ShnampskTrailer, MIN_SIDECAR_LEN,

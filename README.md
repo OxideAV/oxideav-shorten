@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 273 (2026-06-10).** The crate was
+**Clean-room rebuild — round 282 (2026-06-12).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -912,7 +912,81 @@ Wayne Stielau's seek-table utility:
     owns derivation of the per-block coefficient vector from the
     input samples per `spec/03` §3.5 + TR.156 §3.2's Laplacian-
     distribution rule, and `select_predictor_with_qlpc` only scores
-    the candidate against the DIFFn family.
+    the candidate against the DIFFn family. (Closed by round 282's
+    `select_predictor_auto`.)
+
+- **Round 282** — **QLPC auto-derivation** in the per-block
+  predictor-selection sequencer (`spec/03` §3.5 + `spec/02` §4.3 +
+  §4.4 + `spec/05` §1.1):
+  * New public entry points `select_predictor_auto(samples, mu_chan,
+    carry, max_lpc_order)` / `evaluate_candidates_auto(..)` complete
+    the QLPC pipeline the round-266 caller-supplied-candidate surface
+    left open: the sequencer now **derives and quantises the
+    per-block coefficient vector itself** and runs the per-block
+    **order search**, so `BLOCK_FN_QLPC` is auto-selected exactly
+    when it is genuinely cheapest end-to-end. Passing
+    `max_lpc_order = 0` reproduces `select_predictor` bit-for-bit
+    (`spec/03` §3.5: a `H_maxlpcorder = 0` stream is
+    polynomial-difference-only).
+  * `derive_qlpc_coefs(samples, carry, order)` solves the
+    least-squares normal equations of the predictor model
+    `ŝ(t) = Σᵢ aᵢ · s(t − i)` over the block's **actual** prediction
+    contexts — per-sample history windows seeded from the channel
+    carry exactly as `qlpc_residuals` seeds them (`spec/05` §1.1) —
+    via Gaussian elimination with partial pivoting, then quantises by
+    rounding each coefficient to the nearest integer (`spec/03` §3.5
+    pins the wire's coefficient domain as plain signed integers the
+    decoder applies without scaling, so nearest-integer rounding is
+    the projection onto the representable set; rounding loss
+    surfaces only as residual cost, never as reconstruction error).
+    Degenerate systems (all-zero blocks, lag-dependent contexts a
+    lower order already models exactly) return `None` and drop the
+    candidate.
+  * `derive_qlpc_candidate(samples, carry, max_lpc_order)` runs the
+    order search over `0..=min(max_lpc_order, carry.len(),
+    MAX_QLPC_ORDER, MAX_QLPC_AUTO_ORDER = 32)`, **zero-anchored**
+    per `spec/02` §4.3's TR.156 anchor ("for version 2 and above,
+    the search is started at zero order" — the order-0 candidate's
+    empty coefficient vector predicts zero without consulting the
+    mean estimator, so it is not residual-identical to DIFF0 when
+    `μ_chan ≠ 0`). Every order is scored under the full cost model —
+    function code + `uvar(LPCQSIZE)` order field +
+    `order × svar(LPCQUANT)` coefficient-transmission overhead +
+    energy field + Rice-`n`-optimal residual stream — and cost ties
+    break toward the lower order.
+  * **Decoder-prefix-cap regression fix** surfaced by the QLPC work
+    but reachable through plain DIFFn selection since round 254: the
+    Rice-`n` sweep could pick an energy whose sparse-outlier code
+    needs more than the decoder's 32-zero `uvar` prefix cap (e.g. a
+    constant-50 block over a cold carry → DIFF1 residuals
+    `[50, 0, …]` at `e = 0` → a 50-zero prefix the decoder rejects
+    as `OverflowingUvar`). `residual_bits_at_energy` (and the
+    sequencer's coefficient costing) now treat over-cap codes as
+    unrepresentable, so the sweep settles on a decodable energy and
+    every selected block round-trips.
+  * Measured on synthetic material (16 × 256-sample blocks): a
+    bounded period-6 integer recurrence `s(t) = s(t−1) − s(t−2)`
+    encodes in 8,768 bits via auto-QLPC vs 34,240 bits via the
+    DIFFn-only legacy selector — a **74 % saving** with QLPC
+    auto-selected on 16/16 blocks and the derived vector `[1, −1]`
+    driving warm-carry residuals to zero. On material without an
+    integer-coefficient recurrence the auto pick never costs more
+    than the legacy pick (superset candidate sets).
+  * +13 in-module unit tests (derivation recovers exact first- and
+    second-order recurrences; degenerate-input rejection;
+    lowest-adequate-order tie-break; zero-anchored search; max-order
+    0 ⇒ no QLPC; legacy-parity invariant; QLPC win on the period-6
+    oscillation with strict-cheapest assertion; DIFF2 fallback on
+    arithmetic ramps where the derived `[2, −1]` ties DIFF2's
+    residuals and loses on overhead; ZERO priority; emitted-bits /
+    `Choice::bits()` equality; carry-length cap) and +5 integration
+    tests in `tests/encoder_qlpc_autoselect_pipeline.rs` (mono
+    multi-block auto-QLPC stream decodes bit-exact through
+    `decode_stream` with per-block bit-delta parity; stereo
+    round-robin with a QLPC channel and a DIFF2 ramp channel;
+    whole-stream rate dominance + strict saving on LPC material;
+    prefix-cap regression roundtrip; `max_lpc_order = 0` stream is
+    byte-identical to the legacy selector's).
 
 - **Round 273** — **`BLOCK_FN_QUIT` encoding pinned to the resolved
   `spec/04` §2 errata** (`spec/04` §2 + §2.1 + `spec/02` §2.1):
@@ -991,8 +1065,8 @@ Wayne Stielau's seek-table utility:
     auto-selection — still requires a candidate coefficient-
     quantisation pass and remains future work.
 
-The combined surface is exercised by **375 tests** (284 in-module
-unit + 91 integration tests across 19 integration binaries). The
+The combined surface is exercised by **394 tests** (298 in-module
+unit + 96 integration tests across 20 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
@@ -1021,17 +1095,18 @@ leaves the second block undecoded until the next pull) (round 10).
 
 ### What's not yet here
 
-* Encoder-side **coefficient quantisation** for QLPC. The round-17
-  `write_qlpc_block` entry point accepts the caller's already-
-  quantised coefficient vector as `&[i64]`; the optimal-quantisation
-  derivation from raw input samples per TR.156 §3.2 (the
-  Laplacian-distribution rule) remains a higher-layer concern.
-* (Round 266 closed the QLPC auto-selection gap that lived here
-  previously — the round-251 sequencer now scores a caller-supplied
-  QLPC coefficient candidate alongside the DIFFn family via
-  `select_predictor_with_qlpc`. The only remaining encoder-side QLPC
-  gap is **coefficient quantisation**, covered by the bullet
-  immediately above.)
+* (Rounds 266 + 282 closed the QLPC encoder gaps that lived here
+  previously — round 266 scored a caller-supplied coefficient
+  candidate alongside the DIFFn family via
+  `select_predictor_with_qlpc`; round 282 added in-sequencer
+  coefficient derivation + quantisation and the per-block order
+  search via `select_predictor_auto`, so the QLPC encode path is now
+  fully automatic.)
+* A whole-stream **encode driver** (the encoder mirror of
+  `decode_stream`) that owns channel round-robin, carry / mean
+  bookkeeping, BLOCKSIZE tail handling, and verbatim prefixes around
+  the per-block selector; today the integration tests compose those
+  pieces by hand.
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking

@@ -43,7 +43,13 @@ pub const ULONGSIZE: u32 = 2;
 /// even with `n = 0` only 8 leading zeros would be needed); anything
 /// approaching 32 leading zeros is either a malformed stream or
 /// pathological input.
-const UVAR_PREFIX_CAP: u32 = 32;
+///
+/// `pub(crate)` because the encoder's rate model must respect the
+/// same bound: a residual / coefficient code whose prefix-zero run
+/// exceeds this cap would be rejected by [`BitReader::read_uvar`] on
+/// decode, so the per-block energy auto-selection treats such codes
+/// as unrepresentable (see `crate::residual_bits_at_energy`).
+pub(crate) const UVAR_PREFIX_CAP: u32 = 32;
 
 /// MSB-first bit reader over a borrowed byte slice. The reader
 /// starts at byte `0` of the slice and reads from bit 7 of that byte
