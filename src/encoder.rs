@@ -331,6 +331,26 @@ pub enum EncodeError {
     /// driving multi-gigabyte allocations downstream when the override
     /// is consumed by the next predictor command.
     BlocksizeOutOfRange(u32),
+    /// The interleaved sample buffer handed to the whole-stream encode
+    /// driver ([`crate::encode_stream`]) had a length that is not an
+    /// exact multiple of `H_channels`. The interleaving convention of
+    /// `spec/03` §2 / TR.156 §3.1 (`a(0), b(0), a(1), b(1), …`)
+    /// requires every channel to carry the same number of samples, so
+    /// a ragged buffer cannot be deinterleaved.
+    RaggedInterleave { samples: usize, channels: u32 },
+    /// The whole-stream encode driver's per-block predictor selector
+    /// ([`crate::select_predictor_auto`]) returned no candidate for a
+    /// non-empty block — only reachable when every `DIFFn`/QLPC
+    /// residual stream overflows the natural-energy range
+    /// (`0..=MAX_NATURAL_ENERGY`) and `BLOCK_FN_ZERO` is ineligible.
+    /// For in-range PCM this is unreachable; it surfaces a pathological
+    /// input rather than emitting an undecodable block.
+    NoPredictorFits,
+    /// The header handed to the whole-stream encode driver declared
+    /// `H_channels = 0`, which the round-robin channel cursor cannot
+    /// index (mirrors the decoder-side rejection in
+    /// [`crate::decode_stream`]).
+    ZeroChannels,
 }
 
 impl core::fmt::Display for EncodeError {
@@ -379,6 +399,18 @@ impl core::fmt::Display for EncodeError {
             EncodeError::BlocksizeOutOfRange(n) => write!(
                 f,
                 "oxideav-shorten: BLOCKSIZE new_bs {n} exceeds the implementation safety cap"
+            ),
+            EncodeError::RaggedInterleave { samples, channels } => write!(
+                f,
+                "oxideav-shorten: interleaved buffer of {samples} samples is not a multiple of {channels} channels"
+            ),
+            EncodeError::NoPredictorFits => write!(
+                f,
+                "oxideav-shorten: no natural-energy predictor candidate fits a block (residuals out of range)"
+            ),
+            EncodeError::ZeroChannels => write!(
+                f,
+                "oxideav-shorten: encode driver rejects a header with H_channels = 0"
             ),
         }
     }

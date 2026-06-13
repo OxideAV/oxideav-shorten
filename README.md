@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 282 (2026-06-12).** The crate was
+**Clean-room rebuild — round 290 (2026-06-13).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -988,6 +988,62 @@ Wayne Stielau's seek-table utility:
     prefix-cap regression roundtrip; `max_lpc_order = 0` stream is
     byte-identical to the legacy selector's).
 
+- **Round 290** — the **whole-stream encode driver** `encode_stream`
+  (`spec/03` §2 + §3.6 + §3.8 + §3.10 + `spec/04` §4.1 + `spec/05`
+  §1 + §2 + §4) — the encoder mirror of [`decode_stream`] and the top
+  item the "What's not yet here" list had been pointing at:
+  * `encode_stream(header, samples, verbatim_prefix) ->
+    EncodeResult<Vec<u8>>` takes an **interleaved** `&[i32]` PCM buffer
+    (`a(0), b(0), a(1), b(1), …` per `spec/03` §2 / TR.156 §3.1) plus a
+    [`ShortenStreamHeader`] and produces a syntactically-valid `.shn`
+    byte stream that [`decode_stream`] reconstructs **sample-exact**.
+    The two share an identical per-channel state model — the
+    load-bearing round-trip property.
+  * Composes the existing per-block writers + the round-282
+    [`select_predictor_auto`] sequencer into one call: deinterleave into
+    `H_channels` planes, partition each into `H_blocksize` blocks, and
+    emit them in the round-robin cursor order [`decode_stream`] consumes
+    (block 0 of every channel, then block 1 of every channel, …). Each
+    block's predictor (ZERO / DIFF0..3 / auto-derived QLPC up to
+    `H_maxlpcorder`) is chosen by the Rice-`n`-optimal selector.
+  * Per-channel [`ChannelCarry`] (`spec/05` §1) and [`MeanEstimator`]
+    (`spec/05` §2) are carried across blocks and refreshed from the
+    pre-shift block in the same order as [`decode_stream`]'s
+    `commit_block`, so the encode and decode state machines stay in
+    lockstep.
+  * The trailing partial block is handled by a single
+    `BLOCK_FN_BLOCKSIZE` override at the head of the tail round —
+    mirroring fixture `F2`'s lone tail-block override at command 11,377
+    (`new_bs = 155`, `spec/04` §4.1 `T12`) — followed by the partial
+    block for every channel. Envelope = byte-aligned magic + version +
+    parameter block + optional `BLOCK_FN_VERBATIM` prefix (`spec/03`
+    §3.10); termination = `BLOCK_FN_QUIT` (`spec/03` §3.8) + zero-pad to
+    the next byte boundary (`spec/05` §4).
+  * New `EncodeError` variants `RaggedInterleave { samples, channels }`
+    (buffer length not a multiple of `H_channels`), `ZeroChannels`
+    (`H_channels = 0`, mirrors the decoder rejection), and
+    `NoPredictorFits` (a block whose best-predictor residual stream
+    overflows the natural-energy band `e ∈ 0..=MAX_NATURAL_ENERGY` the
+    selector scores — a documented limitation, see below).
+  * **Natural-energy limitation.** [`select_predictor_auto`] scores
+    candidates only at the natural Rice energies (mantissa widths
+    `1..=8`); a block whose residuals exceed that band (e.g. a
+    cold-carry DIFF0 first block of full-scale samples) surfaces
+    `NoPredictorFits`. Real PCM after a predictor's de-correlation
+    almost always lands inside the band; widening the selector's energy
+    sweep up to the decoder's `MAX_RESIDUAL_WIDTH = 30` cap is a
+    sequencer-layer refinement that does not change the wire format.
+  * 14 new in-module unit tests + 7 new integration tests
+    (`tests/encode_stream_pipeline.rs`) confirm: mono full-block,
+    mono-with-tail, stereo round-robin, three- and five-channel
+    round-robin, verbatim splice, constant-signal ZERO eligibility under
+    a mean window, LPC-recurrence material under `H_maxlpcorder = 2`,
+    auto-QLPC encode never larger than the DIFFn-only encode on LPC
+    material, empty-buffer, tail-only (no full blocks), ragged-buffer
+    rejection, zero-channel rejection, and the natural-energy-overflow
+    `NoPredictorFits` path — all round-trip sample-exact through
+    `decode_stream`.
+
 - **Round 273** — **`BLOCK_FN_QUIT` encoding pinned to the resolved
   `spec/04` §2 errata** (`spec/04` §2 + §2.1 + `spec/02` §2.1):
   * The QUIT function-code field `uvar(FNSIZE = 2)` of value 4 is the
@@ -1065,8 +1121,8 @@ Wayne Stielau's seek-table utility:
     auto-selection — still requires a candidate coefficient-
     quantisation pass and remains future work.
 
-The combined surface is exercised by **394 tests** (298 in-module
-unit + 96 integration tests across 20 integration binaries). The
+The combined surface is exercised by **415 tests** (312 in-module
+unit + 103 integration tests across 21 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
@@ -1102,11 +1158,15 @@ leaves the second block undecoded until the next pull) (round 10).
   coefficient derivation + quantisation and the per-block order
   search via `select_predictor_auto`, so the QLPC encode path is now
   fully automatic.)
-* A whole-stream **encode driver** (the encoder mirror of
-  `decode_stream`) that owns channel round-robin, carry / mean
-  bookkeeping, BLOCKSIZE tail handling, and verbatim prefixes around
-  the per-block selector; today the integration tests compose those
-  pieces by hand.
+* (Round 290 landed the whole-stream **encode driver** `encode_stream`
+  — the encoder mirror of `decode_stream` that owns channel round-robin,
+  carry / mean bookkeeping, BLOCKSIZE tail handling, and verbatim
+  prefixes around the per-block selector. The remaining encoder
+  refinement is widening [`select_predictor_auto`]'s energy sweep beyond
+  the natural-energy band `e ∈ 0..=MAX_NATURAL_ENERGY` up to the
+  decoder's `MAX_RESIDUAL_WIDTH = 30` cap, so full-scale cold-carry
+  blocks select rather than surface `NoPredictorFits`; this is a
+  sequencer-layer change that does not affect the wire format.)
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking

@@ -8,6 +8,42 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 290 clean-room rebuild.** Whole-stream encode driver
+  `encode_stream(header, samples, verbatim_prefix)` — the encoder mirror
+  of `decode_stream` (`spec/03` §2 + §3.6 + §3.8 + §3.10 + `spec/04`
+  §4.1 + `spec/05` §1 + §2 + §4):
+  - Deinterleaves an interleaved `&[i32]` PCM buffer (`a(0), b(0),
+    a(1), b(1), …` per `spec/03` §2 / TR.156 §3.1) into `H_channels`
+    per-channel planes, partitions each into `H_blocksize` blocks, and
+    emits them in the round-robin cursor order `decode_stream` consumes.
+  - Carries the per-channel `ChannelCarry` (`spec/05` §1) and
+    `MeanEstimator` (`spec/05` §2) across blocks, updating each from the
+    pre-shift block in the same order as `decode_stream`'s
+    `commit_block`, so the produced stream is reconstructed
+    **sample-exact**.
+  - Trailing partial block handled by a single `BLOCK_FN_BLOCKSIZE`
+    override at the head of the tail round, mirroring fixture `F2`'s
+    lone tail override (`new_bs = 155`, `spec/04` §4.1 `T12`).
+  - Per-block predictor chosen by `select_predictor_auto` (ZERO /
+    DIFF0..3 / auto-derived QLPC up to `H_maxlpcorder`); envelope =
+    magic + version + parameter block + optional `BLOCK_FN_VERBATIM`
+    prefix (`spec/03` §3.10), terminated by `BLOCK_FN_QUIT` + byte-align
+    padding (`spec/05` §4).
+  - New `EncodeError` variants `RaggedInterleave { samples, channels }`,
+    `NoPredictorFits`, and `ZeroChannels`. `NoPredictorFits` surfaces
+    when a block's best-predictor residual stream overflows the
+    natural-energy band (`e ∈ 0..=MAX_NATURAL_ENERGY`) the selector
+    scores — a documented limitation; widening the energy sweep up to
+    the decoder's `MAX_RESIDUAL_WIDTH = 30` cap is a sequencer-layer
+    refinement that does not change the wire format.
+  - 14 in-module unit tests + 7 integration tests
+    (`tests/encode_stream_pipeline.rs`): mono / stereo / 3-/5-channel
+    round-robin, tail-block override, verbatim splice, constant-signal
+    ZERO eligibility, LPC-recurrence material under `H_maxlpcorder = 2`,
+    auto-QLPC never larger than DIFFn-only on LPC material, empty
+    buffer, ragged / zero-channel rejection — all round-trip
+    sample-exact through `decode_stream`.
+
 - **Round 282 clean-room rebuild.** QLPC auto-derivation in the
   per-block predictor-selection sequencer (`spec/03` §3.5 + `spec/02`
   §4.3 + §4.4 + `spec/05` §1.1):
