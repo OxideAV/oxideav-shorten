@@ -120,7 +120,7 @@
 use crate::bitwriter::BitWriter;
 use crate::block::FNSIZE;
 use crate::encoder::{
-    optimal_energy_for_residuals, qlpc_residuals, residual_bits_at_energy, write_diff0_block,
+    optimal_energy_for_residuals_wide, qlpc_residuals, residual_bits_at_energy, write_diff0_block,
     write_diff1_block, write_diff2_block, write_diff3_block, write_qlpc_block, write_zero_block,
     EncodeResult, FN_DIFF0, FN_DIFF1, FN_DIFF2, FN_DIFF3, FN_QLPC, FN_ZERO, MAX_QLPC_ORDER,
 };
@@ -261,11 +261,22 @@ fn svar_bits(value: i64, n: u32) -> Option<u64> {
     Some(uvar_bits(u as u32, n))
 }
 
-/// Optimal Rice energy `e ∈ 0..=MAX_NATURAL_ENERGY` for the residual
-/// stream per TR.156 §3.3's optimal-`n` rate metric, plus the **total**
-/// encoded bit length of the residual stream at that energy. Returns
-/// `None` when no `e` in the natural band yields a finite cost (every
-/// folded value overflows) or when `residuals` is empty.
+/// Optimal Rice energy `e ∈ 0..=MAX_ENERGY` for the residual stream per
+/// TR.156 §3.3's optimal-`n` rate metric, plus the **total** encoded bit
+/// length of the residual stream at that energy. Returns `None` only when
+/// every fold overflows `u64` at every energy in range or when `residuals`
+/// is empty.
+///
+/// The sweep ranges over the **full** decoder-accepted energy band
+/// (`0..=MAX_ENERGY`, residual widths `1..=30`) via
+/// [`optimal_energy_for_residuals_wide`], not just the natural band
+/// `0..=MAX_NATURAL_ENERGY`. This is what lets the selector score a
+/// full-scale cold-carry block — e.g. a first DIFF0 block of near-
+/// full-range samples against a zero mean — instead of having every
+/// candidate evaluator return `None` and the driver surface
+/// [`crate::EncodeError::NoPredictorFits`]. Emitting a wider energy is
+/// not a wire-format change (`spec/02` §4.2: the `uvar(3)` energy field
+/// carries any non-negative integer).
 ///
 /// The cost metric is the same `⌊u / 2^width⌋ + 1 + width` per-sample
 /// formula `svar(width)` uses, summed across the block; the optimum
@@ -281,7 +292,7 @@ fn svar_bits(value: i64, n: u32) -> Option<u64> {
 /// The total cost includes only the residuals; the caller adds the
 /// command's `FNSIZE` + `ENERGYSIZE` prefix.
 fn optimal_energy_and_residual_bits(residuals: &[i64]) -> Option<(u32, u64)> {
-    let e = optimal_energy_for_residuals(residuals)?;
+    let e = optimal_energy_for_residuals_wide(residuals)?;
     let cost = residual_bits_at_energy(residuals, e)?;
     Some((e, cost))
 }

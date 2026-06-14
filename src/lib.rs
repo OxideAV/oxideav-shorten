@@ -313,12 +313,13 @@ pub use crate::encoder::{
     encode_envelope_stream, min_energy_for_diff0, min_energy_for_diff1, min_energy_for_diff2,
     min_energy_for_diff3, min_energy_for_qlpc, optimal_energy_for_diff0, optimal_energy_for_diff1,
     optimal_energy_for_diff2, optimal_energy_for_diff3, optimal_energy_for_qlpc,
-    optimal_energy_for_residuals, qlpc_residuals, residual_bits_at_energy, write_bitshift_command,
-    write_blocksize_command, write_byte_aligned_prefix, write_diff0_block, write_diff1_block,
-    write_diff2_block, write_diff3_block, write_parameter_block, write_qlpc_block,
-    write_quit_command, write_stream_header, write_verbatim_block, write_zero_block, EncodeError,
-    EncodeResult, ENCODER_VERSION, FN_BITSHIFT, FN_BLOCKSIZE, FN_DIFF0, FN_DIFF1, FN_DIFF2,
-    FN_DIFF3, FN_QLPC, FN_QUIT, FN_VERBATIM, FN_ZERO, MAX_NATURAL_ENERGY, MAX_QLPC_ORDER,
+    optimal_energy_for_residuals, optimal_energy_for_residuals_wide, qlpc_residuals,
+    residual_bits_at_energy, write_bitshift_command, write_blocksize_command,
+    write_byte_aligned_prefix, write_diff0_block, write_diff1_block, write_diff2_block,
+    write_diff3_block, write_parameter_block, write_qlpc_block, write_quit_command,
+    write_stream_header, write_verbatim_block, write_zero_block, EncodeError, EncodeResult,
+    ENCODER_VERSION, FN_BITSHIFT, FN_BLOCKSIZE, FN_DIFF0, FN_DIFF1, FN_DIFF2, FN_DIFF3, FN_QLPC,
+    FN_QUIT, FN_VERBATIM, FN_ZERO, MAX_ENERGY, MAX_NATURAL_ENERGY, MAX_QLPC_ORDER,
 };
 pub use crate::error::{Error, Result};
 pub use crate::header::{

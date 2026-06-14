@@ -247,6 +247,25 @@ pub const MAX_QLPC_ORDER: u32 = 1024;
 /// [`EncodeError::ResidualOutOfRange`] when no width up to `8` fits.
 pub const MAX_NATURAL_ENERGY: u32 = 7;
 
+/// Largest energy encoded value the per-block writers will accept and
+/// the wide energy sweep ([`optimal_energy_for_residuals_wide`]) will
+/// consider.
+///
+/// The energy field is `uvar(ENERGYSIZE = 3)` carrying `e`; the residual
+/// mantissa width applied is `e + 1` per `spec/05` §3. The decoder caps
+/// the residual mantissa width at `MAX_RESIDUAL_WIDTH = 30` (see
+/// `predictor.rs`), so the largest encoded energy whose residual width
+/// the decoder still accepts is `e = 30 − 1 = 29`. Emitting `e > 7` is
+/// **not** a wire-format change — the `uvar(3)` energy field carries any
+/// non-negative integer; values above the natural band simply spend more
+/// `uvar` prefix-zero bits on the field itself (the per-block writers
+/// already pack the field with `write_uvar`, and `spec/02` §4.2 places no
+/// upper bound on the field value). The wider acceptance lets a
+/// full-scale cold-carry block — e.g. a first DIFF0 block of near-
+/// full-range samples against a zero mean — select an energy in
+/// `8..=29` rather than surface [`EncodeError::NoPredictorFits`].
+pub const MAX_ENERGY: u32 = 29;
+
 /// The format version this encoder emits.
 ///
 /// The reachable fixture corpus is v2-only per `spec/05` §7; the
@@ -269,9 +288,10 @@ pub enum EncodeError {
     /// `spec/02` §4.5 (`VERBATIM_MAX_LEN`).
     VerbatimTooLong(u32),
     /// The caller's `energy_encoded` parameter to a `BLOCK_FN_DIFFn`
-    /// encoder would imply a residual mantissa width outside `1..=8`.
-    /// The width is `energy_encoded + 1` per `spec/05` §3, so the
-    /// accepted range is `0..=7`.
+    /// (or `BLOCK_FN_QLPC`) encoder would imply a residual mantissa width
+    /// the decoder rejects. The width is `energy_encoded + 1` per
+    /// `spec/05` §3 and the decoder caps it at `MAX_RESIDUAL_WIDTH = 30`,
+    /// so the accepted encoded-energy range is `0..=MAX_ENERGY` (`0..=29`).
     EnergyOutOfRange(u32),
     /// The samples passed to a `BLOCK_FN_DIFFn` encoder (after
     /// subtracting the predictor's prediction) include a residual
@@ -341,10 +361,13 @@ pub enum EncodeError {
     /// The whole-stream encode driver's per-block predictor selector
     /// ([`crate::select_predictor_auto`]) returned no candidate for a
     /// non-empty block — only reachable when every `DIFFn`/QLPC
-    /// residual stream overflows the natural-energy range
-    /// (`0..=MAX_NATURAL_ENERGY`) and `BLOCK_FN_ZERO` is ineligible.
-    /// For in-range PCM this is unreachable; it surfaces a pathological
-    /// input rather than emitting an undecodable block.
+    /// residual stream overflows the **full** decoder-accepted energy
+    /// range (`0..=MAX_ENERGY`, residual widths `1..=30`) and
+    /// `BLOCK_FN_ZERO` is ineligible. Since round 297 the selector sweeps
+    /// the full range (not just `0..=MAX_NATURAL_ENERGY`), so this is
+    /// reachable only for a pathological block whose folded residuals
+    /// overflow `u64` (or need a `uvar` prefix beyond the decoder's cap)
+    /// at every energy in range. For in-range PCM it is unreachable.
     NoPredictorFits,
     /// The header handed to the whole-stream encode driver declared
     /// `H_channels = 0`, which the round-robin channel cursor cannot
@@ -805,11 +828,45 @@ pub fn residual_bits_at_energy(residuals: &[i64], encoded_energy: u32) -> Option
 /// score arbitrary residual streams against the same TR.156 §3.3 rate
 /// metric.
 pub fn optimal_energy_for_residuals(residuals: &[i64]) -> Option<u32> {
+    optimal_energy_in_range(residuals, MAX_NATURAL_ENERGY)
+}
+
+/// Compute the optimal Rice-energy parameter `e ∈ 0..=MAX_ENERGY` for
+/// `residuals` per TR.156 §3.3's optimal-`n` rate metric, sweeping the
+/// **full** encoded-energy range the decoder accepts rather than only the
+/// natural band of [`optimal_energy_for_residuals`].
+///
+/// The difference from [`optimal_energy_for_residuals`] is the upper end
+/// of the sweep: this function ranges `e` up to [`MAX_ENERGY`] (`29`), the
+/// largest encoded energy whose residual mantissa width `e + 1` the
+/// decoder's `MAX_RESIDUAL_WIDTH = 30` cap admits. A residual stream whose
+/// folded magnitudes overflow every natural-band width (`1..=8`) — e.g. a
+/// cold-carry DIFF0 first block of near-full-range samples — still yields
+/// a finite cost at some wider energy, so this function returns `Some`
+/// where [`optimal_energy_for_residuals`] returns `None`.
+///
+/// Emitting the returned energy is not a wire-format change: the energy
+/// field is `uvar(ENERGYSIZE = 3)` carrying any non-negative integer
+/// (`spec/02` §4.2 places no upper bound on the field value), and the
+/// decoder reads it and applies `svar(e + 1)` to the residuals unchanged.
+///
+/// Ties break toward the smaller `e` (tighter mantissa). Returns `None`
+/// only when `residuals` is empty or every fold overflows `u64` at every
+/// energy in range.
+pub fn optimal_energy_for_residuals_wide(residuals: &[i64]) -> Option<u32> {
+    optimal_energy_in_range(residuals, MAX_ENERGY)
+}
+
+/// Shared rate-optimum scan: smallest-cost encoded energy `e ∈ 0..=max_e`
+/// under the [`residual_bits_at_energy`] metric, ties broken toward the
+/// smaller `e`. Returns `None` for an empty stream or when no energy in
+/// range yields a finite cost.
+fn optimal_energy_in_range(residuals: &[i64], max_e: u32) -> Option<u32> {
     if residuals.is_empty() {
         return None;
     }
     let mut best: Option<(u32, u64)> = None;
-    for e in 0..=MAX_NATURAL_ENERGY {
+    for e in 0..=max_e {
         let Some(cost) = residual_bits_at_energy(residuals, e) else {
             continue;
         };
@@ -902,7 +959,9 @@ pub fn optimal_energy_for_qlpc(residuals: &[i64]) -> Option<u32> {
 ///
 /// Errors:
 ///
-/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > 7`.
+/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > MAX_ENERGY`
+///   (`29`); the residual mantissa width `energy_encoded + 1` would
+///   exceed the decoder's `MAX_RESIDUAL_WIDTH = 30`.
 /// * [`EncodeError::BlockTooLong`] if `samples.len() > u32::MAX as usize`.
 ///
 /// The decoder side ([`crate::decode_diff_block`] with
@@ -914,7 +973,7 @@ pub fn write_diff0_block(
     samples: &[i32],
     mu_chan: i64,
 ) -> EncodeResult<()> {
-    if energy_encoded > MAX_NATURAL_ENERGY {
+    if energy_encoded > MAX_ENERGY {
         return Err(EncodeError::EnergyOutOfRange(energy_encoded));
     }
     if samples.len() > u32::MAX as usize {
@@ -999,7 +1058,9 @@ pub(crate) fn diff1_residuals(samples: &[i32], carry: &ChannelCarry) -> Vec<i64>
 ///
 /// Errors:
 ///
-/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > 7`.
+/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > MAX_ENERGY`
+///   (`29`); the residual mantissa width `energy_encoded + 1` would
+///   exceed the decoder's `MAX_RESIDUAL_WIDTH = 30`.
 /// * [`EncodeError::BlockTooLong`] if `samples.len() > u32::MAX as usize`.
 ///
 /// The decoder side ([`crate::decode_diff_block`] with
@@ -1011,7 +1072,7 @@ pub fn write_diff1_block(
     samples: &[i32],
     carry: &ChannelCarry,
 ) -> EncodeResult<()> {
-    if energy_encoded > MAX_NATURAL_ENERGY {
+    if energy_encoded > MAX_ENERGY {
         return Err(EncodeError::EnergyOutOfRange(energy_encoded));
     }
     if samples.len() > u32::MAX as usize {
@@ -1111,7 +1172,9 @@ pub(crate) fn diff2_residuals(samples: &[i32], carry: &ChannelCarry) -> Vec<i64>
 ///
 /// Errors:
 ///
-/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > 7`.
+/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > MAX_ENERGY`
+///   (`29`); the residual mantissa width `energy_encoded + 1` would
+///   exceed the decoder's `MAX_RESIDUAL_WIDTH = 30`.
 /// * [`EncodeError::BlockTooLong`] if `samples.len() > u32::MAX as usize`.
 ///
 /// The decoder side ([`crate::decode_diff_block`] with
@@ -1124,7 +1187,7 @@ pub fn write_diff2_block(
     samples: &[i32],
     carry: &ChannelCarry,
 ) -> EncodeResult<()> {
-    if energy_encoded > MAX_NATURAL_ENERGY {
+    if energy_encoded > MAX_ENERGY {
         return Err(EncodeError::EnergyOutOfRange(energy_encoded));
     }
     if samples.len() > u32::MAX as usize {
@@ -1241,7 +1304,9 @@ pub(crate) fn diff3_residuals(samples: &[i32], carry: &ChannelCarry) -> Vec<i64>
 ///
 /// Errors:
 ///
-/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > 7`.
+/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > MAX_ENERGY`
+///   (`29`); the residual mantissa width `energy_encoded + 1` would
+///   exceed the decoder's `MAX_RESIDUAL_WIDTH = 30`.
 /// * [`EncodeError::BlockTooLong`] if `samples.len() > u32::MAX as usize`.
 ///
 /// The decoder side ([`crate::decode_diff_block`] with
@@ -1254,7 +1319,7 @@ pub fn write_diff3_block(
     samples: &[i32],
     carry: &ChannelCarry,
 ) -> EncodeResult<()> {
-    if energy_encoded > MAX_NATURAL_ENERGY {
+    if energy_encoded > MAX_ENERGY {
         return Err(EncodeError::EnergyOutOfRange(energy_encoded));
     }
     if samples.len() > u32::MAX as usize {
@@ -1434,7 +1499,9 @@ pub fn min_energy_for_qlpc(residuals: &[i64]) -> Option<u32> {
 ///
 /// Errors:
 ///
-/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > 7`.
+/// * [`EncodeError::EnergyOutOfRange`] if `energy_encoded > MAX_ENERGY`
+///   (`29`); the residual mantissa width `energy_encoded + 1` would
+///   exceed the decoder's `MAX_RESIDUAL_WIDTH = 30`.
 /// * [`EncodeError::LpcOrderTooLarge`] if `coefs.len()` exceeds
 ///   [`MAX_QLPC_ORDER`] or the supplied `carry`'s length.
 /// * [`EncodeError::BlockTooLong`] if `samples.len() > u32::MAX as usize`.
@@ -1449,7 +1516,7 @@ pub fn write_qlpc_block(
     samples: &[i32],
     carry: &ChannelCarry,
 ) -> EncodeResult<()> {
-    if energy_encoded > MAX_NATURAL_ENERGY {
+    if energy_encoded > MAX_ENERGY {
         return Err(EncodeError::EnergyOutOfRange(energy_encoded));
     }
     if samples.len() > u32::MAX as usize {
@@ -1895,11 +1962,24 @@ mod tests {
     }
 
     #[test]
-    fn write_diff0_block_rejects_oversize_energy() {
+    fn write_diff0_block_accepts_above_natural_energy_up_to_max() {
+        // Energy 8 (residual width 9) is above the natural band but well
+        // within the decoder's MAX_RESIDUAL_WIDTH = 30 cap; the writer
+        // accepts it (lifting the former MAX_NATURAL_ENERGY ceiling).
+        let mut w = BitWriter::new();
+        assert!(write_diff0_block(&mut w, 8, &[0, 0], 0).is_ok());
+        let mut w = BitWriter::new();
+        assert!(write_diff0_block(&mut w, MAX_ENERGY, &[0, 0], 0).is_ok());
+    }
+
+    #[test]
+    fn write_diff0_block_rejects_energy_above_max() {
+        // Energy 30 implies residual width 31 > MAX_RESIDUAL_WIDTH = 30,
+        // which the decoder rejects; the writer mirrors the cap.
         let mut w = BitWriter::new();
         assert_eq!(
-            write_diff0_block(&mut w, 8, &[0, 0], 0),
-            Err(EncodeError::EnergyOutOfRange(8))
+            write_diff0_block(&mut w, MAX_ENERGY + 1, &[0, 0], 0),
+            Err(EncodeError::EnergyOutOfRange(MAX_ENERGY + 1))
         );
     }
 
@@ -2077,12 +2157,21 @@ mod tests {
     }
 
     #[test]
-    fn write_diff1_block_rejects_oversize_energy() {
+    fn write_diff1_block_accepts_above_natural_energy_up_to_max() {
+        let mut w = BitWriter::new();
+        let carry = crate::predictor::ChannelCarry::new(3);
+        assert!(write_diff1_block(&mut w, 8, &[0, 0], &carry).is_ok());
+        let mut w = BitWriter::new();
+        assert!(write_diff1_block(&mut w, MAX_ENERGY, &[0, 0], &carry).is_ok());
+    }
+
+    #[test]
+    fn write_diff1_block_rejects_energy_above_max() {
         let mut w = BitWriter::new();
         let carry = crate::predictor::ChannelCarry::new(3);
         assert_eq!(
-            write_diff1_block(&mut w, 8, &[0, 0], &carry),
-            Err(EncodeError::EnergyOutOfRange(8))
+            write_diff1_block(&mut w, MAX_ENERGY + 1, &[0, 0], &carry),
+            Err(EncodeError::EnergyOutOfRange(MAX_ENERGY + 1))
         );
     }
 
@@ -2287,12 +2376,21 @@ mod tests {
     }
 
     #[test]
-    fn write_diff2_block_rejects_oversize_energy() {
+    fn write_diff2_block_accepts_above_natural_energy_up_to_max() {
+        let mut w = BitWriter::new();
+        let carry = crate::predictor::ChannelCarry::new(3);
+        assert!(write_diff2_block(&mut w, 8, &[0, 0], &carry).is_ok());
+        let mut w = BitWriter::new();
+        assert!(write_diff2_block(&mut w, MAX_ENERGY, &[0, 0], &carry).is_ok());
+    }
+
+    #[test]
+    fn write_diff2_block_rejects_energy_above_max() {
         let mut w = BitWriter::new();
         let carry = crate::predictor::ChannelCarry::new(3);
         assert_eq!(
-            write_diff2_block(&mut w, 8, &[0, 0], &carry),
-            Err(EncodeError::EnergyOutOfRange(8))
+            write_diff2_block(&mut w, MAX_ENERGY + 1, &[0, 0], &carry),
+            Err(EncodeError::EnergyOutOfRange(MAX_ENERGY + 1))
         );
     }
 
@@ -2539,12 +2637,21 @@ mod tests {
     }
 
     #[test]
-    fn write_diff3_block_rejects_oversize_energy() {
+    fn write_diff3_block_accepts_above_natural_energy_up_to_max() {
+        let mut w = BitWriter::new();
+        let carry = crate::predictor::ChannelCarry::new(3);
+        assert!(write_diff3_block(&mut w, 8, &[0, 0], &carry).is_ok());
+        let mut w = BitWriter::new();
+        assert!(write_diff3_block(&mut w, MAX_ENERGY, &[0, 0], &carry).is_ok());
+    }
+
+    #[test]
+    fn write_diff3_block_rejects_energy_above_max() {
         let mut w = BitWriter::new();
         let carry = crate::predictor::ChannelCarry::new(3);
         assert_eq!(
-            write_diff3_block(&mut w, 8, &[0, 0], &carry),
-            Err(EncodeError::EnergyOutOfRange(8))
+            write_diff3_block(&mut w, MAX_ENERGY + 1, &[0, 0], &carry),
+            Err(EncodeError::EnergyOutOfRange(MAX_ENERGY + 1))
         );
     }
 
@@ -2813,11 +2920,20 @@ mod tests {
     }
 
     #[test]
-    fn write_qlpc_block_rejects_energy_above_seven() {
+    fn write_qlpc_block_accepts_above_natural_energy_up_to_max() {
         let mut w = BitWriter::new();
         let carry = crate::predictor::ChannelCarry::new(3);
-        let err = write_qlpc_block(&mut w, 8, &[1], &[0], &carry).unwrap_err();
-        assert_eq!(err, EncodeError::EnergyOutOfRange(8));
+        assert!(write_qlpc_block(&mut w, 8, &[1], &[0], &carry).is_ok());
+        let mut w = BitWriter::new();
+        assert!(write_qlpc_block(&mut w, MAX_ENERGY, &[1], &[0], &carry).is_ok());
+    }
+
+    #[test]
+    fn write_qlpc_block_rejects_energy_above_max() {
+        let mut w = BitWriter::new();
+        let carry = crate::predictor::ChannelCarry::new(3);
+        let err = write_qlpc_block(&mut w, MAX_ENERGY + 1, &[1], &[0], &carry).unwrap_err();
+        assert_eq!(err, EncodeError::EnergyOutOfRange(MAX_ENERGY + 1));
     }
 
     #[test]
@@ -3530,5 +3646,49 @@ mod tests {
         // spec/01 §3 — but the API surfaces None rather than panic.
         let empty: Vec<i64> = Vec::new();
         assert!(optimal_energy_for_residuals(&empty).is_none());
+        assert!(optimal_energy_for_residuals_wide(&empty).is_none());
+    }
+
+    #[test]
+    fn wide_sweep_selects_where_natural_band_overflows() {
+        // A full-scale cold-carry DIFF0 residual stream (the samples
+        // themselves over a zero mean) whose largest folded magnitude
+        // exceeds every natural-band width (e ∈ 0..=7, residual widths
+        // 1..=8 cover folded magnitudes < 2^8 = 256). The natural-band
+        // optimum returns None (the prefix-zero run at width 8 exceeds
+        // the decoder's uvar cap), while the wide sweep selects a finite
+        // energy in 8..=MAX_ENERGY.
+        let residuals: Vec<i64> = vec![32_767, -32_768, 32_000, -31_000];
+        assert!(
+            optimal_energy_for_residuals(&residuals).is_none(),
+            "natural band has no finite-cost energy for full-scale residuals"
+        );
+        let wide = optimal_energy_for_residuals_wide(&residuals)
+            .expect("wide sweep finds a finite-cost energy");
+        assert!(
+            wide > MAX_NATURAL_ENERGY && wide <= MAX_ENERGY,
+            "wide optimum {wide} is above the natural band and within MAX_ENERGY"
+        );
+        // The chosen energy actually has a finite encoded cost.
+        assert!(residual_bits_at_energy(&residuals, wide).is_some());
+    }
+
+    #[test]
+    fn wide_sweep_agrees_with_natural_when_residuals_are_tight() {
+        // For a residual stream that fits the natural band, the two
+        // sweeps return the same optimum (the wider range adds only
+        // strictly-more-expensive candidates that never win).
+        for residuals in [
+            vec![0i64, 1, -1, 2, -2],
+            vec![3, -3, 0, 1],
+            vec![127, -128, 0],
+            vec![0, 0, 0, 0],
+        ] {
+            assert_eq!(
+                optimal_energy_for_residuals(&residuals),
+                optimal_energy_for_residuals_wide(&residuals),
+                "sweeps agree on tight stream {residuals:?}"
+            );
+        }
     }
 }

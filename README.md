@@ -5,7 +5,7 @@ A pure-Rust Shorten (`.shn`) lossless audio codec for the
 
 ## Status
 
-**Clean-room rebuild — round 290 (2026-06-13).** The crate was
+**Clean-room rebuild — round 297 (2026-06-14).** The crate was
 orphan-rebuilt on 2026-05-18 after a workspace audit found the prior
 implementation derived from an external reference codebase.
 Re-implementation is proceeding strictly against the in-tree clean-room
@@ -1044,6 +1044,44 @@ Wayne Stielau's seek-table utility:
     `NoPredictorFits` path — all round-trip sample-exact through
     `decode_stream`.
 
+- **Round 297** — **wide energy sweep up to the decoder's residual-width
+  cap** (`spec/02` §4.2 + `spec/05` §3), closing round 290's stated
+  "What's not yet here" follow-up:
+  * New `pub const MAX_ENERGY = 29` — the largest encoded energy `e`
+    whose residual mantissa width `e + 1` reaches the decoder's
+    `MAX_RESIDUAL_WIDTH = 30` cap. `spec/02` §4.2 places no upper bound
+    on the `uvar(ENERGYSIZE = 3)` energy-field value, so emitting an
+    energy in `8..=29` is **not** a wire-format change — the field just
+    spends more `uvar` prefix bits and the decoder reads it and applies
+    `svar(e + 1)` unchanged.
+  * New public helper `optimal_energy_for_residuals_wide(residuals)` —
+    the rate-optimum scan over the full band `e ∈ 0..=MAX_ENERGY`,
+    alongside the natural-band `optimal_energy_for_residuals`
+    (`0..=MAX_NATURAL_ENERGY`). The per-block sequencer's candidate
+    evaluators now score against the wide variant, so a full-scale
+    cold-carry block — e.g. a first DIFF0 block of near-full-range s16
+    samples against a zero mean — selects a wider energy and encodes
+    sample-exact instead of every candidate returning `None` and the
+    driver surfacing `NoPredictorFits`.
+  * The five per-block writers (`write_diff0..3_block`,
+    `write_qlpc_block`) now accept `energy_encoded` up to `MAX_ENERGY`
+    (formerly capped at `MAX_NATURAL_ENERGY = 7`), still rejecting
+    `energy_encoded > MAX_ENERGY` with `EnergyOutOfRange` because the
+    implied width would exceed the decoder's cap.
+  * `NoPredictorFits` is now reachable only for a pathological block
+    whose folded residuals overflow `u64` (or need a `uvar` prefix
+    beyond the decoder's cap) at *every* energy in range — unreachable
+    for in-range PCM.
+  * 8 new tests: the round-290 `out_of_natural_energy_range_surfaces_no_predictor_fits`
+    driver test is rewritten as
+    `full_scale_cold_carry_block_selects_via_wide_energy_sweep` (now a
+    sample-exact round-trip) plus a near-full-range s16 cold-carry
+    round-trip; the five writer rejection tests are rewritten to assert
+    `energy ∈ {8, MAX_ENERGY}` is accepted and `MAX_ENERGY + 1` is
+    rejected; and two encoder unit tests pin
+    `optimal_energy_for_residuals_wide` (selects where the natural band
+    overflows; agrees with the natural band on tight streams).
+
 - **Round 273** — **`BLOCK_FN_QUIT` encoding pinned to the resolved
   `spec/04` §2 errata** (`spec/04` §2 + §2.1 + `spec/02` §2.1):
   * The QUIT function-code field `uvar(FNSIZE = 2)` of value 4 is the
@@ -1121,7 +1159,7 @@ Wayne Stielau's seek-table utility:
     auto-selection — still requires a candidate coefficient-
     quantisation pass and remains future work.
 
-The combined surface is exercised by **415 tests** (312 in-module
+The combined surface is exercised by **423 tests** (320 in-module
 unit + 103 integration tests across 21 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
@@ -1161,11 +1199,11 @@ leaves the second block undecoded until the next pull) (round 10).
 * (Round 290 landed the whole-stream **encode driver** `encode_stream`
   — the encoder mirror of `decode_stream` that owns channel round-robin,
   carry / mean bookkeeping, BLOCKSIZE tail handling, and verbatim
-  prefixes around the per-block selector. The remaining encoder
-  refinement is widening [`select_predictor_auto`]'s energy sweep beyond
-  the natural-energy band `e ∈ 0..=MAX_NATURAL_ENERGY` up to the
-  decoder's `MAX_RESIDUAL_WIDTH = 30` cap, so full-scale cold-carry
-  blocks select rather than surface `NoPredictorFits`; this is a
+  prefixes around the per-block selector. Round 297 closed its energy-
+  sweep follow-up: the selector now scores candidates over the full
+  decoder-accepted band `e ∈ 0..=MAX_ENERGY` (`29`) up to the decoder's
+  `MAX_RESIDUAL_WIDTH = 30` cap, so full-scale cold-carry blocks select
+  and encode sample-exact rather than surfacing `NoPredictorFits` — a
   sequencer-layer change that does not affect the wire format.)
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,

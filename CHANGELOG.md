@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 297 clean-room rebuild.** Wide energy sweep up to the decoder's
+  residual-width cap (`spec/02` §4.2 + `spec/05` §3), closing round 290's
+  energy-sweep follow-up:
+  - New `pub const MAX_ENERGY = 29` — the largest encoded energy whose
+    residual mantissa width `e + 1` reaches the decoder's
+    `MAX_RESIDUAL_WIDTH = 30` cap. `spec/02` §4.2 places no upper bound on
+    the `uvar(ENERGYSIZE = 3)` energy-field value, so emitting an energy in
+    `8..=29` is not a wire-format change.
+  - New public helper `optimal_energy_for_residuals_wide(residuals)` — the
+    rate-optimum scan over the full band `e ∈ 0..=MAX_ENERGY`, alongside
+    the natural-band `optimal_energy_for_residuals`. The per-block
+    sequencer now scores candidates against the wide variant, so a
+    full-scale cold-carry block selects a wider energy and encodes
+    sample-exact instead of surfacing `EncodeError::NoPredictorFits`.
+  - The five per-block writers (`write_diff0..3_block`, `write_qlpc_block`)
+    now accept `energy_encoded` up to `MAX_ENERGY` (formerly capped at
+    `MAX_NATURAL_ENERGY = 7`), still rejecting values above `MAX_ENERGY`
+    with `EncodeError::EnergyOutOfRange`.
+
 - **Round 290 clean-room rebuild.** Whole-stream encode driver
   `encode_stream(header, samples, verbatim_prefix)` — the encoder mirror
   of `decode_stream` (`spec/03` §2 + §3.6 + §3.8 + §3.10 + `spec/04`

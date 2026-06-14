@@ -68,19 +68,23 @@
 //! `H_maxlpcorder = 0` reduces the candidate set to the
 //! polynomial-difference family plus ZERO (`spec/03` §3.5).
 //!
-//! ## Natural-energy range (current limitation)
+//! ## Energy range
 //!
-//! [`select_predictor_auto`] scores candidates only at the
-//! *natural* Rice energies `e ∈ 0..=MAX_NATURAL_ENERGY` (`spec/05`
-//! §3.1), i.e. residual mantissa widths `1..=8`. A block whose
-//! best-predictor residual stream overflows that band — for instance a
-//! cold-carry DIFF0 first block of full-scale samples — has no scored
-//! candidate and surfaces [`EncodeError::NoPredictorFits`]. Real PCM
-//! after a predictor's de-correlation almost always lands inside the
-//! band; widening the selector's energy sweep up to the decoder's
-//! `MAX_RESIDUAL_WIDTH = 30` cap is a sequencer-layer refinement that
-//! does not change the wire format (the per-predictor writers already
-//! accept any energy in range).
+//! [`select_predictor_auto`] scores candidates over the **full**
+//! decoder-accepted Rice-energy range `e ∈ 0..=MAX_ENERGY` (`29`),
+//! i.e. residual mantissa widths `1..=30` (the decoder's
+//! `MAX_RESIDUAL_WIDTH = 30` cap; `spec/02` §4.2 places no upper bound on
+//! the `uvar(3)` energy-field value). A block whose best-predictor
+//! residual stream overflows the *natural* band `0..=MAX_NATURAL_ENERGY`
+//! (residual widths `1..=8`) — for instance a cold-carry DIFF0 first
+//! block of full-scale samples — now selects a wider energy and encodes
+//! sample-exact rather than surfacing [`EncodeError::NoPredictorFits`]
+//! (round 297). Emitting a wider energy is not a wire-format change — the
+//! per-predictor writers pack the field with `write_uvar` and the decoder
+//! reads any value and applies `svar(e + 1)`. [`EncodeError::NoPredictorFits`]
+//! is now reachable only for a pathological block whose folded residuals
+//! overflow `u64` (or need a `uvar` prefix beyond the decoder's cap) at
+//! *every* energy in range — unreachable for in-range PCM.
 //!
 //! ## Clean-room provenance
 //!
@@ -450,19 +454,31 @@ mod tests {
     }
 
     #[test]
-    fn out_of_natural_energy_range_surfaces_no_predictor_fits() {
+    fn full_scale_cold_carry_block_selects_via_wide_energy_sweep() {
         // A first block whose samples (= DIFF0 residuals over a cold
-        // carry) exceed the natural-energy band the current selector
-        // scores surfaces NoPredictorFits rather than emitting an
-        // undecodable block. This pins the documented limitation of the
-        // natural-energy selector (a wider-energy sweep is a future
-        // sequencer-layer refinement, not a wire-format change). The
-        // amplitude here (50_000) overflows every e ∈ 0..=7 width.
+        // carry) overflow every natural-energy width (e ∈ 0..=7, residual
+        // widths 1..=8). The round-297 wide energy sweep ranges the
+        // selector up to the decoder's MAX_RESIDUAL_WIDTH = 30 cap
+        // (e ∈ 0..=MAX_ENERGY = 29), so the block now selects a wider
+        // energy and round-trips sample-exact rather than surfacing
+        // NoPredictorFits. Emitting the wider energy is not a wire-format
+        // change — the uvar(3) energy field carries any non-negative
+        // value (spec/02 §4.2). The amplitude here (50_000) needs a
+        // residual width above the natural band.
         let header = v2_header(1, 4, 0, 0);
         let samples: Vec<i32> = vec![50_000, -50_000, 40_000, -30_000];
-        assert!(matches!(
-            encode_stream(&header, &samples, &[]),
-            Err(EncodeError::NoPredictorFits)
-        ));
+        roundtrip(&header, &samples, &[]);
+    }
+
+    #[test]
+    fn full_range_i16_cold_carry_roundtrips() {
+        // Near-full-range s16 first block against a cold (zero) carry:
+        // the DIFF0 residual stream is the samples themselves, with
+        // magnitudes up to 32_767 (folded ~65_534 → residual width 17,
+        // encoded energy 16). Exercises the wide sweep on a realistic
+        // worst-case opening block.
+        let header = v2_header(1, 8, 0, 0);
+        let samples: Vec<i32> = vec![32_767, -32_768, 32_000, -31_000, 30_000, -29_000, 1, -1];
+        roundtrip(&header, &samples, &[]);
     }
 }
