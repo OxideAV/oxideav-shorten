@@ -287,6 +287,8 @@ mod codec;
 mod driver;
 mod encode_driver;
 mod encoder;
+#[cfg(feature = "registry")]
+mod encoder_trait;
 mod error;
 mod header;
 mod predictor;
@@ -321,6 +323,10 @@ pub use crate::encoder::{
     ENCODER_VERSION, FN_BITSHIFT, FN_BLOCKSIZE, FN_DIFF0, FN_DIFF1, FN_DIFF2, FN_DIFF3, FN_QLPC,
     FN_QUIT, FN_VERBATIM, FN_ZERO, MAX_ENERGY, MAX_NATURAL_ENERGY, MAX_QLPC_ORDER,
 };
+#[cfg(feature = "registry")]
+pub use crate::encoder_trait::{
+    make_encoder, register_encoder, ShortenEncoder, DEFAULT_BLOCKSIZE, ENCODER_HEADER_VERSION,
+};
 pub use crate::error::{Error, Result};
 pub use crate::header::{
     parse_stream_header, Filetype, ParsedHeader, ShortenStreamHeader, MAGIC, MIN_HEADER_BYTES,
@@ -352,6 +358,7 @@ pub use crate::stream_iter::{decode_stream_iter, DecodedBlock, StreamDecoder};
 pub fn register(ctx: &mut oxideav_core::RuntimeContext) {
     codec::register_codecs(&mut ctx.codecs);
     codec::register_streaming_codecs(&mut ctx.codecs);
+    encoder_trait::register_encoder(&mut ctx.codecs);
 }
 
 #[cfg(feature = "registry")]

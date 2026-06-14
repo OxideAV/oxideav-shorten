@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 304 clean-room rebuild.** `oxideav_core::Encoder` trait wiring —
+  the frame-in / packet-out mirror of the round-8 `ShortenDecoder`
+  (`spec/05` §6 + `spec/03` §2 + `spec/01` §3 + the `oxideav_core::Encoder`
+  trait contract):
+  - New `ShortenEncoder` adaptor: `send_frame` unpacks each planar
+    `AudioFrame` into per-channel `i32` accumulators (reversing the
+    `spec/05` §6 host-byte packing the decoder applies on emission);
+    `flush` re-interleaves and runs `encode_stream` once, queuing exactly
+    one `.shn` `Packet`; `receive_packet` drains it then returns `Eof`.
+  - `H_filetype` derived from `params.sample_format` (`U8P` → `2`/`u8`,
+    `S16P` → `5`/`s16lh` by default); a `"filetype"` codec option overrides
+    to one of the three `spec/05` §6 pinned codes (`2`/`3`/`5`).
+    `"blocksize"` / `"maxlpcorder"` / `"meanblocks"` options tune the
+    remaining header fields with spec-default fallbacks (256 / 0 / 0).
+  - `make_encoder(params)` direct factory + `register_encoder(reg)`
+    installer (registered under the existing `"shorten"` codec id alongside
+    the decoder factory); `register(ctx)` now wires both encode + decode.
+  - Public constants `DEFAULT_BLOCKSIZE = 256` and
+    `ENCODER_HEADER_VERSION = 2`.
+  - +15 in-module unit tests + 2 integration tests
+    (`tests/encoder_trait_roundtrip.rs`): registry-resolved encode → decode
+    round-trip sample-exact (mono + multi-frame stereo + `u8`), the
+    decoder-output → encoder re-encode byte-identity property, factory
+    parameter validation, and `filetype` option override.
+
 - **Round 297 clean-room rebuild.** Wide energy sweep up to the decoder's
   residual-width cap (`spec/02` §4.2 + `spec/05` §3), closing round 290's
   energy-sweep follow-up:

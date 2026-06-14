@@ -1159,8 +1159,55 @@ Wayne Stielau's seek-table utility:
     auto-selection — still requires a candidate coefficient-
     quantisation pass and remains future work.
 
-The combined surface is exercised by **423 tests** (320 in-module
-unit + 103 integration tests across 21 integration binaries). The
+- **Round 304** — the **`oxideav_core::Encoder` trait wiring**
+  ([`ShortenEncoder`] / [`make_encoder`] / [`register_encoder`]) per
+  `spec/05` §6 + `spec/03` §2 + `spec/01` §3 + the `oxideav_core::Encoder`
+  trait contract — the frame-in / packet-out mirror of the round-8
+  [`ShortenDecoder`], completing the dual-API surface (both sides now
+  expose a direct `make_*` factory plus a registry installer):
+  * [`ShortenEncoder`] buffers planar [`oxideav_core::AudioFrame`] PCM
+    across `send_frame` calls — unpacking each plane's host bytes back
+    into per-channel `i32` samples by reversing the `spec/05` §6 packing
+    the decoder applies on emission (`u8` → 1 byte, `s16hl` → big-endian
+    `i16`, `s16lh` → little-endian `i16`) — and on `flush` re-interleaves
+    them, builds the [`ShortenStreamHeader`], runs [`encode_stream`] once,
+    and queues exactly one `.shn` [`oxideav_core::Packet`].
+    `receive_packet` drains the queued packet then returns
+    [`oxideav_core::Error::Eof`]; before `flush` it returns `NeedMore`.
+    Since Shorten's predictor / mean state runs across every block of the
+    whole file (`spec/03` §2), the encoder cannot emit until it has seen
+    the entire sample population — hence the single-packet-at-flush shape.
+  * Header derivation from [`oxideav_core::CodecParameters`]: `H_channels`
+    from `params.channels` (required); `H_filetype` from
+    `params.sample_format` (`U8P` → `2`/`u8`; `S16P` → `5`/`s16lh` by
+    default, the little-endian form fixture `F1` pins in `spec/05` §6),
+    overridable to one of the three pinned codes (`2`/`3`/`5`) via a
+    `"filetype"` codec option; `H_blocksize` / `H_maxlpcorder` /
+    `H_meanblocks` from the `"blocksize"` / `"maxlpcorder"` /
+    `"meanblocks"` options with spec-default fallbacks (256 / 0 / 0).
+  * [`make_encoder`] direct factory + [`register_encoder`] installer
+    (registered under the existing `"shorten"` codec id alongside the
+    decoder factory — a second `CodecInfo` so `has_decoder` and
+    `has_encoder` both resolve). [`register`] now wires both encode +
+    decode + the streaming decoder. Public constants
+    `DEFAULT_BLOCKSIZE = 256` and `ENCODER_HEADER_VERSION = 2`. The
+    encoder-trait module is gated on the `registry` feature (it depends on
+    the framework's `Encoder` trait); the standalone build is unaffected.
+  * 15 new in-module unit tests + 2 new integration tests
+    (`tests/encoder_trait_roundtrip.rs`) confirm: factory builds + reports
+    codec id; rejection of missing / zero channels; `register_encoder`
+    installs the encoder factory; `H_filetype` default derivation +
+    `"filetype"` option override to `s16hl` + unpinned-code rejection;
+    `s16` plane unpack round-trip + odd-length rejection; mono frame
+    encodes + decodes sample-exact; stereo across two frames re-interleaves
+    + round-trips; wrong-plane-count rejection; `send_frame`-after-`flush`
+    rejection; `u8` filetype round-trip; empty-stream flush still emits a
+    decodable envelope; a registry-resolved encode → registry-resolved
+    decode round-trip is sample-exact; and a decoder-output frame
+    re-encodes byte-identically.
+
+The combined surface is exercised by **440 tests** (335 in-module
+unit + 105 integration tests across 22 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
 channel DIFF1-DIFF1-DIFF1-QUIT with the round-robin cursor of
@@ -1205,6 +1252,11 @@ leaves the second block undecoded until the next pull) (round 10).
   `MAX_RESIDUAL_WIDTH = 30` cap, so full-scale cold-carry blocks select
   and encode sample-exact rather than surfacing `NoPredictorFits` — a
   sequencer-layer change that does not affect the wire format.)
+* (Round 304 wired the whole-stream encode driver into the framework's
+  `oxideav_core::Encoder` trait via `ShortenEncoder` / `make_encoder` /
+  `register_encoder`, completing the dual-API surface — both the decode
+  and encode sides now expose a direct `make_*` factory plus a registry
+  installer, and `register(ctx)` resolves a Shorten encoder by codec id.)
 * Sample-format byte-packing for the eight TR.156 labels that
   `spec/05` §6 leaves with unpinned numeric codes (`ulaw`, `s8`,
   `s16`, `u16`, `s16x`, `u16x`, `u16hl`, `u16lh`); unblocking
