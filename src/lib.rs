@@ -342,7 +342,7 @@ pub use crate::sequencer::{
 };
 pub use crate::sidecar::{
     detect_shnampsk_trailer, split_off_shnampsk_trailer, ShnampskTrailer, MIN_SIDECAR_LEN,
-    SEEK_MAGIC, SHNAMPSK_SIGNATURE, SIDECAR_LEN_CAP, TRAILER_TAIL_LEN,
+    SEEK_MAGIC, SEEK_VERSION_OFFSET, SHNAMPSK_SIGNATURE, SIDECAR_LEN_CAP, TRAILER_TAIL_LEN,
 };
 pub use crate::stream_iter::{decode_stream_iter, DecodedBlock, StreamDecoder};
 

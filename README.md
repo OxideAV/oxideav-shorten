@@ -273,6 +273,43 @@ Wayne Stielau's seek-table utility:
     (implementation safety cap; the `spec/05` §5 narrative does
     not pin a numeric cap).
 
+- **Round 312** — the **`SEEK` sidecar format-version byte**
+  (`spec/05` §5.1):
+  * `ShnampskTrailer` gains a `seek_format_version: u8` field — the
+    single byte at sidecar offset 4 (immediately after the 4-byte
+    `SEEK` magic), the only sidecar-internal field of the `spec/05`
+    §5.1 narrative ("the sidecar begins with the 4-byte ASCII magic
+    `SEEK` … followed by … a version byte") pinned with an
+    unambiguous one-byte width. `detect_shnampsk_trailer` reads it
+    once the `SEEK` anchor is validated and surfaces it raw — the
+    spec set pins the field's existence and width but not its legal
+    value set, so the detector does not interpret the numeric value.
+  * New public constant `SEEK_VERSION_OFFSET = 4` — the sidecar-
+    relative byte offset of the version byte, equal to
+    `SEEK_MAGIC.len()`.
+  * The §5.1 "stored copy of the SHN-stream-proper length" field
+    that follows the version byte is **deliberately not parsed**:
+    neither its byte width nor its endianness is pinned by the
+    references, and `spec/05` §8 open §9.4 candidate #5 declares the
+    seek-table-proper internal schema out of scope (`no resolution
+    is sought`). The trailer tail's own 4-byte little-endian
+    `len_u32` (`spec/05` §5.1 row 1) remains the load-bearing
+    sidecar-boundary check, independent of that unpinned internal
+    copy.
+  * 5 new in-module unit tests: version byte read at offset 4;
+    distinct version values (`{0, 1, 2, 3, 0x7F, 0x80, 0xFF}`)
+    round-trip; the byte comes from `sidecar_start + 4` not the
+    trailer tail or the SHN proper; `split_off` slice cross-check;
+    `SEEK_VERSION_OFFSET` constant matches the layout. The version
+    byte is always in bounds for a well-formed sidecar
+    (`MIN_SIDECAR_LEN = 16 ≥ 4 + 12`), so no new error path is
+    introduced.
+  * **Scope.** The remaining sidecar gap (the seek-record entries'
+    field schema) is `spec/05` §8 candidate #5, explicitly out of
+    scope. The remaining codec-path gap is the eight unpinned
+    `H_filetype` labels (§8 candidate #3), which need additional
+    fixtures or reference-encoder observation.
+
 * Round 12 (`spec/01` §1 + §3 + `spec/02` §1..§3 + `spec/03` §3.8 +
   §3.10 + `spec/04` §2 + §7 + `spec/05` §4):
   * `BitWriter` — MSB-first encode-side counterpart of `BitReader`,
@@ -1206,7 +1243,7 @@ Wayne Stielau's seek-table utility:
     decode round-trip is sample-exact; and a decoder-output frame
     re-encodes byte-identically.
 
-The combined surface is exercised by **440 tests** (335 in-module
+The combined surface is exercised by **445 tests** (340 in-module
 unit + 105 integration tests across 22 integration binaries). The
 integration suite composes the header parse
 with the per-block dispatch: VERBATIM-then-QUIT (round 2), multi-
