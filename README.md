@@ -17,7 +17,11 @@ v2/v3 path:
   six-field variable-length parameter block, all ten function codes
   (`DIFF0..3`, `QLPC`, `ZERO`, `VERBATIM`, `QUIT`, `BLOCKSIZE`,
   `BITSHIFT`), the per-channel sample-history carry, the running-mean
-  estimator, and the per-stream bit-shift.
+  estimator, and the per-stream bit-shift. On `QUIT` it consumes the
+  zero-padding to the next byte boundary and exposes the byte-exact
+  end of the SHN stream proper as `DecodedStream::stream_proper_len`
+  (`spec/04` §2.1) — the authoritative split point for any out-of-band
+  seek-table sidecar.
 * **Encoder** — the whole-stream encode driver (`encode_stream`) takes
   an interleaved `&[i32]` PCM buffer and produces a `.shn` byte stream
   that `decode_stream` reconstructs sample-exact. A per-block selector

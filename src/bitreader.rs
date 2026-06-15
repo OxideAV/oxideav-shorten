@@ -93,6 +93,57 @@ impl<'a> BitReader<'a> {
         bits_read_from_input - cached
     }
 
+    /// Total bits already surfaced to the caller, irrespective of the
+    /// total-input width (unlike [`Self::bits_consumed_so_far`], which
+    /// the header parser uses with a known total). Equals
+    /// `byte_pos * 8 - n_bits` because the cache holds `n_bits`
+    /// look-ahead bits that have been pulled from the input but not yet
+    /// consumed by a `read_*`.
+    fn bits_consumed(&self) -> u64 {
+        (self.byte_pos as u64) * 8 - (self.n_bits as u64)
+    }
+
+    /// Number of bits already surfaced to the caller, modulo 8 — i.e.
+    /// the bit position within the current byte (`0` means the reader
+    /// is sitting on a byte boundary).
+    pub fn bit_offset_in_byte(&self) -> u32 {
+        (self.bits_consumed() % 8) as u32
+    }
+
+    /// Consume the zero-padding bits from the current sub-byte bit
+    /// position up to the next byte boundary, returning the
+    /// **byte offset** (into the input slice) of that boundary — i.e.
+    /// the count of input bytes fully consumed once the alignment
+    /// completes.
+    ///
+    /// `spec/04` §2.1 pins the post-`BLOCK_FN_QUIT` rule: the QUIT
+    /// command's `uvar(2)` field ends at an arbitrary sub-byte bit
+    /// position, after which the encoder emits zero-padding bits to the
+    /// next byte boundary; that boundary is exactly where the SHN
+    /// stream proper ends (and, when present, where a `SEEK`-magic
+    /// seek-table sidecar begins — verified on fixtures `F9` and `F1`).
+    /// The padding bits are skipped rather than value-checked: their
+    /// role in the spec is purely to reach the boundary, and lenient
+    /// skipping lets the decoder accept streams whose final-byte tail
+    /// carries unrelated low bits without rejecting otherwise-valid
+    /// PCM. If the reader is already on a byte boundary no bits are
+    /// consumed.
+    ///
+    /// Returns [`Error::Truncated`] only if the input exhausts before
+    /// the boundary is reached.
+    pub fn align_to_byte(&mut self) -> Result<usize> {
+        let rem = self.bit_offset_in_byte();
+        if rem != 0 {
+            // (8 - rem) padding bits remain to the next byte boundary.
+            self.skip_bits(8 - rem)?;
+        }
+        debug_assert_eq!(self.bit_offset_in_byte(), 0);
+        // After alignment, every bit pulled into the cache beyond the
+        // boundary is whole bytes; the boundary byte offset is the
+        // consumed-bit count divided by 8.
+        Ok((self.bits_consumed() / 8) as usize)
+    }
+
     /// Refill the cache so that it holds at least `min_bits` valid
     /// bits. Each refilled byte is shifted into the low positions of
     /// the cache window, but the read API consumes from the high end.
@@ -247,6 +298,35 @@ mod tests {
         }
         // One more bit would exhaust the buffer.
         assert!(matches!(r.read_bit(), Err(Error::Truncated)));
+    }
+
+    #[test]
+    fn align_to_byte_consumes_padding_to_boundary() {
+        // spec/04 §2.1: after a sub-byte-position command field the
+        // remaining bits to the next byte boundary are zero padding.
+        // 0xFB 0xB1 — read 4 bits (lands at bit offset 4 within byte 0),
+        // then align consumes the next 4 bits and reports byte offset 1.
+        let bytes = [0xFB, 0xB1];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read_bits(4).unwrap(), 0xF);
+        assert_eq!(r.bit_offset_in_byte(), 4);
+        assert_eq!(r.align_to_byte().unwrap(), 1);
+        assert_eq!(r.bit_offset_in_byte(), 0);
+        // The byte-1 content is still readable in full after alignment.
+        assert_eq!(r.read_bits(8).unwrap(), 0xB1);
+        assert_eq!(r.align_to_byte().unwrap(), 2);
+    }
+
+    #[test]
+    fn align_to_byte_is_a_noop_on_boundary() {
+        // Already byte-aligned: align consumes nothing and reports the
+        // current byte offset.
+        let bytes = [0xAB, 0xCD];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read_bits(8).unwrap(), 0xAB);
+        assert_eq!(r.bit_offset_in_byte(), 0);
+        assert_eq!(r.align_to_byte().unwrap(), 1);
+        assert_eq!(r.read_bits(8).unwrap(), 0xCD);
     }
 
     #[test]

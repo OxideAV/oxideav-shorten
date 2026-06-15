@@ -8,6 +8,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 313 — post-`BLOCK_FN_QUIT` byte-alignment (`spec/04` §2.1).**
+  The decoder now consumes the zero-padding bits that follow the QUIT
+  command's sub-byte-position `uvar(2) = 4` field up to the next byte
+  boundary, and `DecodedStream` exposes the resulting boundary as a new
+  `stream_proper_len` field — the byte-exact end of the SHN stream
+  proper (and the start of any out-of-band `SEEK`-magic seek-table
+  sidecar, matching the §2.1 / footnote-`T9` fixture anchors). New
+  `BitReader::align_to_byte` / `bit_offset_in_byte` helpers back this.
+  +2 bit-reader unit tests + 2 driver tests (boundary on a padded
+  stream; boundary excluding a trailing out-of-band trailer).
+
 - **Round 304 clean-room rebuild.** `oxideav_core::Encoder` trait wiring —
   the frame-in / packet-out mirror of the round-8 `ShortenDecoder`
   (`spec/05` §6 + `spec/03` §2 + `spec/01` §3 + the `oxideav_core::Encoder`

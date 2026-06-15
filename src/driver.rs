@@ -96,6 +96,18 @@ pub struct DecodedStream {
     /// lossless stream (`bshift = 0` throughout) the samples are the
     /// reconstructed PCM directly.
     pub channels: Vec<Vec<i32>>,
+    /// Byte length of the SHN stream proper — the offset into the
+    /// original input at which the `BLOCK_FN_QUIT` command's
+    /// zero-padding reaches the next byte boundary (`spec/04` §2.1).
+    ///
+    /// This is the authoritative end of the Shorten bit stream: any
+    /// bytes at `bytes[stream_proper_len..]` are out-of-band trailer
+    /// material (e.g. a `SEEK`-magic seek-table sidecar; `spec/05`
+    /// §5). On fixtures with no trailing sidecar this equals
+    /// `bytes.len()`; on a fixture carrying a sidecar it lands exactly
+    /// on the sidecar's `SEEK` magic, matching the §2.1 / footnote
+    /// `T9` anchor.
+    pub stream_proper_len: usize,
 }
 
 impl DecodedStream {
@@ -163,6 +175,12 @@ pub fn decode_stream(bytes: &[u8]) -> Result<DecodedStream> {
     let mut verbatim: Vec<u8> = Vec::new();
 
     let mut cursor: usize = 0;
+    // SHN-stream-proper byte length, assigned when BLOCK_FN_QUIT's
+    // padding is byte-aligned (spec/04 §2.1). The loop only leaves via
+    // the QUIT branch (every other exit is an early `return Err`), so
+    // this binding is always definitely-assigned before the post-loop
+    // read.
+    let stream_proper_len: usize;
     // Running sub-block size: default H_blocksize, overridden by
     // BLOCK_FN_BLOCKSIZE (spec/03 §3.6).
     let mut block_size = header.blocksize;
@@ -184,7 +202,17 @@ pub fn decode_stream(bytes: &[u8]) -> Result<DecodedStream> {
 
         let fc = read_function_code(&mut reader)?;
         match fc {
-            FunctionCode::Quit => break,
+            FunctionCode::Quit => {
+                // spec/04 §2.1: the QUIT `uvar(2)` field ends at an
+                // arbitrary sub-byte bit position; the encoder then
+                // pads with zero bits to the next byte boundary, which
+                // is the end of the SHN stream proper (and the start of
+                // any seek-table sidecar). Consume that padding so the
+                // reported boundary is byte-exact.
+                let post_version_end = reader.align_to_byte()?;
+                stream_proper_len = 5 + post_version_end;
+                break;
+            }
 
             // --- Housekeeping commands: mutate state, no samples,
             //     cursor unchanged. ---
@@ -249,6 +277,7 @@ pub fn decode_stream(bytes: &[u8]) -> Result<DecodedStream> {
         header,
         verbatim,
         channels,
+        stream_proper_len,
     })
 }
 
@@ -415,6 +444,48 @@ mod tests {
         assert_eq!(dec.channels.len(), 1);
         assert_eq!(dec.channels[0], vec![10, 15, 12, 14, 21, 19, 14, 15]);
         assert!(dec.verbatim.is_empty());
+    }
+
+    #[test]
+    fn quit_padding_reports_stream_proper_len_at_byte_boundary() {
+        // spec/04 §2.1: the QUIT command's `uvar(2) = 4` field (4 bits,
+        // `0100`) ends at a sub-byte bit position; the encoder pads
+        // with zero bits to the next byte boundary, which is the end of
+        // the SHN stream proper. The decoder must consume that padding
+        // and report `stream_proper_len` exactly at the boundary.
+        let mut bits = header_param_bits(5, 1, 4, 0, 0, 0);
+        append_diff_block(&mut bits, 0, 0, &[1, 0, 0, 0]);
+        bits.extend(encode_uvar(4, FNSIZE)); // QUIT (4-bit `0100`)
+        let buf = assemble(&bits);
+
+        let dec = decode_stream(&buf).expect("stream decodes");
+        // With no trailing out-of-band material, the stream proper is
+        // the whole (byte-padded) buffer.
+        assert_eq!(dec.stream_proper_len, buf.len());
+    }
+
+    #[test]
+    fn quit_boundary_excludes_trailing_out_of_band_bytes() {
+        // A stream followed by a non-standard out-of-band trailer (the
+        // shape of a `SEEK`-magic seek-table sidecar, spec/05 §5). The
+        // §2.1 byte boundary after QUIT must fall before the trailer,
+        // so `stream_proper_len` excludes it.
+        let mut bits = header_param_bits(5, 1, 4, 0, 0, 0);
+        append_diff_block(&mut bits, 0, 0, &[1, 0, 0, 0]);
+        bits.extend(encode_uvar(4, FNSIZE)); // QUIT
+        let mut buf = assemble(&bits);
+        let proper = buf.len();
+        // Append a fake out-of-band trailer.
+        buf.extend_from_slice(b"SEEK\x00\x01\x02\x03trailing-junk");
+
+        let dec = decode_stream(&buf).expect("stream decodes");
+        assert_eq!(dec.stream_proper_len, proper);
+        assert!(dec.stream_proper_len < buf.len());
+        // The trailer bytes start exactly at the reported boundary.
+        assert_eq!(
+            &buf[dec.stream_proper_len..dec.stream_proper_len + 4],
+            b"SEEK"
+        );
     }
 
     #[test]
