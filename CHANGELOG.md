@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 320 — end-to-end proof the public driver emits `BLOCK_FN_QLPC`
+  (`spec/04` §5, validation-corrected).** `spec/04` §5 + `spec/05` §8
+  item 2 closed the prior by-elimination caveat on `BLOCK_FN_QLPC = 7`
+  to a cross-codec byte-exact confirmation (audit/01 §5). New
+  integration test `encoder_driver_emits_qlpc_command` drives only the
+  high-level public `encode_stream` entry point on an exact two-term
+  recurrence signal (`s(t) = s(t−1) − s(t−2)`, modelled exactly by the
+  derived QLPC vector `[1, −1]`), then walks the produced bit stream
+  command-by-command using the crate's own public payload readers and
+  asserts the driver emitted ≥ 1 `FunctionCode::Qlpc` command — plus a
+  stereo-with-tail-block variant and a `H_maxlpcorder = 0` control that
+  asserts zero QLPC commands (`spec/03` §3.5). Each variant also
+  round-trips sample-exact through `decode_stream`. +3 integration
+  tests; no wire-format or `src/` change.
+
 - **Round 313 — post-`BLOCK_FN_QUIT` byte-alignment (`spec/04` §2.1).**
   The decoder now consumes the zero-padding bits that follow the QUIT
   command's sub-byte-position `uvar(2) = 4` field up to the next byte

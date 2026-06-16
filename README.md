@@ -28,7 +28,11 @@ v2/v3 path:
   (`select_predictor_auto`) derives and quantises QLPC coefficients,
   runs an order search, and scores every candidate predictor at the
   Rice-optimal residual energy across the full decoder-accepted band,
-  choosing the cheapest per block.
+  choosing the cheapest per block. When the stream header sets
+  `H_maxlpcorder > 0` the driver emits a genuine `BLOCK_FN_QLPC`
+  command (function code `7`, `spec/04` §5) for blocks where the
+  quantised-LPC predictor is cheapest — verified end-to-end by walking
+  the produced bit stream and counting the emitted QLPC commands.
 * **Framework wiring** (default `registry` feature) — `ShortenDecoder`
   / `ShortenStreamingDecoder` / `ShortenEncoder` implement the
   `oxideav_core::Decoder` / `Encoder` traits. The crate also exposes
