@@ -1632,7 +1632,7 @@ pub fn write_zero_block(writer: &mut BitWriter) {
 /// `fn = 6` command's `bshift` parameter matches each fixture's
 /// filename-tagged `-q N` encoder invocation (1, 4, 8, 12) byte-exact
 /// (test `T10`). Cross-fixture corroboration on `F2` (an 8-bit
-/// unsigned AIFC stream) pins `bshift = 7` against FFmpeg's decoded
+/// unsigned AIFC stream) pins `bshift = 7` against a reference decoder's decoded
 /// PCM at the half-range step `128 = 1 << 7` (test `T11`).
 ///
 /// Caller responsibilities:

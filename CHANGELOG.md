@@ -21,8 +21,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
     rule (`value == 0 && bits <= 7`).
   - `DecodedStream` gains a `quit_padding: BytePadding` field carrying
     the QUIT padding the decoder consumed. Decode stays **lenient** —
-    a stream whose padding bits are non-zero still decodes (matching
-    FFmpeg, `spec/05` §5.2); the field lets a caller run a strict §4
+    a stream whose padding bits are non-zero still decodes (matching lenient
+    real-world decoders, `spec/05` §5.2); the field lets a caller run a strict §4
     conformance check without rejecting the stream.
   - +5 bit-reader unit tests (the `F9`-shape `0010 0000` zero-pad anchor,
     a non-zero-pad surfacing case, boundary no-op, offset parity with the

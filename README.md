@@ -26,7 +26,7 @@ v2/v3 path:
   `spec/05` §4 pins the padding to all-zero with a 0..7 count, and
   `BytePadding::is_spec_conformant` checks that rule — while decode
   stays lenient and still accepts a stream whose padding is non-zero
-  (matching FFmpeg, `spec/05` §5.2).
+  (matching lenient real-world decoders, `spec/05` §5.2).
 * **Encoder** — the whole-stream encode driver (`encode_stream`) takes
   an interleaved `&[i32]` PCM buffer and produces a `.shn` byte stream
   that `decode_stream` reconstructs sample-exact. A per-block selector

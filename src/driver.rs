@@ -116,7 +116,7 @@ pub struct DecodedStream {
     /// padding bits is in the range 0..7", forced byte-exactly across
     /// fixtures `F1`, `F4`, `F9`. The decoder records this observation
     /// but still decodes leniently — it does **not** reject a stream
-    /// whose padding bits are non-zero (matching FFmpeg, `spec/05`
+    /// whose padding bits are non-zero (matching lenient real-world decoders, `spec/05`
     /// §5.2). A caller that wants a strict §4-conformance check consults
     /// [`BytePadding::is_spec_conformant`]; for every encoder-produced
     /// stream this returns `true`.
@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn quit_padding_non_zero_is_flagged_but_decode_stays_lenient() {
         // spec/05 §5.2: the decoder accepts a stream whose trailing
-        // padding bits are non-zero (FFmpeg does the same). We OR junk
+        // padding bits are non-zero (lenient decoders do the same). We OR junk
         // into the QUIT padding region of the final byte and confirm the
         // PCM still decodes while `quit_padding` reports the
         // non-conformance.

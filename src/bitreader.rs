@@ -75,7 +75,7 @@ impl BytePadding {
     ///
     /// Returns `true` when every padding bit is zero and the count is
     /// at most seven. The driver records the padding but decodes
-    /// leniently regardless (matching FFmpeg, `spec/05` §5.2); a caller
+    /// leniently regardless (matching lenient real-world decoders, `spec/05` §5.2); a caller
     /// that wants a strict conformance check consults this.
     pub fn is_spec_conformant(&self) -> bool {
         self.value == 0 && self.bits <= 7
@@ -187,7 +187,7 @@ impl<'a> BitReader<'a> {
     /// last byte `0010 0000` is the 5-bit `BLOCK_FN_QUIT` `uvar(2) = 4`
     /// pattern `00100`-shape plus three trailing zero bits). The plain
     /// [`Self::align_to_byte`] skips these bits leniently (to accept any
-    /// decodable stream the way FFmpeg does, `spec/05` §5.2); this
+    /// decodable stream the way lenient decoders do, `spec/05` §5.2); this
     /// variant additionally surfaces their value so the driver can record
     /// whether the stream is §4-conformant without rejecting it.
     ///
