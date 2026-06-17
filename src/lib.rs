@@ -296,7 +296,7 @@ mod sequencer;
 mod sidecar;
 mod stream_iter;
 
-pub use crate::bitreader::{BitReader, ULONGSIZE};
+pub use crate::bitreader::{BitReader, BytePadding, ULONGSIZE};
 pub use crate::bitwriter::{natural_ulong_width, BitWriter};
 pub use crate::block::{
     read_bitshift_payload, read_blocksize_payload, read_function_code, read_verbatim_payload,

@@ -57,7 +57,7 @@
 //! externality) + §2 (mean estimator), and `spec/01-stream-header.md`
 //! (header parse + carry-length derivation).
 
-use crate::bitreader::BitReader;
+use crate::bitreader::{BitReader, BytePadding};
 use crate::block::{
     read_bitshift_payload, read_blocksize_payload, read_function_code, read_verbatim_payload,
     FunctionCode,
@@ -108,6 +108,19 @@ pub struct DecodedStream {
     /// on the sidecar's `SEEK` magic, matching the §2.1 / footnote
     /// `T9` anchor.
     pub stream_proper_len: usize,
+    /// The zero-padding bits the decoder consumed after the
+    /// `BLOCK_FN_QUIT` command to reach the byte boundary at
+    /// [`Self::stream_proper_len`] (`spec/05` §4).
+    ///
+    /// `spec/05` §4 pins "The padding bits are zero; the count of
+    /// padding bits is in the range 0..7", forced byte-exactly across
+    /// fixtures `F1`, `F4`, `F9`. The decoder records this observation
+    /// but still decodes leniently — it does **not** reject a stream
+    /// whose padding bits are non-zero (matching FFmpeg, `spec/05`
+    /// §5.2). A caller that wants a strict §4-conformance check consults
+    /// [`BytePadding::is_spec_conformant`]; for every encoder-produced
+    /// stream this returns `true`.
+    pub quit_padding: BytePadding,
 }
 
 impl DecodedStream {
@@ -181,6 +194,10 @@ pub fn decode_stream(bytes: &[u8]) -> Result<DecodedStream> {
     // this binding is always definitely-assigned before the post-loop
     // read.
     let stream_proper_len: usize;
+    // The QUIT padding bits, observed when the QUIT branch aligns to the
+    // byte boundary (spec/05 §4). Like `stream_proper_len`, assigned
+    // exactly once on the loop's only non-error exit.
+    let quit_padding: BytePadding;
     // Running sub-block size: default H_blocksize, overridden by
     // BLOCK_FN_BLOCKSIZE (spec/03 §3.6).
     let mut block_size = header.blocksize;
@@ -208,9 +225,13 @@ pub fn decode_stream(bytes: &[u8]) -> Result<DecodedStream> {
                 // pads with zero bits to the next byte boundary, which
                 // is the end of the SHN stream proper (and the start of
                 // any seek-table sidecar). Consume that padding so the
-                // reported boundary is byte-exact.
-                let post_version_end = reader.align_to_byte()?;
+                // reported boundary is byte-exact, observing the padding
+                // bits' value so the §4 zero-padding rule can be checked
+                // by the caller (decode stays lenient regardless,
+                // spec/05 §5.2).
+                let (post_version_end, padding) = reader.align_to_byte_observing_padding()?;
                 stream_proper_len = 5 + post_version_end;
+                quit_padding = padding;
                 break;
             }
 
@@ -278,6 +299,7 @@ pub fn decode_stream(bytes: &[u8]) -> Result<DecodedStream> {
         verbatim,
         channels,
         stream_proper_len,
+        quit_padding,
     })
 }
 
@@ -462,6 +484,56 @@ mod tests {
         // With no trailing out-of-band material, the stream proper is
         // the whole (byte-padded) buffer.
         assert_eq!(dec.stream_proper_len, buf.len());
+    }
+
+    #[test]
+    fn quit_padding_is_observed_and_zero_for_a_well_formed_stream() {
+        // spec/05 §4: the QUIT zero-padding bits are surfaced on
+        // `DecodedStream::quit_padding`. A stream assembled with the
+        // (zero-padding) bit packer is §4-conformant: every padding bit
+        // is zero and the count is 0..=7.
+        let mut bits = header_param_bits(5, 1, 4, 0, 0, 0);
+        append_diff_block(&mut bits, 0, 0, &[1, 0, 0, 0]);
+        bits.extend(encode_uvar(4, FNSIZE)); // QUIT (4-bit `0100`)
+        let buf = assemble(&bits);
+
+        let dec = decode_stream(&buf).expect("stream decodes");
+        assert_eq!(dec.quit_padding.value, 0);
+        assert!(dec.quit_padding.bits <= 7);
+        assert!(dec.quit_padding.is_spec_conformant());
+    }
+
+    #[test]
+    fn quit_padding_non_zero_is_flagged_but_decode_stays_lenient() {
+        // spec/05 §5.2: the decoder accepts a stream whose trailing
+        // padding bits are non-zero (FFmpeg does the same). We OR junk
+        // into the QUIT padding region of the final byte and confirm the
+        // PCM still decodes while `quit_padding` reports the
+        // non-conformance.
+        let mut bits = header_param_bits(5, 1, 4, 0, 0, 0);
+        append_diff_block(&mut bits, 0, 0, &[1, 0, 0, 0]);
+        bits.extend(encode_uvar(4, FNSIZE)); // QUIT
+        let mut buf = assemble(&bits);
+
+        // Decode the clean stream to learn the boundary + padding width.
+        let clean = decode_stream(&buf).expect("clean stream decodes");
+        let pad_bits = clean.quit_padding.bits;
+        // Only meaningful when QUIT left sub-byte padding to corrupt.
+        if pad_bits > 0 {
+            // The padding occupies the low `pad_bits` of the final byte
+            // of the stream proper. Set them all to one.
+            let last = clean.stream_proper_len - 1;
+            let mask: u8 = ((1u16 << pad_bits) - 1) as u8;
+            buf[last] |= mask;
+
+            let dec = decode_stream(&buf).expect("lenient decode still succeeds");
+            // PCM is byte-identical to the clean decode.
+            assert_eq!(dec.channels, clean.channels);
+            // Padding now reports the corrupted (non-zero) bits.
+            assert_eq!(dec.quit_padding.bits, pad_bits);
+            assert_eq!(dec.quit_padding.value, mask as u32);
+            assert!(!dec.quit_padding.is_spec_conformant());
+        }
     }
 
     #[test]

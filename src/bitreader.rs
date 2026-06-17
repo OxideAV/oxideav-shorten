@@ -51,6 +51,37 @@ pub const ULONGSIZE: u32 = 2;
 /// as unrepresentable (see `crate::residual_bits_at_energy`).
 pub(crate) const UVAR_PREFIX_CAP: u32 = 32;
 
+/// The bits skipped to reach a byte boundary, as observed by
+/// [`BitReader::align_to_byte_observing_padding`].
+///
+/// `spec/05` §4 pins the post-`BLOCK_FN_QUIT` padding rule: "The
+/// padding bits are zero; the count of padding bits is in the range
+/// 0..7." A §4-conformant stream therefore has [`Self::value`] `== 0`
+/// and [`Self::bits`] in `0..=7`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BytePadding {
+    /// Count of padding bits consumed to reach the next byte boundary.
+    /// In a well-formed stream this is in `0..=7` (`spec/05` §4).
+    pub bits: u32,
+    /// The padding bits' MSB-first value: the first padding bit
+    /// consumed occupies bit `bits - 1`. `spec/05` §4 forces this to
+    /// `0` for an encoder-produced stream.
+    pub value: u32,
+}
+
+impl BytePadding {
+    /// Whether the observed padding matches the `spec/05` §4 rule
+    /// ("The padding bits are zero; the count … is in the range 0..7").
+    ///
+    /// Returns `true` when every padding bit is zero and the count is
+    /// at most seven. The driver records the padding but decodes
+    /// leniently regardless (matching FFmpeg, `spec/05` §5.2); a caller
+    /// that wants a strict conformance check consults this.
+    pub fn is_spec_conformant(&self) -> bool {
+        self.value == 0 && self.bits <= 7
+    }
+}
+
 /// MSB-first bit reader over a borrowed byte slice. The reader
 /// starts at byte `0` of the slice and reads from bit 7 of that byte
 /// downward, then bit 7 of byte 1, etc.
@@ -142,6 +173,43 @@ impl<'a> BitReader<'a> {
         // boundary is whole bytes; the boundary byte offset is the
         // consumed-bit count divided by 8.
         Ok((self.bits_consumed() / 8) as usize)
+    }
+
+    /// Consume the padding bits to the next byte boundary like
+    /// [`Self::align_to_byte`], but **observe** rather than discard them,
+    /// returning `(byte_offset, padding)` where `padding` records the
+    /// count of padding bits read and their MSB-first value.
+    ///
+    /// `spec/05` §4 pins the post-`BLOCK_FN_QUIT` padding rule precisely:
+    /// "The padding bits are zero; the count of padding bits is in the
+    /// range 0..7." §4.1 forces the zero-padding interpretation
+    /// byte-exactly across fixtures `F1`, `F4`, and `F9` (e.g. `F9`'s
+    /// last byte `0010 0000` is the 5-bit `BLOCK_FN_QUIT` `uvar(2) = 4`
+    /// pattern `00100`-shape plus three trailing zero bits). The plain
+    /// [`Self::align_to_byte`] skips these bits leniently (to accept any
+    /// decodable stream the way FFmpeg does, `spec/05` §5.2); this
+    /// variant additionally surfaces their value so the driver can record
+    /// whether the stream is §4-conformant without rejecting it.
+    ///
+    /// The padding bits are returned in the low bits of `padding.value`,
+    /// MSB-first: the first padding bit consumed occupies bit
+    /// `padding.bits - 1`. When the reader is already on a byte boundary,
+    /// `padding.bits == 0` and `padding.value == 0`.
+    ///
+    /// Returns [`Error::Truncated`] only if the input exhausts before the
+    /// boundary is reached.
+    pub fn align_to_byte_observing_padding(&mut self) -> Result<(usize, BytePadding)> {
+        let rem = self.bit_offset_in_byte();
+        let padding = if rem != 0 {
+            let bits = 8 - rem;
+            // `bits` is in 1..=7, well within `read_bits`'s 32-bit bound.
+            let value = self.read_bits(bits)?;
+            BytePadding { bits, value }
+        } else {
+            BytePadding { bits: 0, value: 0 }
+        };
+        debug_assert_eq!(self.bit_offset_in_byte(), 0);
+        Ok(((self.bits_consumed() / 8) as usize, padding))
     }
 
     /// Refill the cache so that it holds at least `min_bits` valid
@@ -327,6 +395,84 @@ mod tests {
         assert_eq!(r.bit_offset_in_byte(), 0);
         assert_eq!(r.align_to_byte().unwrap(), 1);
         assert_eq!(r.read_bits(8).unwrap(), 0xCD);
+    }
+
+    #[test]
+    fn observing_padding_reads_zero_pad_value_f9_shape() {
+        // spec/05 §4.1: fixture `F9`'s last byte is `0010 0000` — the
+        // 5-bit `BLOCK_FN_QUIT` `uvar(2) = 4` pattern `00100` followed by
+        // three zero padding bits to the byte boundary. After consuming
+        // the 5-bit QUIT field, observing-align consumes 3 zero pad bits.
+        let bytes = [0b0010_0000];
+        let mut r = BitReader::new(&bytes);
+        // Consume the 5-bit `00100` QUIT field.
+        assert_eq!(r.read_bits(5).unwrap(), 0b00100);
+        assert_eq!(r.bit_offset_in_byte(), 5);
+        let (off, pad) = r.align_to_byte_observing_padding().unwrap();
+        assert_eq!(off, 1);
+        assert_eq!(pad.bits, 3);
+        assert_eq!(pad.value, 0, "spec/05 §4: padding bits are zero");
+        assert!(pad.is_spec_conformant());
+    }
+
+    #[test]
+    fn observing_padding_surfaces_non_zero_pad_bits() {
+        // A non-conformant tail: after a 4-bit field, the byte's low 4
+        // bits are `1011` rather than zero padding. The observer reports
+        // bits=4, value=0b1011, and flags the stream as non-conformant —
+        // but does not error (decode stays lenient, spec/05 §5.2).
+        let bytes = [0b1111_1011];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read_bits(4).unwrap(), 0b1111);
+        let (off, pad) = r.align_to_byte_observing_padding().unwrap();
+        assert_eq!(off, 1);
+        assert_eq!(pad.bits, 4);
+        assert_eq!(pad.value, 0b1011);
+        assert!(!pad.is_spec_conformant());
+    }
+
+    #[test]
+    fn observing_padding_is_a_noop_on_boundary() {
+        // On a byte boundary there are zero padding bits; the result is
+        // the default (bits=0, value=0), which is trivially conformant.
+        let bytes = [0xAB, 0xCD];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read_bits(8).unwrap(), 0xAB);
+        let (off, pad) = r.align_to_byte_observing_padding().unwrap();
+        assert_eq!(off, 1);
+        assert_eq!(pad, BytePadding::default());
+        assert_eq!(pad.bits, 0);
+        assert!(pad.is_spec_conformant());
+        // The next byte is still fully readable.
+        assert_eq!(r.read_bits(8).unwrap(), 0xCD);
+    }
+
+    #[test]
+    fn observing_padding_matches_align_to_byte_offset() {
+        // The observing variant must report the identical byte offset to
+        // the lenient `align_to_byte` for the same pre-state.
+        let bytes = [0xFB, 0xB1];
+        let mut a = BitReader::new(&bytes);
+        let mut b = BitReader::new(&bytes);
+        assert_eq!(a.read_bits(4).unwrap(), 0xF);
+        assert_eq!(b.read_bits(4).unwrap(), 0xF);
+        let lenient = a.align_to_byte().unwrap();
+        let (observed, _pad) = b.align_to_byte_observing_padding().unwrap();
+        assert_eq!(lenient, observed);
+    }
+
+    #[test]
+    fn observing_padding_in_buffer_padding_aligns_within_final_byte() {
+        // The padding bits to the next boundary are always inside the
+        // current (final) byte, which is already in the buffer, so a
+        // sub-byte position aligns cleanly without needing a further byte.
+        let bytes = [0b1010_0000];
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read_bits(5).unwrap(), 0b10100);
+        let (off, pad) = r.align_to_byte_observing_padding().unwrap();
+        assert_eq!(off, 1);
+        assert_eq!(pad.bits, 3);
+        assert_eq!(pad.value, 0);
     }
 
     #[test]

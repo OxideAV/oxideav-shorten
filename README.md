@@ -21,7 +21,12 @@ v2/v3 path:
   zero-padding to the next byte boundary and exposes the byte-exact
   end of the SHN stream proper as `DecodedStream::stream_proper_len`
   (`spec/04` §2.1) — the authoritative split point for any out-of-band
-  seek-table sidecar.
+  seek-table sidecar. It also **observes** those QUIT padding bits and
+  exposes them as `DecodedStream::quit_padding` (a `BytePadding`):
+  `spec/05` §4 pins the padding to all-zero with a 0..7 count, and
+  `BytePadding::is_spec_conformant` checks that rule — while decode
+  stays lenient and still accepts a stream whose padding is non-zero
+  (matching FFmpeg, `spec/05` §5.2).
 * **Encoder** — the whole-stream encode driver (`encode_stream`) takes
   an interleaved `&[i32]` PCM buffer and produces a `.shn` byte stream
   that `decode_stream` reconstructs sample-exact. A per-block selector

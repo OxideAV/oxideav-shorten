@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 328 — post-`BLOCK_FN_QUIT` zero-padding observation (`spec/05`
+  §4).** `spec/05` §4 pins "The padding bits are zero; the count of
+  padding bits is in the range 0..7", forced byte-exactly across
+  fixtures `F1`, `F4`, `F9` (e.g. `F9`'s last byte `0010 0000` = the
+  5-bit QUIT field plus three zero pad bits). Round 313 consumed that
+  padding leniently; this round additionally **observes** it:
+  - New `BitReader::align_to_byte_observing_padding` returns the byte
+    offset plus a new public `BytePadding { bits, value }` recording the
+    count and MSB-first value of the padding bits skipped to the
+    boundary, with `BytePadding::is_spec_conformant()` checking the §4
+    rule (`value == 0 && bits <= 7`).
+  - `DecodedStream` gains a `quit_padding: BytePadding` field carrying
+    the QUIT padding the decoder consumed. Decode stays **lenient** —
+    a stream whose padding bits are non-zero still decodes (matching
+    FFmpeg, `spec/05` §5.2); the field lets a caller run a strict §4
+    conformance check without rejecting the stream.
+  - +5 bit-reader unit tests (the `F9`-shape `0010 0000` zero-pad anchor,
+    a non-zero-pad surfacing case, boundary no-op, offset parity with the
+    lenient `align_to_byte`) + 2 driver tests (well-formed stream reports
+    conformant zero padding; a corrupted-padding stream decodes
+    byte-identically while flagging non-conformance). No wire-format
+    change; `quit_padding` is a new public field on `DecodedStream`.
+
 - **Round 320 — end-to-end proof the public driver emits `BLOCK_FN_QLPC`
   (`spec/04` §5, validation-corrected).** `spec/04` §5 + `spec/05` §8
   item 2 closed the prior by-elimination caveat on `BLOCK_FN_QLPC = 7`
