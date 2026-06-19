@@ -67,8 +67,8 @@ Three `H_filetype` sample-format codes are pinned and packed:
 Both remaining gaps are **blocked on the spec, not on this crate** — the
 references in the clean-room allow-list (`docs/audio/shorten/spec/`) do
 not pin them, and resolving either is a `spec/05` §8 `§9.4`-escalation
-item (additional public `.shn` fixtures or Tony Robinson's reference
-encoder *binary*):
+item (additional public `.shn` fixtures or a reference Shorten encoder
+*binary*):
 
 * The eight `H_filetype` labels whose numeric codes the spec leaves
   unpinned (`ulaw`, `s8`, `s16`, `u16`, `s16x`, `u16x`, `u16hl`,
