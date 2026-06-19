@@ -38,12 +38,22 @@ v2/v3 path:
   command (function code `7`, `spec/04` §5) for blocks where the
   quantised-LPC predictor is cheapest — verified end-to-end by walking
   the produced bit stream and counting the emitted QLPC commands.
+* **Lossy `-q N` encode** (`encode_stream_lossy`) — the encoder-side
+  dual of the decoder's `BLOCK_FN_BITSHIFT` handling (`spec/03` §3.7 /
+  `spec/04` §3). It emits a `BLOCK_FN_BITSHIFT` command and discards the
+  `bshift` low-order bits of every sample before prediction — exactly
+  the form TR.156's `-q quantisation level` option produces (the
+  `F5..F8` `-q ∈ {1, 4, 8, 12}` anchors of `spec/04` §3.1). The decode
+  reconstructs `(s >> bshift) << bshift`, so the round-trip is
+  near-lossless; `bshift = 0` is byte-identical to `encode_stream`.
 * **Framework wiring** (default `registry` feature) — `ShortenDecoder`
   / `ShortenStreamingDecoder` / `ShortenEncoder` implement the
   `oxideav_core::Decoder` / `Encoder` traits. The crate also exposes
   the direct `make_decoder` / `make_encoder` factories and a
   `register(ctx)` installer (codec ids `"shorten"` and
-  `"shorten-streaming"`).
+  `"shorten-streaming"`). `ShortenEncoder` accepts a `"bitshift"`
+  option selecting the lossy `-q N` quantisation level (default `0`,
+  lossless).
 * **SHNAMPSK seek-table trailer** — `detect_shnampsk_trailer` /
   `split_off_shnampsk_trailer` separate the SHN-stream-proper bytes
   from the non-standard sidecar some distributed `.shn` files append.
@@ -54,11 +64,25 @@ Three `H_filetype` sample-format codes are pinned and packed:
 
 ## Not yet supported
 
+Both remaining gaps are **blocked on the spec, not on this crate** — the
+references in the clean-room allow-list (`docs/audio/shorten/spec/`) do
+not pin them, and resolving either is a `spec/05` §8 `§9.4`-escalation
+item (additional public `.shn` fixtures or Tony Robinson's reference
+encoder *binary*):
+
 * The eight `H_filetype` labels whose numeric codes the spec leaves
   unpinned (`ulaw`, `s8`, `s16`, `u16`, `s16x`, `u16x`, `u16hl`,
-  `u16lh`). Unblocking needs additional fixtures.
+  `u16lh`). Only `2`/`u8`, `3`/`s16hl`, `5`/`s16lh` are forced by the
+  fixture corpus (`spec/05` §6); the other eight codes' numeric values
+  are not derivable from the allow-listed references (`spec/01` §7
+  item 1, `spec/05` §8 item 3). Unblocking needs one fixture per label.
 * The seek-record internal schema of the SHNAMPSK sidecar (the trailer
-  boundary is detected; the records themselves are out of scope).
+  boundary is detected; the records themselves are explicitly out of
+  scope per `spec/00` and `spec/05` §8 item 5).
+* Format-version 1 and version 3 wire-format deltas — every reachable
+  fixture is `v2` (`spec/05` §7); the v1/v3 deltas are not pinned
+  (`spec/05` §8 item 4). The decoder accepts the `v1`/`v3` version
+  byte but the layout differences are unverified.
 
 ## Usage
 
