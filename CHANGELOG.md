@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 345 — lossy `-q N` encode path (`spec/03` §3.7 / `spec/04`
+  §3).** The decoder has handled `BLOCK_FN_BITSHIFT` (left-shift on
+  emission) since round 7, but `encode_stream` only ever produced
+  lossless (`bshift = 0`) streams — the lossy encode side was the
+  remaining encoder gap. New public `encode_stream_lossy` emits a
+  single `BLOCK_FN_BITSHIFT` command after the verbatim prefix and
+  encodes the residuals of the **quantised** sample stream — each input
+  sample arithmetic-right-shifted by `bshift`, exactly the form TR.156's
+  `-q quantisation level` produces (fixtures `F5..F8` with
+  `-q ∈ {1, 4, 8, 12}`, `spec/04` §3.1). The per-channel carry and
+  running-mean estimator consume the quantised (pre-left-shift) samples
+  — the same form `spec/05` §1.4 pins the decoder's state update to — so
+  encoder and decoder stay in lockstep over the quantised stream. The
+  round-trip is near-lossless: `decode(encode_lossy(s, N)) == (s >> N)
+  << N`. `encode_stream` now delegates to a shared core with `bshift =
+  0`, so `encode_stream_lossy(.., 0)` is byte-identical to the lossless
+  path. +11 unit tests: bit-identical `bshift = 0` parity, mono/stereo
+  `-q ∈ {1, 4, 8, 12}` round-trips to the quantised expectation,
+  negative-sample arithmetic-shift convention (`-3 → -4`), tail-block +
+  bshift interaction, over-cap `bshift` rejection
+  (`BitshiftOutOfRange`), and QLPC-over-quantised material. No
+  wire-format change — `BLOCK_FN_BITSHIFT` was already a decoder
+  command; this adds the encoder that produces it.
+
 - **Round 328 — post-`BLOCK_FN_QUIT` zero-padding observation (`spec/05`
   §4).** `spec/05` §4 pins "The padding bits are zero; the count of
   padding bits is in the range 0..7", forced byte-exactly across

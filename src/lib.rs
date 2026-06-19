@@ -310,7 +310,7 @@ pub use crate::codec::{
     FILETYPE_U8, STREAMING_CODEC_ID_STR,
 };
 pub use crate::driver::{decode_stream, DecodedStream, MAX_COMMANDS};
-pub use crate::encode_driver::encode_stream;
+pub use crate::encode_driver::{encode_stream, encode_stream_lossy};
 pub use crate::encoder::{
     encode_envelope_stream, min_energy_for_diff0, min_energy_for_diff1, min_energy_for_diff2,
     min_energy_for_diff3, min_energy_for_qlpc, optimal_energy_for_diff0, optimal_energy_for_diff1,

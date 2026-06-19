@@ -55,9 +55,24 @@
 //! (`spec/05` §1) and [`MeanEstimator`] (`spec/05` §2) from the
 //! **pre-shift** sample block — exactly the order
 //! [`crate::decode_stream`]'s `commit_block` applies after decoding —
-//! before the cursor advances. Because this driver encodes losslessly
-//! (`bshift = 0`), the pre-shift and emitted forms coincide; the state
+//! before the cursor advances. For the lossless [`encode_stream`] path
+//! (`bshift = 0`) the pre-shift and emitted forms coincide; the state
 //! update consumes the samples directly.
+//!
+//! ## Lossy `-q N` mode (`spec/03` §3.7 / `spec/04` §3)
+//!
+//! [`encode_stream_lossy`] adds the encoder-side dual of the decoder's
+//! `BLOCK_FN_BITSHIFT` handling. With `bshift = N > 0` it emits a single
+//! `BLOCK_FN_BITSHIFT` command after the verbatim prefix and encodes the
+//! residuals of the **quantised** sample stream — each input sample
+//! arithmetic-right-shifted by `bshift`, the form TR.156's
+//! `-q quantisation level` produces (fixtures `F5..F8` with
+//! `-q ∈ {1, 4, 8, 12}`, `spec/04` §3.1). The carry and mean estimator
+//! consume those quantised samples — the same **pre-shift** form
+//! `spec/05` §1.4 pins the decoder's state update to — so the two stay
+//! in lockstep; the decoder restores the magnitude with its dual
+//! left-shift on emission. The round-trip is near-lossless:
+//! `decode(encode_lossy(s, N)) == (s >> N) << N`.
 //!
 //! ## Predictor selection
 //!
@@ -101,9 +116,10 @@
 //! decisions of its own.
 
 use crate::bitwriter::BitWriter;
+use crate::block::BITSHIFT_MAX;
 use crate::encoder::{
-    write_blocksize_command, write_byte_aligned_prefix, write_parameter_block, write_quit_command,
-    write_verbatim_block, EncodeError, EncodeResult,
+    write_bitshift_command, write_blocksize_command, write_byte_aligned_prefix,
+    write_parameter_block, write_quit_command, write_verbatim_block, EncodeError, EncodeResult,
 };
 use crate::header::ShortenStreamHeader;
 use crate::predictor::{ChannelCarry, MeanEstimator};
@@ -149,6 +165,67 @@ pub fn encode_stream(
     samples: &[i32],
     verbatim_prefix: &[u8],
 ) -> EncodeResult<Vec<u8>> {
+    encode_stream_inner(header, samples, verbatim_prefix, 0)
+}
+
+/// Encode an interleaved `i32` PCM buffer into a complete v2/v3 Shorten
+/// byte stream in **lossy** (`-q N`-equivalent) mode, discarding the
+/// `bshift` low-order bits of every sample before prediction
+/// (`spec/03` §3.7 + `spec/04` §3).
+///
+/// This is the encoder-side dual of the decoder's `BLOCK_FN_BITSHIFT`
+/// handling, which the round-7 driver already applies as a left-shift
+/// on emission (`spec/03` §3.7, `spec/05` §1.4). The lossy encode path
+/// is what TR.156's `-q quantisation level` option produces: the
+/// reference encoder, when invoked with `-q N`, emits a single
+/// `BLOCK_FN_BITSHIFT` command carrying `bshift = N` near the head of
+/// the stream and encodes the residuals of the **quantised** sample
+/// stream — each input sample arithmetic-right-shifted by `bshift` —
+/// rather than the full-resolution samples (`spec/04` §3.1, fixtures
+/// `F5..F8` with `-q ∈ {1, 4, 8, 12}`).
+///
+/// The round-trip property is therefore **near-lossless**, not exact:
+/// [`crate::decode_stream`] applied to the returned bytes yields, for
+/// each input sample `s`, the value `(s >> bshift) << bshift` — `s`
+/// with its `bshift` low-order bits cleared. With `bshift = 0` the
+/// path is bit-identical to [`encode_stream`] and the round-trip is
+/// exact.
+///
+/// The quantisation uses **arithmetic** right-shift (floor division
+/// toward negative infinity), matching the decoder's left-shift
+/// reconstruction: a sample `s` reconstructs as `(s >> bshift) <<
+/// bshift`, which for `bshift = 1` maps `-3 → -4`, `-2 → -2`, `3 → 2`.
+/// The per-channel carry and running-mean estimators consume the
+/// **quantised** (post-shift, pre-left-shift) samples, exactly the
+/// pre-shift form `spec/05` §1.4 pins the decoder's state update to
+/// read — so the encoder's and decoder's predictor recurrences stay in
+/// lockstep over the quantised stream.
+///
+/// Errors mirror [`encode_stream`], plus
+/// [`EncodeError::BitshiftOutOfRange`] if `bshift > BITSHIFT_MAX`.
+pub fn encode_stream_lossy(
+    header: &ShortenStreamHeader,
+    samples: &[i32],
+    verbatim_prefix: &[u8],
+    bshift: u32,
+) -> EncodeResult<Vec<u8>> {
+    if bshift > BITSHIFT_MAX {
+        return Err(EncodeError::BitshiftOutOfRange(bshift));
+    }
+    encode_stream_inner(header, samples, verbatim_prefix, bshift)
+}
+
+/// Shared core for [`encode_stream`] (`bshift = 0`) and
+/// [`encode_stream_lossy`] (`bshift > 0`). When `bshift > 0` a single
+/// `BLOCK_FN_BITSHIFT` command is emitted after the verbatim prefix and
+/// every sample is arithmetic-right-shifted by `bshift` before the
+/// per-block predictor path consumes it (`spec/03` §3.7).
+fn encode_stream_inner(
+    header: &ShortenStreamHeader,
+    samples: &[i32],
+    verbatim_prefix: &[u8],
+    bshift: u32,
+) -> EncodeResult<Vec<u8>> {
     if header.channels == 0 {
         return Err(EncodeError::ZeroChannels);
     }
@@ -162,12 +239,16 @@ pub fn encode_stream(
     let per_channel = samples.len() / n_channels;
 
     // Deinterleave a(0), b(0), a(1), b(1), … into per-channel vectors
-    // (spec/03 §2 / TR.156 §3.1).
+    // (spec/03 §2 / TR.156 §3.1). In lossy mode each sample is
+    // arithmetic-right-shifted by `bshift` first (spec/03 §3.7): the
+    // predictor encodes the quantised stream and the decoder restores
+    // the magnitude with the dual left-shift on emission.
     let mut planes: Vec<Vec<i32>> = (0..n_channels)
         .map(|_| Vec::with_capacity(per_channel))
         .collect();
     for (i, &s) in samples.iter().enumerate() {
-        planes[i % n_channels].push(s);
+        let q = if bshift == 0 { s } else { s >> bshift };
+        planes[i % n_channels].push(q);
     }
 
     // Per-channel state, allocated exactly as decode_stream does.
@@ -187,6 +268,14 @@ pub fn encode_stream(
     write_parameter_block(&mut writer, header);
     if !verbatim_prefix.is_empty() {
         write_verbatim_block(&mut writer, verbatim_prefix)?;
+    }
+
+    // Lossy mode: announce the per-stream bit-shift once, before any
+    // predictor block. BLOCK_FN_BITSHIFT does not advance the channel
+    // cursor (spec/03 §3.7), so it sits at the head of the command
+    // stream and governs every subsequent block's emission shift.
+    if bshift > 0 {
+        write_bitshift_command(&mut writer, bshift)?;
     }
 
     // The default block size is H_blocksize. The reference encoder
@@ -468,6 +557,136 @@ mod tests {
         let header = v2_header(1, 4, 0, 0);
         let samples: Vec<i32> = vec![50_000, -50_000, 40_000, -30_000];
         roundtrip(&header, &samples, &[]);
+    }
+
+    /// Apply the decoder's reconstruction quantisation to a per-channel
+    /// expectation: each sample loses its `bshift` low-order bits via the
+    /// `(s >> bshift) << bshift` round-trip (`spec/03` §3.7).
+    fn quantise(samples: &[i32], bshift: u32) -> Vec<i32> {
+        samples
+            .iter()
+            .map(|&s| {
+                if bshift == 0 {
+                    s
+                } else {
+                    (s >> bshift) << bshift
+                }
+            })
+            .collect()
+    }
+
+    /// Round-trip a lossy encode: `decode(encode_lossy(x, q))` must equal
+    /// `x` with its `q` low-order bits cleared, per channel.
+    fn roundtrip_lossy(
+        header: &ShortenStreamHeader,
+        samples: &[i32],
+        verbatim: &[u8],
+        bshift: u32,
+    ) {
+        let bytes =
+            encode_stream_lossy(header, samples, verbatim, bshift).expect("lossy encode succeeds");
+        let dec = decode_stream(&bytes).expect("decode succeeds");
+        assert_eq!(dec.header, *header, "header round-trips");
+        assert_eq!(dec.verbatim, verbatim, "verbatim prefix round-trips");
+        let planes = deinterleave(samples, header.channels as usize);
+        let expected: Vec<Vec<i32>> = planes.iter().map(|p| quantise(p, bshift)).collect();
+        assert_eq!(
+            dec.channels, expected,
+            "per-channel samples round-trip to (s >> {bshift}) << {bshift}"
+        );
+    }
+
+    #[test]
+    fn lossy_bshift_zero_is_bit_identical_to_lossless() {
+        // bshift = 0 must produce exactly the same bytes as encode_stream.
+        let header = v2_header(2, 4, 0, 3);
+        let mut samples = Vec::new();
+        for t in 0..20i32 {
+            samples.push(100 + t * 3);
+            samples.push(-50 - t);
+        }
+        let lossless = encode_stream(&header, &samples, b"hdr").unwrap();
+        let lossy0 = encode_stream_lossy(&header, &samples, b"hdr", 0).unwrap();
+        assert_eq!(lossless, lossy0, "bshift = 0 matches the lossless path");
+    }
+
+    #[test]
+    fn lossy_mono_q1_roundtrips_to_quantised() {
+        let header = v2_header(1, 8, 0, 0);
+        let samples: Vec<i32> = (0..40).map(|x| x * 17 - 300).collect();
+        roundtrip_lossy(&header, &samples, &[], 1);
+    }
+
+    #[test]
+    fn lossy_stereo_q4_roundtrips_to_quantised() {
+        let header = v2_header(2, 16, 0, 4);
+        let mut samples = Vec::new();
+        let mut a = 0i32;
+        let mut b = 1000i32;
+        for t in 0..100i32 {
+            a += (t % 11) - 5;
+            b -= (t % 7) - 3;
+            samples.push(a << 3); // give the low bits real content to lose
+            samples.push(b << 3);
+        }
+        roundtrip_lossy(&header, &samples, &[], 4);
+    }
+
+    #[test]
+    fn lossy_q8_and_q12_roundtrip_like_f5_f8_anchors() {
+        // The spec/04 §3.1 anchor fixtures F5..F8 were produced with
+        // -q ∈ {1, 4, 8, 12}; exercise the two larger shifts the same
+        // way the decoder's BITSHIFT test does.
+        let header = v2_header(2, 32, 0, 0);
+        let mut samples = Vec::new();
+        for t in 0..128i32 {
+            samples.push((t * t) % 30000 - 15000);
+            samples.push(20000 - (t * 31) % 25000);
+        }
+        roundtrip_lossy(&header, &samples, &[], 8);
+        roundtrip_lossy(&header, &samples, &[], 12);
+    }
+
+    #[test]
+    fn lossy_negative_samples_quantise_toward_negative_infinity() {
+        // Arithmetic shift floors toward -inf: -3 >> 1 = -2, << 1 = -4.
+        // Verify the round-trip matches that convention exactly.
+        let header = v2_header(1, 4, 0, 0);
+        let samples: Vec<i32> = vec![-3, -2, -1, 0, 1, 2, 3, -7, 7, -8, 8, -100];
+        roundtrip_lossy(&header, &samples, &[], 1);
+        // Spot-check the convention directly.
+        assert_eq!(quantise(&[-3], 1), vec![-4]);
+        assert_eq!(quantise(&[-2], 1), vec![-2]);
+        assert_eq!(quantise(&[3], 1), vec![2]);
+    }
+
+    #[test]
+    fn lossy_with_tail_block_roundtrips() {
+        // bshift + a trailing partial block (BLOCKSIZE override) together.
+        let header = v2_header(1, 8, 0, 0);
+        let samples: Vec<i32> = (0..22).map(|x| (x * 53) % 4096 - 2048).collect();
+        roundtrip_lossy(&header, &samples, b"WAVE", 3);
+    }
+
+    #[test]
+    fn lossy_over_cap_bshift_is_rejected() {
+        let header = v2_header(1, 4, 0, 0);
+        let err = encode_stream_lossy(&header, &[1, 2, 3, 4], &[], BITSHIFT_MAX + 1).unwrap_err();
+        assert!(matches!(err, EncodeError::BitshiftOutOfRange(b) if b == BITSHIFT_MAX + 1));
+    }
+
+    #[test]
+    fn lossy_with_maxlpcorder_roundtrips() {
+        // Quantised LPC material: the QLPC predictor operates on the
+        // post-shift stream, so the round-trip still holds to the
+        // quantised expectation.
+        let header = v2_header(1, 8, 2, 0);
+        let mut s = vec![300i32, 700];
+        for t in 2..64 {
+            let v = (s[t - 1] - s[t - 2] / 2).clamp(-30000, 30000);
+            s.push(v);
+        }
+        roundtrip_lossy(&header, &s, &[], 2);
     }
 
     #[test]
