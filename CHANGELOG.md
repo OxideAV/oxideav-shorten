@@ -32,6 +32,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   wire-format change — `BLOCK_FN_BITSHIFT` was already a decoder
   command; this adds the encoder that produces it.
 
+- **Round 345 — `"bitshift"` codec option wires lossy mode into the
+  `oxideav_core::Encoder` trait (`spec/03` §3.7).** `ShortenEncoder`
+  gains a `"bitshift"` option (default `0`, lossless): a non-zero value
+  routes `flush` through `encode_stream_lossy`, producing a near-lossless
+  `-q N`-equivalent stream whose decode is `(s >> bitshift) << bitshift`.
+  Values above `BITSHIFT_MAX` are rejected at construction. The
+  direct/registry dual API now exposes lossy encode through the same
+  `make_encoder` factory. +3 trait unit tests (lossy quantised
+  round-trip via the trait, explicit `bitshift = 0` stays lossless,
+  over-cap rejection) + a new `tests/encode_stream_lossy_pipeline.rs`
+  integration suite (6 tests: `q1..q12` quantised round-trips, stereo +
+  tail + verbatim, `q0` byte-identical to lossless, monotone
+  compression of a noisy signal as `q` grows, QLPC-over-quantised,
+  negative-signal arithmetic-shift floor). 476 total passing.
+
 - **Round 328 — post-`BLOCK_FN_QUIT` zero-padding observation (`spec/05`
   §4).** `spec/05` §4 pins "The padding bits are zero; the count of
   padding bits is in the range 0..7", forced byte-exactly across

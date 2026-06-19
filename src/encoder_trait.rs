@@ -61,6 +61,15 @@
 //! * `version` — `2` (the v2/v3 envelope the parameter-block writer
 //!   emits; `spec/00`).
 //!
+//! The `"bitshift"` option (default `0`, lossless) selects the lossy
+//! `-q N` quantisation level (`spec/03` §3.7 / `spec/04` §3): a non-zero
+//! value routes [`flush`](oxideav_core::Encoder::flush) through
+//! [`encode_stream_lossy`], which emits a `BLOCK_FN_BITSHIFT` command and
+//! discards the `bitshift` low-order bits of every sample. The decoded
+//! output is then `(s >> bitshift) << bitshift` rather than `s` exactly.
+//! Values above [`BITSHIFT_MAX`](crate::BITSHIFT_MAX) are rejected at
+//! construction time.
+//!
 //! ## Sample-format byte unpacking (`spec/05` §6)
 //!
 //! `send_frame` reverses the same byte packing
@@ -92,8 +101,9 @@ use oxideav_core::{
     Error as CoreError, Frame, Packet, Result as CoreResult, SampleFormat, TimeBase,
 };
 
+use crate::block::BITSHIFT_MAX;
 use crate::codec::{CODEC_ID_STR, FILETYPE_S16HL, FILETYPE_S16LH, FILETYPE_U8};
-use crate::encode_driver::encode_stream;
+use crate::encode_driver::{encode_stream, encode_stream_lossy};
 use crate::encoder::EncodeError;
 use crate::header::ShortenStreamHeader;
 
@@ -187,6 +197,7 @@ pub struct ShortenEncoder {
     blocksize: u32,
     maxlpcorder: u32,
     meanblocks: u32,
+    bitshift: u32,
     n_channels: usize,
     planes: Vec<Vec<i32>>,
     pending: VecDeque<Packet>,
@@ -203,6 +214,7 @@ impl std::fmt::Debug for ShortenEncoder {
             .field("blocksize", &self.blocksize)
             .field("maxlpcorder", &self.maxlpcorder)
             .field("meanblocks", &self.meanblocks)
+            .field("bitshift", &self.bitshift)
             .field("n_channels", &self.n_channels)
             .field(
                 "accumulated_samples_per_channel",
@@ -233,6 +245,16 @@ impl ShortenEncoder {
         }
         let maxlpcorder = option_u32(params, "maxlpcorder", 0)?;
         let meanblocks = option_u32(params, "meanblocks", 0)?;
+        // The lossy `-q N` quantisation level (`spec/03` §3.7 / `spec/04`
+        // §3). Default 0 = lossless. Values above the implementation cap
+        // are rejected up-front so the encoder cannot construct a stream
+        // the decoder would immediately reject.
+        let bitshift = option_u32(params, "bitshift", 0)?;
+        if bitshift > BITSHIFT_MAX {
+            return Err(CoreError::invalid(format!(
+                "oxideav-shorten: bitshift option {bitshift} exceeds the cap {BITSHIFT_MAX}"
+            )));
+        }
 
         let mut output = params.clone();
         output.channels = Some(n_channels as u16);
@@ -245,6 +267,7 @@ impl ShortenEncoder {
             blocksize,
             maxlpcorder,
             meanblocks,
+            bitshift,
             n_channels,
             planes: vec![Vec::new(); n_channels],
             pending: VecDeque::new(),
@@ -324,7 +347,15 @@ impl ShortenEncoder {
             skipbytes: 0,
         };
 
-        let bytes = encode_stream(&header, &interleaved, &[]).map_err(encode_error_to_core)?;
+        let bytes = if self.bitshift == 0 {
+            encode_stream(&header, &interleaved, &[]).map_err(encode_error_to_core)?
+        } else {
+            // Lossy `-q N` mode: discard the `bitshift` low-order bits of
+            // every sample before prediction (`spec/03` §3.7). The
+            // decoded output is `(s >> bitshift) << bitshift`.
+            encode_stream_lossy(&header, &interleaved, &[], self.bitshift)
+                .map_err(encode_error_to_core)?
+        };
 
         let mut packet = Packet::new(0, TimeBase::new(1, 1), bytes);
         packet.pts = self.pts;
@@ -650,6 +681,54 @@ mod tests {
         let dec = decode_stream(&packet.data).expect("decode_stream");
         assert_eq!(dec.header.filetype, FILETYPE_U8);
         assert_eq!(dec.channels[0], samples);
+    }
+
+    #[test]
+    fn bitshift_option_drives_lossy_quantised_roundtrip() {
+        // A "bitshift" = 4 option routes the encoder through the lossy
+        // path: the decoded output is each sample with its 4 low bits
+        // cleared, (s >> 4) << 4 (spec/03 §3.7).
+        let samples: Vec<i32> = (0..200).map(|t| ((t * 37) % 8000) - 4000).collect();
+        let mut p = params_with(1, SampleFormat::S16P);
+        p.options = CodecOptions::default().set("bitshift", "4");
+        let mut enc = make_encoder(&p).expect("make_encoder");
+        enc.send_frame(&audio_frame(
+            vec![pack_s16lh(&samples)],
+            samples.len() as u32,
+            None,
+        ))
+        .expect("send_frame");
+        enc.flush().expect("flush");
+        let packet = enc.receive_packet().expect("packet");
+        let dec = decode_stream(&packet.data).expect("decode_stream");
+        let expected: Vec<i32> = samples.iter().map(|&s| (s >> 4) << 4).collect();
+        assert_eq!(dec.channels[0], expected);
+    }
+
+    #[test]
+    fn bitshift_zero_option_is_lossless() {
+        // bitshift = 0 (the explicit default) must stay sample-exact.
+        let samples: Vec<i32> = (0..120).map(|t| ((t * 11) % 5000) - 2500).collect();
+        let mut p = params_with(1, SampleFormat::S16P);
+        p.options = CodecOptions::default().set("bitshift", "0");
+        let mut enc = make_encoder(&p).expect("make_encoder");
+        enc.send_frame(&audio_frame(
+            vec![pack_s16lh(&samples)],
+            samples.len() as u32,
+            None,
+        ))
+        .expect("send_frame");
+        enc.flush().expect("flush");
+        let packet = enc.receive_packet().expect("packet");
+        let dec = decode_stream(&packet.data).expect("decode_stream");
+        assert_eq!(dec.channels[0], samples);
+    }
+
+    #[test]
+    fn bitshift_over_cap_is_rejected_at_construction() {
+        let mut p = params_with(1, SampleFormat::S16P);
+        p.options = CodecOptions::default().set("bitshift", (BITSHIFT_MAX + 1).to_string());
+        assert!(make_encoder(&p).is_err());
     }
 
     #[test]
