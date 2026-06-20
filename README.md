@@ -65,14 +65,14 @@ Three `H_filetype` sample-format codes are pinned and packed:
 ## Fixture-anchored conformance tests
 
 Beyond the encode/decode self-roundtrip suite, the decode path is
-pinned against **external ground truth** — FFmpeg 7.1.2's decoded PCM
+pinned against **external ground truth** — the reference encoder's decoded PCM
 for the clean-room spec's fixture corpus, as transcribed into the spec's
 behavioural footnotes. Each test reconstructs the exact spec-pinned wire
 residual stream, drives it through the public `decode_stream` API, and
-asserts the ffmpeg-byte-exact output (not the crate's own encoder
+asserts the reference-encoder byte-exact output (not the crate's own encoder
 output):
 
-* `tests/f1_diff1_ffmpeg_byte_exact.rs` — fixture `F1`'s first
+* `tests/f1_diff1_byte_exact.rs` — fixture `F1`'s first
   `BLOCK_FN_DIFF1` block (`spec/05` §3.1 / `T15`): energy-field encoded
   value `3` read at the `+1`-incremented width `svar(4)` →
   residuals `[4, 0, -26, 42, -17, -14]` → ch0 PCM

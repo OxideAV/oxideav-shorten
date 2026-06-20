@@ -1,12 +1,12 @@
 //! Fixture-anchored byte-exact decode test — fixture `F1`'s first
 //! `BLOCK_FN_DIFF1` block.
 //!
-//! The behavioural anchor is the **ffmpeg-byte-exact** vector pinned in
+//! The behavioural anchor is the **reference-encoder byte-exact** vector pinned in
 //! `docs/audio/shorten/spec/05-state-and-quirks.md` §3.1 and its
 //! footnote `T15`. That section resolves the residual-mantissa-width
 //! `+1` rule against a real `.shn` fixture (`luckynight.shn`, the
 //! corpus's `F1`) by reading the fixture's first per-block command and
-//! comparing two candidate interpretations against FFmpeg 7.1.2's
+//! comparing two candidate interpretations against the reference encoder's
 //! decoded PCM:
 //!
 //!   * `energy_field = 3` decoded as `uvar(3) = 3`. Reading the
@@ -18,14 +18,14 @@
 //!     `BLOCK_FN_DIFF1` recurrence `s(t) = s(t-1) + e1(t)` with a
 //!     zero-initialised carry (`s(-1) = 0`), this reproduces ch0
 //!     samples `[4, 4, -22, 20, 3, -11, …]` — **byte-for-byte** with
-//!     FFmpeg's `s16le`-decoded ch0 output for `F1` across the first
+//!     the reference encoder's `s16le`-decoded ch0 output for `F1` across the first
 //!     256 samples.
 //!
 //! This test does not require the (large, out-of-tree) `F1` bytes: it
 //! reconstructs the *exact pinned residual stream* of the `svar(4)`
 //! reading on the wire, drives it through the public `decode_stream`
-//! decode path, and asserts the spec/ffmpeg-pinned ch0 PCM. Because the
-//! reconstructed samples are an external ground truth (FFmpeg's PCM, not
+//! decode path, and asserts the spec-pinned ch0 PCM. Because the
+//! reconstructed samples are an external ground truth (the reference encoder's PCM, not
 //! our own encoder's output), this is a genuine fixture-anchored
 //! byte-exact decode test, not a self-roundtrip.
 //!
@@ -139,12 +139,12 @@ const FN_DIFF1: u32 = 1;
 const FN_BLOCKSIZE: u32 = 5;
 const FN_QUIT: u32 = 4;
 
-/// The spec/05 §3.1 / `T15` ffmpeg-byte-exact residual stream of `F1`'s
+/// The spec/05 §3.1 / `T15` reference-encoder byte-exact residual stream of `F1`'s
 /// first `BLOCK_FN_DIFF1` block, read at the `+1`-incremented width
 /// `svar(4)`.
 const F1_DIFF1_RESIDUALS_SVAR4: [i64; 6] = [4, 0, -26, 42, -17, -14];
 
-/// The corresponding ffmpeg ch0 PCM samples, reconstructed under
+/// The corresponding reference-encoder ch0 PCM samples, reconstructed under
 /// `s(t) = s(t-1) + e1(t)` with `s(-1) = 0` (spec/05 §3.1).
 const F1_DIFF1_CH0_PCM: [i32; 6] = [4, 4, -22, 20, 3, -11];
 
@@ -189,7 +189,7 @@ fn build_f1_diff1_stream() -> Vec<u8> {
 }
 
 #[test]
-fn f1_first_diff1_block_decodes_to_ffmpeg_pinned_ch0_pcm() {
+fn f1_first_diff1_block_decodes_to_reference_pinned_ch0_pcm() {
     let stream = build_f1_diff1_stream();
     let decoded = decode_stream(&stream).expect("F1 first-block synthetic stream decodes");
 
@@ -203,7 +203,7 @@ fn f1_first_diff1_block_decodes_to_ffmpeg_pinned_ch0_pcm() {
         ch0.as_slice(),
         F1_DIFF1_CH0_PCM,
         "spec/05 §3.1 / T15: F1's first DIFF1 block must reconstruct to \
-         ffmpeg's byte-exact ch0 PCM under the energy-field-plus-one rule"
+         the reference encoder's byte-exact ch0 PCM under the energy-field-plus-one rule"
     );
 }
 
@@ -212,7 +212,7 @@ fn f1_diff1_residual_stream_reads_as_svar4_not_svar3() {
     // Re-derive the two residual readings directly from the wire to pin
     // the negative half of T15: the *same* residual bits read at the
     // un-incremented width `svar(3)` give the documented wrong stream,
-    // and only `svar(4)` gives the ffmpeg-byte-exact one. This exercises
+    // and only `svar(4)` gives the reference-encoder byte-exact one. This exercises
     // the public BitReader::read_svar primitive against the spec vector.
     let mut bits = Vec::new();
     for &r in &F1_DIFF1_RESIDUALS_SVAR4 {

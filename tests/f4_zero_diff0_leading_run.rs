@@ -1,7 +1,7 @@
 //! Fixture-anchored byte-exact decode test — fixture `F4`'s leading
 //! `BLOCK_FN_ZERO` + `BLOCK_FN_DIFF0` zero-sample run.
 //!
-//! The behavioural anchor is the ffmpeg-byte-exact leading-zero run
+//! The behavioural anchor is the reference-encoder byte-exact leading-zero run
 //! pinned in `docs/audio/shorten/spec/04-function-code-resolution.md`
 //! §6.1 + footnote `T13`, cross-checked against
 //! `spec/05-state-and-quirks.md` §2.1/§2.3/§2.4 (running-mean
@@ -14,7 +14,7 @@
 //! samples per channel — followed by an `fn = 0` (`BLOCK_FN_DIFF0`)
 //! block for ch0 whose first `159` residuals are zero (extending ch0's
 //! zero run to `10,399`), then ch1's first DIFF0 with `351` leading
-//! zero residuals (extending ch1's run to `10,591`). FFmpeg decodes all
+//! zero residuals (extending ch1's run to `10,591`). the reference encoder decodes all
 //! of those leading samples to exactly zero.
 //!
 //! The two state rules this pins are:
@@ -28,7 +28,7 @@
 //! The test reproduces a scaled-down but structurally identical leading
 //! run (`H_meanblocks = 4` as in `F4`, a handful of ZERO blocks per
 //! channel, then a DIFF0 block of all-zero residuals) and asserts every
-//! decoded sample is zero — the ffmpeg ground truth for the leading
+//! decoded sample is zero — the reference-encoder ground truth for the leading
 //! run. It uses a `BLOCK_FN_BLOCKSIZE` override to keep the block count
 //! small while preserving the ZERO-then-DIFF0 ordering and the
 //! zero-mean reconstruction semantics.

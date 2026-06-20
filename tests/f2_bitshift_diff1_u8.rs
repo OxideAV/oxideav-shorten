@@ -2,7 +2,7 @@
 //! `BLOCK_FN_VERBATIM` → `BLOCK_FN_BITSHIFT(7)` → `BLOCK_FN_DIFF1`
 //! opening chain.
 //!
-//! The behavioural anchor is the ffmpeg-byte-exact `u8p` PCM pinned in
+//! The behavioural anchor is the reference-encoder byte-exact `u8p` PCM pinned in
 //! `docs/audio/shorten/spec/04-function-code-resolution.md` §3.2 +
 //! footnote `T11`. `F2` is an 8-bit-unsigned (`u8p`) AIFC-formatted
 //! Shorten stream whose opening per-block chain after the verbatim
@@ -14,11 +14,11 @@
 //! `[0, 0, 0, 0, 1, …]`; the decoder then emits each sample
 //! left-shifted by `bshift = 7`, so the **first non-zero ch0 output
 //! sample is at index 4 with value `128 = 1 << 7`** — byte-for-byte
-//! with FFmpeg's `u8p` PCM for `F2`.
+//! with the reference encoder's `u8p` PCM for `F2`.
 //!
 //! Only the leading samples `T11` actually pins are asserted: the four
 //! leading zeros and the value `128` at index 4. `T11`'s "first
-//! non-zero ch0 sample at index 4 with value 128" is the firm ffmpeg
+//! non-zero ch0 sample at index 4 with value 128" is the firm reference encoder
 //! anchor; samples past index 4 are not pinned by the footnote (it ends
 //! the residual list with `…`), so the test does not assert them.
 //!
@@ -181,12 +181,12 @@ fn f2_bitshift7_diff1_first_nonzero_ch0_sample_is_128_at_index_4() {
         "the DIFF1 block must produce at least 5 ch0 samples"
     );
 
-    // T11's firm ffmpeg anchor: first four samples zero, sample 4 = 128.
+    // T11's firm reference-encoder anchor: first four samples zero, sample 4 = 128.
     assert_eq!(
         &ch0[..5],
         &[0, 0, 0, 0, 128],
         "spec/04 §3.2 / T11: under BITSHIFT(7) the first non-zero ch0 \
-         sample is at index 4 with value 128 = 1 << 7 (ffmpeg u8p PCM)"
+         sample is at index 4 with value 128 = 1 << 7 (reference-encoder u8p PCM)"
     );
 }
 
