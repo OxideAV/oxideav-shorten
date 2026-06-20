@@ -62,6 +62,32 @@ Three `H_filetype` sample-format codes are pinned and packed:
 `2` (`u8`, `U8P`), `3` (`s16hl`, big-endian `S16P`), and
 `5` (`s16lh`, little-endian `S16P`).
 
+## Fixture-anchored conformance tests
+
+Beyond the encode/decode self-roundtrip suite, the decode path is
+pinned against **external ground truth** — FFmpeg 7.1.2's decoded PCM
+for the clean-room spec's fixture corpus, as transcribed into the spec's
+behavioural footnotes. Each test reconstructs the exact spec-pinned wire
+residual stream, drives it through the public `decode_stream` API, and
+asserts the ffmpeg-byte-exact output (not the crate's own encoder
+output):
+
+* `tests/f1_diff1_ffmpeg_byte_exact.rs` — fixture `F1`'s first
+  `BLOCK_FN_DIFF1` block (`spec/05` §3.1 / `T15`): energy-field encoded
+  value `3` read at the `+1`-incremented width `svar(4)` →
+  residuals `[4, 0, -26, 42, -17, -14]` → ch0 PCM
+  `[4, 4, -22, 20, 3, -11]`. Also pins the negative half (the same bits
+  read at `svar(3)` give the documented wrong stream).
+* `tests/f4_zero_diff0_leading_run.rs` — fixture `F4`'s leading
+  `BLOCK_FN_ZERO` + `BLOCK_FN_DIFF0` zero run (`spec/04` §6.1 / `T13`,
+  `spec/05` §2): `ZERO` emits `mu_chan = 0` and a following `DIFF0` with
+  zero residuals stays zero under the zero-initialised mean buffer.
+* `tests/f2_bitshift_diff1_u8.rs` — fixture `F2`'s
+  `VERBATIM → BITSHIFT(7) → DIFF1` `u8p` opening chain
+  (`spec/04` §3.2 / `T11`): first non-zero ch0 sample at index 4 is
+  `128 = 1 << 7`, exercising the verbatim-prefix carry, the
+  `BLOCK_FN_BITSHIFT` state, and the `sample << bshift` emit together.
+
 ## Not yet supported
 
 Both remaining gaps are **blocked on the spec, not on this crate** — the
