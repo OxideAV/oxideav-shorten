@@ -185,3 +185,79 @@ fn full_stream_two_channel_with_verbatim_bitshift_blocksize_quit() {
     assert_eq!(dec.channel_len(0), 6);
     assert_eq!(dec.channel_len(1), 4);
 }
+
+/// A stereo v2 stream exercising the order-2 and order-3
+/// polynomial-difference predictors (`BLOCK_FN_DIFF2` / `BLOCK_FN_DIFF3`)
+/// end-to-end through the public [`decode_stream`] driver, including the
+/// per-channel sample-history carry hand-off across two consecutive
+/// blocks of the same channel.
+///
+/// Behavioural anchors: `spec/03` §3.3 (DIFF2 line-fit predictor
+/// `ŝ₂(t) = 2·s(t-1) − s(t-2)`), §3.4 (DIFF3 quadratic-fit predictor
+/// `ŝ₃(t) = 3·s(t-1) − 3·s(t-2) + s(t-3)`), §2 (round-robin channel
+/// cursor), and `spec/05` §1 (most-recent-first carry indexing, zero
+/// initialisation, full refresh from blocks of `bs ≥ CARRY_LEN`).
+///
+/// The prior `full_stream_*` test covers DIFF0 + DIFF1 via the driver;
+/// this test closes the DIFF2 + DIFF3 driver path so all four
+/// polynomial-difference orders are decoder-direct byte-exact through
+/// `decode_stream` (not only through the encoder round-trip suite).
+#[test]
+fn full_stream_diff2_diff3_carry_handoff_through_driver() {
+    // Header: filetype = 5 (s16lh), 2 channels, blocksize = 4, no LPC,
+    // no mean, no skip.
+    let mut bits = header_param_bits(5, 2, 4, 0, 0, 0);
+
+    // Block 1 — DIFF2 ch0, residuals [0, 0, 0, 0] over zero carry.
+    //   carry seeds s(t-1)=s(t-2)=0.
+    //   s0 = 2*0 - 0 + 0 = 0
+    //   s1 = 2*0 - 0 + 0 = 0
+    //   s2 = 2*0 - 0 + 0 = 0
+    //   s3 = 2*0 - 0 + 0 = 0
+    //   ch0 block 1 = [0, 0, 0, 0]; carry = [0, 0, 0]. Cursor 0 -> 1.
+    append_diff_block(&mut bits, 2, 3, &[0, 0, 0, 0]);
+
+    // Block 2 — DIFF3 ch1, residuals [1, 0, 0, 0] over zero carry.
+    //   s0 = 3*0 - 3*0 + 0 + 1 = 1
+    //   s1 = 3*1 - 3*0 + 0 + 0 = 3   (s(t-1)=1, s(t-2)=0, s(t-3)=0)
+    //   s2 = 3*3 - 3*1 + 0 + 0 = 6   (s(t-1)=3, s(t-2)=1, s(t-3)=0)
+    //   s3 = 3*6 - 3*3 + 1 + 0 = 10  (s(t-1)=6, s(t-2)=3, s(t-3)=1)
+    //   ch1 block 1 = [1, 3, 6, 10]; carry = [10, 6, 3]. Cursor 1 -> 0.
+    append_diff_block(&mut bits, 3, 3, &[1, 0, 0, 0]);
+
+    // Block 3 — DIFF2 ch0 second block, residuals [2, 0, 0, 0] over the
+    //   ch0 carry [0, 0, 0] from block 1 (still all zero):
+    //   s0 = 2*0 - 0 + 2 = 2
+    //   s1 = 2*2 - 0 + 0 = 4   (s(t-1)=2, s(t-2)=0)
+    //   s2 = 2*4 - 2 + 0 = 6   (s(t-1)=4, s(t-2)=2)
+    //   s3 = 2*6 - 4 + 0 = 8   (s(t-1)=6, s(t-2)=4)
+    //   ch0 block 2 = [2, 4, 6, 8]. Cursor 0 -> 1.
+    append_diff_block(&mut bits, 2, 3, &[2, 0, 0, 0]);
+
+    // Block 4 — DIFF3 ch1 second block, residuals [0, 0, 0, 0] over the
+    //   ch1 carry [10, 6, 3] from block 2 (s(t-1)=10, s(t-2)=6, s(t-3)=3):
+    //   s0 = 3*10 - 3*6 + 3 + 0 = 15
+    //   s1 = 3*15 - 3*10 + 6 + 0 = 21   (s(t-1)=15, s(t-2)=10, s(t-3)=6)
+    //   s2 = 3*21 - 3*15 + 10 + 0 = 28  (s(t-1)=21, s(t-2)=15, s(t-3)=10)
+    //   s3 = 3*28 - 3*21 + 15 + 0 = 36  (s(t-1)=28, s(t-2)=21, s(t-3)=15)
+    //   ch1 block 2 = [15, 21, 28, 36]. Cursor 1 -> 0.
+    append_diff_block(&mut bits, 3, 3, &[0, 0, 0, 0]);
+
+    // QUIT.
+    bits.extend(encode_uvar(4, FNSIZE));
+
+    let buf = assemble(&bits);
+    let dec = decode_stream(&buf).expect("DIFF2/DIFF3 stream decodes");
+
+    assert_eq!(dec.header.channels, 2);
+    assert_eq!(dec.channels.len(), 2);
+    // ch0: DIFF2 block 1 then DIFF2 block 2 (carry-continued).
+    assert_eq!(dec.channels[0], vec![0, 0, 0, 0, 2, 4, 6, 8]);
+    // ch1: DIFF3 block 1 then DIFF3 block 2 (carry-continued).
+    assert_eq!(dec.channels[1], vec![1, 3, 6, 10, 15, 21, 28, 36]);
+    assert_eq!(dec.channel_len(0), 8);
+    assert_eq!(dec.channel_len(1), 8);
+    // QUIT zero-padding to the next byte boundary is spec-conformant
+    // (`spec/05` §4).
+    assert!(dec.quit_padding.is_spec_conformant());
+}
