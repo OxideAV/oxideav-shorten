@@ -88,6 +88,31 @@ output):
   `128 = 1 << 7`, exercising the verbatim-prefix carry, the
   `BLOCK_FN_BITSHIFT` state, and the `sample << bshift` emit together.
 
+Beyond the fixture-anchored anchors, a set of hand-built bitstreams
+drives every block-command kernel **byte-exact through the public
+`decode_stream` driver** (the whole-stream path with the driver-owned
+round-robin channel cursor + per-channel state), closing the
+decoder-direct combinations that were previously only exercised at the
+predictor/`MeanEstimator` level or via the encoder round-trip suite
+(`tests/decode_stream_driver.rs`):
+
+* `full_stream_diff2_diff3_carry_handoff_through_driver` — the order-2
+  line-fit and order-3 quadratic-fit predictors with two-block
+  per-channel carry hand-off (`spec/03` §3.3–§3.4).
+* `full_stream_mean_estimator_diff0_and_zero_through_driver` — the
+  non-zero running-mean estimator: `DIFF0` reconstructs `e0(t) + μ` and
+  `ZERO` emits `μ` while the one-slot sliding window updates across five
+  blocks, exercising the `spec/05` §2.5 integer arithmetic
+  (`trunc_div(Σ + divisor/2, divisor)`) at the public API.
+* `full_stream_qlpc_carry_handoff_through_driver` — the quantised-LPC
+  predictor at `H_maxlpcorder = 3` with two-block carry hand-off,
+  interleaved with `DIFF1` on the other channel (`spec/03` §3.5).
+* `full_stream_partial_block_carry_retention_through_driver` — the
+  `bs < CARRY_LEN` carry-retention path (`spec/05` §1.3 second clause):
+  a `BLOCK_FN_BLOCKSIZE` override to `new_bs = 1` makes each size-1
+  `DIFF3` block keep the older history that its `s(t-2)`/`s(t-3)`
+  prediction reads.
+
 ## Not yet supported
 
 Both remaining gaps are **blocked on the spec, not on this crate** — the
