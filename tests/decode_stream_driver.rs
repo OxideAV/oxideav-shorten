@@ -420,3 +420,78 @@ fn full_stream_qlpc_carry_handoff_through_driver() {
     assert_eq!(dec.channel_len(1), 8);
     assert!(dec.quit_padding.is_spec_conformant());
 }
+
+/// A mono v2 stream that drives the **partial-block carry-retention**
+/// path of `spec/05` §1.3's second clause through the public
+/// [`decode_stream`] driver: a `BLOCK_FN_BLOCKSIZE` override shrinks the
+/// sub-block size to `new_bs = 1`, which is **below** the carry length
+/// `CARRY_LEN = max(3, H_maxlpcorder) = 3`. When a block is shorter than
+/// the carry, the carry update keeps the older history beyond the
+/// partial new block:
+///
+/// ```text
+/// carry[i] = blk[bs - 1 - i]            if  bs - 1 - i >= 0
+///          = previous carry[i - bs]     otherwise   (← second clause)
+/// ```
+///
+/// The order-3 predictor of the next block then reads `s(t-2)` and
+/// `s(t-3)` from that retained older history, so a wrong second-clause
+/// implementation would desynchronise the reconstruction. This is the
+/// only end-to-end exercise of the `bs < CARRY_LEN` carry path through
+/// the public driver — the existing housekeeping test uses a tail block
+/// of size 4 (`bs >= CARRY_LEN`, fully-refreshed first clause only).
+///
+/// Behavioural anchors: `spec/05` §1.3 (the two-clause carry update +
+/// the `bs < CARRY_LEN` retention), `spec/03` §3.4 (DIFF3 predictor),
+/// §3.6 (`BLOCK_FN_BLOCKSIZE` override semantics).
+#[test]
+fn full_stream_partial_block_carry_retention_through_driver() {
+    // Header: filetype = 5 (s16lh), 1 channel, default blocksize = 4,
+    // no LPC (carry len = max(3, 0) = 3), no mean, no skip.
+    let mut bits = header_param_bits(5, 1, 4, 0, 0, 0);
+
+    // Block 1 — DIFF1 ch0, bs = 4, residuals [10, 10, 10, 10] over zero
+    //   carry: s = [10, 20, 30, 40]. bs (4) >= CARRY_LEN (3), so the
+    //   carry is fully refreshed from this block:
+    //     carry = [40, 30, 20]  (s(t-1)=40, s(t-2)=30, s(t-3)=20).
+    //   Cursor wraps 0 -> 0 (mono).
+    append_diff_block(&mut bits, 1, 3, &[10, 10, 10, 10]);
+
+    // BLOCKSIZE override -> new_bs = 1 (below CARRY_LEN = 3).
+    bits.extend(encode_uvar(5, FNSIZE)); // BLOCKSIZE = 5
+    bits.extend(encode_ulong(1, 1));
+
+    // Block 2 — DIFF3 ch0, bs = 1, reads the full carry [40, 30, 20]:
+    //   predicted = 3*40 - 3*30 + 20 = 120 - 90 + 20 = 50; residual 0
+    //   -> s0 = 50. bs (1) < CARRY_LEN (3): second clause fires.
+    //     carry[0] = blk[0]          = 50
+    //     carry[1] = old carry[1-1]  = old carry[0] = 40
+    //     carry[2] = old carry[2-1]  = old carry[1] = 30
+    //   new carry = [50, 40, 30].
+    append_diff_block(&mut bits, 3, 3, &[0]);
+
+    // Block 3 — DIFF3 ch0, bs = 1, reads the retained carry [50, 40, 30]:
+    //   predicted = 3*50 - 3*40 + 30 = 150 - 120 + 30 = 60; residual 0
+    //   -> s0 = 60. second clause again:
+    //     carry = [60, 50, 40].
+    append_diff_block(&mut bits, 3, 3, &[0]);
+
+    // Block 4 — DIFF3 ch0, bs = 1, reads [60, 50, 40]:
+    //   predicted = 3*60 - 3*50 + 40 = 180 - 150 + 40 = 70; residual 0
+    //   -> s0 = 70.
+    append_diff_block(&mut bits, 3, 3, &[0]);
+
+    // QUIT.
+    bits.extend(encode_uvar(4, FNSIZE));
+
+    let buf = assemble(&bits);
+    let dec = decode_stream(&buf).expect("partial-block stream decodes");
+
+    assert_eq!(dec.header.channels, 1);
+    assert_eq!(dec.channels.len(), 1);
+    // Block 1 (4 samples) then three size-1 DIFF3 blocks whose
+    // predictions depend on the retained older carry history.
+    assert_eq!(dec.channels[0], vec![10, 20, 30, 40, 50, 60, 70]);
+    assert_eq!(dec.channel_len(0), 7);
+    assert!(dec.quit_padding.is_spec_conformant());
+}
