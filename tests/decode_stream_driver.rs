@@ -20,7 +20,7 @@
 //! * `spec/03` §3.10 — verbatim prefix collection.
 //! * `spec/03` §3.8 — `BLOCK_FN_QUIT` termination.
 
-use oxideav_shorten::{decode_stream, FNSIZE, MAGIC};
+use oxideav_shorten::{decode_stream, FNSIZE, LPCQSIZE, LPCQUANT, MAGIC};
 
 fn pack_bits_msb_first(bits: &[u32]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -333,5 +333,90 @@ fn full_stream_mean_estimator_diff0_and_zero_through_driver() {
         ]
     );
     assert_eq!(dec.channel_len(0), 20);
+    assert!(dec.quit_padding.is_spec_conformant());
+}
+
+/// Append a synthetic `BLOCK_FN_QLPC` command (function code + order +
+/// coefficients + energy + residuals) to `out`.
+fn append_qlpc_block(out: &mut Vec<u32>, coefs: &[i64], energy_encoded: u32, residuals: &[i64]) {
+    out.extend(encode_uvar(7, FNSIZE)); // QLPC = 7
+    out.extend(encode_uvar(coefs.len() as u32, LPCQSIZE));
+    for &c in coefs {
+        out.extend(encode_svar(c, LPCQUANT));
+    }
+    out.extend(encode_uvar(energy_encoded, ENERGYSIZE));
+    let width = energy_encoded + 1;
+    for &r in residuals {
+        out.extend(encode_svar(r, width));
+    }
+}
+
+/// A stereo v2 stream with `H_maxlpcorder = 3` exercising the
+/// quantised-LPC predictor (`BLOCK_FN_QLPC`) end-to-end through the
+/// public [`decode_stream`] driver, interleaved with a DIFF block on the
+/// other channel, including the per-channel carry hand-off across two
+/// consecutive QLPC blocks of the same channel.
+///
+/// Behavioural anchors: `spec/03` §3.5 (QLPC wire layout
+/// `<order> <coef>×order <energy> <residual>×bs` and reconstruction
+/// `s(t) = Σᵢ aᵢ·s(t-i) + e(t)` applied without scaling), §3.11 (carry
+/// length `max(3, H_maxlpcorder)`), §2 (round-robin cursor), `spec/02`
+/// §4.3/§4.4 (`LPCQSIZE = 2`, `LPCQUANT = 2`), and `spec/05` §3.2 (the
+/// QLPC energy field follows the same `+1` residual-width convention).
+///
+/// The prior `qlpc_block_pipeline` test drives `decode_qlpc_block`
+/// directly with a locally-overridden block size; this is the first
+/// QLPC decode that flows through the public `decode_stream` driver with
+/// the header-declared block size and the driver-owned channel cursor +
+/// carry update.
+#[test]
+fn full_stream_qlpc_carry_handoff_through_driver() {
+    // Header: filetype = 5 (s16lh), 2 channels, blocksize = 4,
+    // H_maxlpcorder = 3 (carry len = max(3,3) = 3), no mean, no skip.
+    let mut bits = header_param_bits(5, 2, 4, 3, 0, 0);
+
+    // Block 1 — QLPC ch0, order 2 (a1 = 2, a2 = -1, the DIFF2 line-fit),
+    //   residuals [1, 0, 0, 0] over zero carry (s(t-1)=s(t-2)=0):
+    //     s0 = 2*0 - 1*0 + 1 = 1
+    //     s1 = 2*1 - 1*0 + 0 = 2
+    //     s2 = 2*2 - 1*1 + 0 = 3
+    //     s3 = 2*3 - 1*2 + 0 = 4
+    //   ch0 block 1 = [1, 2, 3, 4]; carry = [4, 3, 2]. Cursor 0 -> 1.
+    append_qlpc_block(&mut bits, &[2, -1], 3, &[1, 0, 0, 0]);
+
+    // Block 2 — DIFF1 ch1, residuals [5, -1, -1, -1] over zero carry:
+    //   s0 = 0 + 5 = 5; s1 = 5 - 1 = 4; s2 = 4 - 1 = 3; s3 = 3 - 1 = 2.
+    //   ch1 block 1 = [5, 4, 3, 2]. Cursor 1 -> 0.
+    append_diff_block(&mut bits, 1, 3, &[5, -1, -1, -1]);
+
+    // Block 3 — QLPC ch0 second block, order 2 (a1 = 2, a2 = -1),
+    //   default block size 4, residuals [0, 0, 0, 0] over the ch0 carry
+    //   [4, 3, 2] (s(t-1)=4, s(t-2)=3):
+    //     s0 = 2*4 - 1*3 + 0 = 5
+    //     s1 = 2*5 - 1*4 + 0 = 6   (s(t-1)=5, s(t-2)=4)
+    //     s2 = 2*6 - 1*5 + 0 = 7   (s(t-1)=6, s(t-2)=5)
+    //     s3 = 2*7 - 1*6 + 0 = 8   (s(t-1)=7, s(t-2)=6)
+    //   ch0 block 2 = [5, 6, 7, 8]. Cursor 0 -> 1.
+    append_qlpc_block(&mut bits, &[2, -1], 3, &[0, 0, 0, 0]);
+
+    // Block 4 — DIFF1 ch1 second block, residuals [0, 0, 0, 0] over the
+    //   ch1 carry [2, 3, 4] (s(t-1)=2): s = [2, 2, 2, 2]. Cursor 1 -> 0.
+    append_diff_block(&mut bits, 1, 3, &[0, 0, 0, 0]);
+
+    // QUIT.
+    bits.extend(encode_uvar(4, FNSIZE));
+
+    let buf = assemble(&bits);
+    let dec = decode_stream(&buf).expect("QLPC stream decodes");
+
+    assert_eq!(dec.header.channels, 2);
+    assert_eq!(dec.header.maxlpcorder, 3);
+    assert_eq!(dec.channels.len(), 2);
+    // ch0: QLPC block 1 then QLPC block 2 (carry-continued).
+    assert_eq!(dec.channels[0], vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    // ch1: DIFF1 block 1 then DIFF1 block 2 (carry-continued).
+    assert_eq!(dec.channels[1], vec![5, 4, 3, 2, 2, 2, 2, 2]);
+    assert_eq!(dec.channel_len(0), 8);
+    assert_eq!(dec.channel_len(1), 8);
     assert!(dec.quit_padding.is_spec_conformant());
 }
