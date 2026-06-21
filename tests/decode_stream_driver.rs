@@ -261,3 +261,77 @@ fn full_stream_diff2_diff3_carry_handoff_through_driver() {
     // (`spec/05` §4).
     assert!(dec.quit_padding.is_spec_conformant());
 }
+
+/// A mono v2 stream exercising the running-mean estimator's effect on
+/// `BLOCK_FN_DIFF0` reconstruction and `BLOCK_FN_ZERO` emission end-to-end
+/// through the public [`decode_stream`] driver, with the mean updating
+/// across consecutive blocks.
+///
+/// Behavioural anchors: `spec/05` §2.3 (DIFF0 reconstruct
+/// `s(t) = e0(t) + μ_chan`), §2.4 (ZERO emits `bs` samples all equal to
+/// `μ_chan`), §2.5 (per-block mean `μ_blk = trunc_div(Σ + bs/2, bs)` and
+/// running mean `μ_chan = trunc_div(Σ_slots + N/2, N)`, both with the
+/// always-positive `+divisor/2` bias and truncation toward zero), and
+/// §2.2 (the sliding window evicts the oldest slot and appends the new
+/// per-block mean at the most-recent slot).
+///
+/// The mean estimator's non-zero path was previously verified only at
+/// the [`MeanEstimator`]/predictor level and through the encoder
+/// round-trip suite; this closes the decoder-direct driver path on a
+/// hand-built bitstream where DIFF0 carries a non-zero running mean and
+/// ZERO emits it.
+#[test]
+fn full_stream_mean_estimator_diff0_and_zero_through_driver() {
+    // Header: filetype = 5 (s16lh), 1 channel, blocksize = 4,
+    // no LPC, H_meanblocks = 1 (one-slot sliding window), no skip.
+    let mut bits = header_param_bits(5, 1, 4, 0, 1, 0);
+
+    // The estimator holds a single slot initialised to 0, so:
+    //   μ_chan = trunc_div(slot + 1/2, 1) = slot   (1/2 = 0).
+    //
+    // Block 1 — DIFF0, μ_chan = 0, residuals [8, 8, 8, 8]:
+    //   s(t) = e0(t) + 0 = [8, 8, 8, 8].
+    //   per-block mean μ_blk = trunc_div(32 + 4/2, 4) = trunc_div(34, 4)
+    //                        = 8. slot -> 8 (μ_chan becomes 8).
+    append_diff_block(&mut bits, 0, 3, &[8, 8, 8, 8]);
+
+    // Block 2 — ZERO, μ_chan = 8 at block start. Emits 4 samples all = 8.
+    //   no residuals. per-block mean μ_blk = trunc_div(32 + 2, 4) = 8.
+    //   slot stays 8 (μ_chan stays 8).
+    bits.extend(encode_uvar(8, FNSIZE)); // ZERO = 8
+
+    // Block 3 — DIFF0, μ_chan = 8, residuals [0, 2, -2, 0]:
+    //   s(t) = e0(t) + 8 = [8, 10, 6, 8].
+    //   per-block mean μ_blk = trunc_div(32 + 2, 4) = 8. slot stays 8.
+    append_diff_block(&mut bits, 0, 3, &[0, 2, -2, 0]);
+
+    // Block 4 — DIFF0, μ_chan = 8, residuals [-8, -8, -8, -8]:
+    //   s(t) = e0(t) + 8 = [0, 0, 0, 0].
+    //   per-block mean μ_blk = trunc_div(0 + 2, 4) = 0. slot -> 0.
+    append_diff_block(&mut bits, 0, 3, &[-8, -8, -8, -8]);
+
+    // Block 5 — ZERO, μ_chan = 0 at block start. Emits 4 samples all = 0.
+    bits.extend(encode_uvar(8, FNSIZE)); // ZERO = 8
+
+    // QUIT.
+    bits.extend(encode_uvar(4, FNSIZE));
+
+    let buf = assemble(&bits);
+    let dec = decode_stream(&buf).expect("mean-estimator stream decodes");
+
+    assert_eq!(dec.header.channels, 1);
+    assert_eq!(dec.header.meanblocks, 1);
+    assert_eq!(dec.channels.len(), 1);
+    assert_eq!(
+        dec.channels[0],
+        vec![
+            8, 8, 8, 8, // block 1 DIFF0 (μ = 0)
+            8, 8, 8, 8, // block 2 ZERO (μ = 8)
+            8, 10, 6, 8, // block 3 DIFF0 (μ = 8)
+            0, 0, 0, 0, // block 4 DIFF0 (μ = 8, residuals -8)
+            0, 0, 0, 0, // block 5 ZERO (μ = 0)
+        ]
+    );
+    assert_eq!(dec.channel_len(0), 20);
+    assert!(dec.quit_padding.is_spec_conformant());
+}
