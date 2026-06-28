@@ -387,6 +387,8 @@ impl Decoder for ShortenDecoder {
         self.verbatim_prefix.clear();
         self.decoded = false;
         self.eof = false;
+        self.stream_proper_len = None;
+        self.quit_padding = None;
         self.pts = None;
         Ok(())
     }
@@ -1113,6 +1115,8 @@ impl Decoder for ShortenStreamingDecoder {
         self.eof = false;
         self.pts = None;
         self.first_frame_emitted = false;
+        self.stream_proper_len = None;
+        self.quit_padding = None;
         self.fatal = None;
         Ok(())
     }
@@ -1552,6 +1556,48 @@ mod tests {
         assert_eq!(dec.stream_proper_len(), Some(proper));
         assert_eq!(dec.quit_padding(), Some(reference.quit_padding));
         assert!(dec.quit_padding().unwrap().is_spec_conformant());
+    }
+
+    /// `reset()` must clear the QUIT-boundary observation on both
+    /// wrappers so a stale `stream_proper_len` / `quit_padding` from a
+    /// prior stream never leaks into a fresh decode. After reset the
+    /// accessors report `None` again; a fresh decode repopulates them.
+    #[test]
+    fn reset_clears_quit_boundary_on_both_wrappers() {
+        let mut bits = header_param_bits(FILETYPE_S16LH, 1, 4, 0, 0, 0);
+        append_diff_block(&mut bits, 0, 5, &[1, 2, 3, 4]);
+        bits.extend(encode_uvar(4, FNSIZE));
+        let bytes = assemble(&bits);
+        let proper = bytes.len();
+
+        // Whole-stream wrapper.
+        let mut dec = ShortenDecoder::new(
+            CodecId::new(CODEC_ID_STR),
+            CodecParameters::audio(CodecId::new(CODEC_ID_STR)),
+        );
+        let pkt = Packet::new(0, TimeBase::new(1, 44_100), bytes.clone());
+        dec.send_packet(&pkt).expect("send_packet");
+        assert_eq!(dec.stream_proper_len(), Some(proper));
+        assert!(dec.quit_padding().is_some());
+        Decoder::reset(&mut dec).expect("reset");
+        assert_eq!(dec.stream_proper_len(), None);
+        assert_eq!(dec.quit_padding(), None);
+        // Fresh decode repopulates.
+        let pkt2 = Packet::new(0, TimeBase::new(1, 44_100), bytes.clone());
+        dec.send_packet(&pkt2).expect("send_packet after reset");
+        assert_eq!(dec.stream_proper_len(), Some(proper));
+
+        // Streaming wrapper.
+        let mut sdec =
+            ShortenStreamingDecoder::new(CodecId::new(STREAMING_CODEC_ID_STR), streaming_params());
+        let spkt = Packet::new(0, TimeBase::new(1, 44_100), bytes.clone());
+        sdec.send_packet(&spkt).expect("streaming send_packet");
+        while let Ok(Frame::Audio(_)) = sdec.receive_frame() {}
+        assert_eq!(sdec.stream_proper_len(), Some(proper));
+        assert!(sdec.quit_padding().is_some());
+        Decoder::reset(&mut sdec).expect("streaming reset");
+        assert_eq!(sdec.stream_proper_len(), None);
+        assert_eq!(sdec.quit_padding(), None);
     }
 
     /// The streaming `ShortenStreamingDecoder` wrapper computes the same

@@ -34,6 +34,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the in-module wrapper assertion. No wire-format change — this is a
   pure read-side API addition over the existing QUIT handling.
 
+- **Round 379 — `reset()` clears the QUIT-boundary observation
+  (`spec/04` §2.1).** Both `oxideav_core::Decoder` wrappers'
+  `reset()` now clear the new `stream_proper_len` / `quit_padding`
+  fields alongside the buffer, verbatim prefix, and per-channel state,
+  so a stale boundary from a prior stream can never leak into a fresh
+  decode through the reused decoder. +1 test asserting both wrappers
+  report `None` after reset and repopulate on the next decode.
+
 - **Round 379 — `BLOCK_FN_QUIT` boundary surfaced at the
   `oxideav_core::Decoder` trait layer (`spec/04` §2.1 / `spec/05` §4).**
   The free-function `decode_stream` and the `StreamDecoder` iterator
