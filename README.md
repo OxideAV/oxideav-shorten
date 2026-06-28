@@ -26,7 +26,18 @@ v2/v3 path:
   `spec/05` §4 pins the padding to all-zero with a 0..7 count, and
   `BytePadding::is_spec_conformant` checks that rule — while decode
   stays lenient and still accepts a stream whose padding is non-zero
-  (matching lenient real-world decoders, `spec/05` §5.2).
+  (matching lenient real-world decoders, `spec/05` §5.2). The same QUIT
+  byte-boundary observation is exposed across **all three API layers**:
+  the streaming `StreamDecoder` surfaces it via
+  `stream_proper_len()` / `quit_padding()` / `trailer_len()` (the last
+  being the appended-sidecar size), and both `oxideav_core::Decoder`
+  trait wrappers (`ShortenDecoder` whole-stream + `ShortenStreamingDecoder`
+  chop-anywhere) expose `stream_proper_len()` / `quit_padding()` — the
+  streaming wrapper computing the byte-exact boundary even when the
+  stream is delivered one byte per `send_packet`. The boundary computed
+  bottom-up from the QUIT alignment is cross-validated against the
+  `SHNAMPSK` detector's top-down `sidecar_start`: a dedicated test pins
+  the three-way agreement (`spec/05` §5.2).
 * **Encoder** — the whole-stream encode driver (`encode_stream`) takes
   an interleaved `&[i32]` PCM buffer and produces a `.shn` byte stream
   that `decode_stream` reconstructs sample-exact. A per-block selector
