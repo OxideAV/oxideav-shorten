@@ -65,7 +65,7 @@
 //! reconstruction recurrences. The contracts cited above are all
 //! traced to `docs/audio/shorten/spec/03` and `spec/05`.
 
-use crate::bitreader::BitReader;
+use crate::bitreader::{BitReader, BytePadding};
 use crate::block::{
     read_bitshift_payload, read_blocksize_payload, read_function_code, read_verbatim_payload,
     FunctionCode,
@@ -178,6 +178,22 @@ pub struct StreamDecoder<'a> {
     /// True once `BLOCK_FN_QUIT` has been observed or an error has
     /// been yielded. Subsequent calls return `None`.
     finished: bool,
+    /// SHN-stream-proper byte length (`spec/04` §2.1), assigned when
+    /// `BLOCK_FN_QUIT` is reached and its post-field zero padding is
+    /// consumed to the next byte boundary. `None` until then. This is
+    /// the byte-exact split point between the SHN stream proper and any
+    /// out-of-band seek-table sidecar — identical to the batch path's
+    /// [`crate::DecodedStream::stream_proper_len`].
+    stream_proper_len: Option<usize>,
+    /// The post-`BLOCK_FN_QUIT` zero padding (`spec/05` §4), observed
+    /// when the QUIT branch aligns to the byte boundary. `None` until
+    /// `BLOCK_FN_QUIT` is reached — mirrors the batch path's
+    /// [`crate::DecodedStream::quit_padding`].
+    quit_padding: Option<BytePadding>,
+    /// Total input length in bytes, retained so the stream-proper length
+    /// can be expressed as an absolute file offset (`5` magic+version
+    /// bytes plus the byte offset into the post-version body).
+    total_len: usize,
 }
 
 impl<'a> std::fmt::Debug for StreamDecoder<'a> {
@@ -240,6 +256,9 @@ impl<'a> StreamDecoder<'a> {
             bshift: 0,
             commands: 0,
             finished: false,
+            stream_proper_len: None,
+            quit_padding: None,
+            total_len: bytes.len(),
         })
     }
 
@@ -281,6 +300,47 @@ impl<'a> StreamDecoder<'a> {
         self.finished
     }
 
+    /// The byte-exact length of the SHN stream proper (`spec/04` §2.1) —
+    /// the offset at which any out-of-band seek-table sidecar begins.
+    ///
+    /// Returns `None` until `BLOCK_FN_QUIT` has been consumed (the
+    /// boundary is only known once the terminator's post-field zero
+    /// padding has been aligned to the next byte). After termination
+    /// this equals the batch path's
+    /// [`crate::DecodedStream::stream_proper_len`] for the same input
+    /// bytes, so a streaming caller can split a sidecar without buffering
+    /// the whole decode.
+    pub fn stream_proper_len(&self) -> Option<usize> {
+        self.stream_proper_len
+    }
+
+    /// The post-`BLOCK_FN_QUIT` zero padding observed at the byte
+    /// boundary (`spec/05` §4). `None` until `BLOCK_FN_QUIT` has been
+    /// consumed.
+    ///
+    /// `spec/05` §4 pins the padding to all-zero with a `0..=7` bit
+    /// count; [`BytePadding::is_spec_conformant`] checks that rule. The
+    /// streaming decoder, like the batch driver, decodes leniently and
+    /// still terminates cleanly on a non-conformant tail (`spec/05`
+    /// §5.2) — this accessor merely surfaces what was observed. Matches
+    /// the batch path's [`crate::DecodedStream::quit_padding`].
+    pub fn quit_padding(&self) -> Option<BytePadding> {
+        self.quit_padding
+    }
+
+    /// The trailing bytes after the SHN stream proper — the candidate
+    /// seek-table / sidecar region (`spec/04` §2.1, `spec/05` §5).
+    ///
+    /// Returns `Some(0)` (no trailer) once `BLOCK_FN_QUIT` is reached on
+    /// a stream whose proper length equals the input length, `Some(n)`
+    /// for a stream with an `n`-byte sidecar, and `None` before
+    /// termination. Derived from [`Self::stream_proper_len`] and the
+    /// original input length.
+    pub fn trailer_len(&self) -> Option<usize> {
+        self.stream_proper_len
+            .map(|proper| self.total_len.saturating_sub(proper))
+    }
+
     /// Pull the next [`DecodedBlock`].
     ///
     /// Walks per-block commands, absorbing housekeeping commands
@@ -319,6 +379,22 @@ impl<'a> StreamDecoder<'a> {
             match fc {
                 FunctionCode::Quit => {
                     self.finished = true;
+                    // spec/04 §2.1: the QUIT `uvar(2)` field ends at an
+                    // arbitrary sub-byte bit position; the encoder pads
+                    // with zero bits to the next byte boundary, which is
+                    // the end of the SHN stream proper. Consume that
+                    // padding so the reported boundary is byte-exact,
+                    // observing the padding bits so the §4 zero rule can
+                    // be checked by the caller. Decode stays lenient
+                    // regardless (spec/05 §5.2) — identical to the batch
+                    // `decode_stream` driver.
+                    match self.reader.align_to_byte_observing_padding() {
+                        Ok((post_version_end, padding)) => {
+                            self.stream_proper_len = Some(5 + post_version_end);
+                            self.quit_padding = Some(padding);
+                        }
+                        Err(e) => return Err(e),
+                    }
                     return Ok(None);
                 }
                 // --- Housekeeping: mutate state in place, loop. ---
@@ -613,6 +689,68 @@ mod tests {
 
         // Iterator protocol — third call still returns None.
         assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn quit_boundary_accessors_match_batch_driver() {
+        // DIFF0 [10, 20] then QUIT, single channel.
+        let mut bits = header_param_bits(5, 1, 2, 0, 0, 0);
+        append_diff_block(&mut bits, 0, 3, &[10, 20]);
+        bits.extend(encode_uvar(4, FNSIZE));
+        let buf = assemble(&bits);
+
+        let reference = decode_stream(&buf).expect("batch decode");
+
+        let mut iter = StreamDecoder::new(&buf).expect("new");
+        // Boundary unknown until QUIT consumed.
+        assert_eq!(iter.stream_proper_len(), None);
+        assert_eq!(iter.quit_padding(), None);
+        assert_eq!(iter.trailer_len(), None);
+
+        while iter.next_block().expect("ok").is_some() {}
+
+        assert_eq!(iter.stream_proper_len(), Some(reference.stream_proper_len));
+        assert_eq!(iter.quit_padding(), Some(reference.quit_padding));
+        assert_eq!(iter.stream_proper_len(), Some(buf.len()));
+        assert_eq!(iter.trailer_len(), Some(0));
+        assert!(iter.quit_padding().unwrap().is_spec_conformant());
+    }
+
+    #[test]
+    fn quit_padding_non_conformant_tail_is_observed_but_lenient() {
+        // Build a stream whose post-QUIT padding bits are NOT all zero,
+        // by flipping a padding bit of the final byte. The streaming
+        // decoder must still terminate cleanly (spec/05 §5.2 lenient
+        // decode) while reporting the padding as non-conformant
+        // (spec/05 §4) — matching the batch driver.
+        let mut bits = header_param_bits(5, 1, 2, 0, 0, 0);
+        append_diff_block(&mut bits, 0, 3, &[1, 2]);
+        bits.extend(encode_uvar(4, FNSIZE));
+        let mut buf = assemble(&bits);
+
+        // Find the QUIT bit position by decoding once: stream_proper_len
+        // tells us the boundary byte. The QUIT field ends mid-byte; the
+        // remaining low bits of that last byte are the padding. Set the
+        // least-significant padding bit to 1 to make it non-conformant.
+        let reference = decode_stream(&buf).expect("batch decode");
+        if reference.quit_padding.bits > 0 {
+            let last = buf.len() - 1;
+            buf[last] |= 1; // flip the lowest padding bit on
+        }
+
+        let tampered = decode_stream(&buf).expect("batch still decodes (lenient)");
+
+        let mut iter = StreamDecoder::new(&buf).expect("new");
+        while iter.next_block().expect("ok still terminates").is_some() {}
+
+        assert!(iter.is_finished());
+        assert_eq!(iter.stream_proper_len(), Some(tampered.stream_proper_len));
+        assert_eq!(iter.quit_padding(), Some(tampered.quit_padding));
+        // If there was padding to flip, the streaming path reports the
+        // non-conformance exactly as the batch path does.
+        if reference.quit_padding.bits > 0 {
+            assert!(!iter.quit_padding().unwrap().is_spec_conformant());
+        }
     }
 
     #[test]

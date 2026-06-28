@@ -246,3 +246,75 @@ fn iterator_yields_first_block_without_buffering_remainder() {
     assert!(iter.next_block().expect("ok").is_none());
     assert!(iter.is_finished());
 }
+
+/// The streaming decoder must surface the `BLOCK_FN_QUIT` byte-alignment
+/// boundary (`spec/04` §2.1) and the post-QUIT zero padding (`spec/05`
+/// §4) exactly as the batch `decode_stream` driver does — the parity
+/// that lets a streaming caller split an out-of-band seek-table sidecar
+/// without buffering the whole decode.
+#[test]
+fn streaming_quit_boundary_matches_batch_driver() {
+    // Single channel, blocksize 4, one DIFF0 block then QUIT.
+    let mut bits = header_param_bits(5, 1, 4, 0, 0, 0);
+    append_diff_block(&mut bits, 0, 3, &[1, 2, 3, 4]);
+    bits.extend(encode_uvar(4, FNSIZE));
+    let buf = assemble(&bits);
+
+    let reference = decode_stream(&buf).expect("reference decode_stream");
+
+    let mut iter = decode_stream_iter(&buf).expect("decode_stream_iter");
+    // Before QUIT the boundary is unknown.
+    assert_eq!(iter.stream_proper_len(), None);
+    assert_eq!(iter.quit_padding(), None);
+    assert_eq!(iter.trailer_len(), None);
+
+    // Drain to termination.
+    while iter.next_block().expect("ok").is_some() {}
+    assert!(iter.is_finished());
+
+    // After QUIT the streaming path reports the same byte-exact split
+    // point and padding the batch driver does.
+    assert_eq!(iter.stream_proper_len(), Some(reference.stream_proper_len));
+    assert_eq!(iter.quit_padding(), Some(reference.quit_padding));
+    // No sidecar appended, so the stream proper spans the whole input.
+    assert_eq!(iter.stream_proper_len(), Some(buf.len()));
+    assert_eq!(iter.trailer_len(), Some(0));
+    // The observed padding is spec/05 §4-conformant (all-zero, 0..=7).
+    assert!(iter.quit_padding().unwrap().is_spec_conformant());
+}
+
+/// With an out-of-band trailer appended after the SHN stream proper, the
+/// streaming decoder's `stream_proper_len` still points at the true end
+/// of the SHN stream (the QUIT byte boundary), and `trailer_len` reports
+/// the sidecar size — without the iterator ever decoding the trailer
+/// bytes as commands (`spec/04` §2.1, `spec/05` §5).
+#[test]
+fn streaming_stream_proper_len_splits_appended_trailer() {
+    let mut bits = header_param_bits(5, 2, 4, 0, 0, 0);
+    append_diff_block(&mut bits, 0, 4, &[10, 20, 30, 40]); // ch0
+    append_diff_block(&mut bits, 0, 4, &[50, 60, 70, 80]); // ch1
+    bits.extend(encode_uvar(4, FNSIZE)); // QUIT
+    let mut buf = assemble(&bits);
+    let proper = buf.len();
+
+    // Append a 9-byte non-standard sidecar (e.g. a seek-table trailer).
+    let trailer: &[u8] = b"SIDECAR12";
+    buf.extend_from_slice(trailer);
+
+    let reference = decode_stream(&buf).expect("reference decode_stream");
+    assert_eq!(reference.stream_proper_len, proper);
+
+    let mut iter = decode_stream_iter(&buf).expect("decode_stream_iter");
+    let mut blocks = 0usize;
+    while iter.next_block().expect("ok").is_some() {
+        blocks += 1;
+    }
+    // Exactly the two sample blocks decoded — the trailer was never
+    // interpreted as a command.
+    assert_eq!(blocks, 2);
+    assert_eq!(iter.stream_proper_len(), Some(proper));
+    assert_eq!(iter.stream_proper_len(), Some(reference.stream_proper_len));
+    assert_eq!(iter.trailer_len(), Some(trailer.len()));
+    // The sidecar bytes are exactly the tail past the reported boundary.
+    assert_eq!(&buf[iter.stream_proper_len().unwrap()..], trailer);
+}

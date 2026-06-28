@@ -8,6 +8,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 379 — streaming `BLOCK_FN_QUIT` byte-boundary parity
+  (`spec/04` §2.1 / `spec/05` §4).** The whole-stream `decode_stream`
+  driver has exposed `DecodedStream::stream_proper_len` (the byte-exact
+  SHN-stream-proper end / sidecar split point) and
+  `DecodedStream::quit_padding` (the observed post-QUIT zero padding)
+  since rounds 313/328, but the streaming `StreamDecoder` only set
+  `finished` at `BLOCK_FN_QUIT` and never surfaced the boundary. This
+  round closes the parity gap: at QUIT the streaming decoder now
+  consumes the post-field zero padding to the next byte boundary via
+  `align_to_byte_observing_padding` and exposes three new accessors —
+  `StreamDecoder::stream_proper_len()`, `quit_padding()`, and
+  `trailer_len()` (input length minus the stream-proper length, i.e.
+  the appended seek-table/sidecar size). All three return `None` until
+  QUIT is consumed, then equal the batch driver's values byte-for-byte,
+  letting a streaming caller split an out-of-band sidecar without
+  buffering the whole decode. Decode stays lenient on a non-conformant
+  tail (`spec/05` §5.2) while reporting it via
+  `BytePadding::is_spec_conformant`. +5 tests: two unit tests in
+  `stream_iter` (accessor parity with the batch driver, lenient
+  observation of a non-conformant flipped-padding tail) and two
+  integration tests in `tests/streaming_iterator_pipeline.rs`
+  (boundary-matches-batch, stream-proper-len splits an appended
+  9-byte sidecar without the trailer being decoded as commands), plus
+  the in-module wrapper assertion. No wire-format change — this is a
+  pure read-side API addition over the existing QUIT handling.
+
 - **Round 345 — lossy `-q N` encode path (`spec/03` §3.7 / `spec/04`
   §3).** The decoder has handled `BLOCK_FN_BITSHIFT` (left-shift on
   emission) since round 7, but `encode_stream` only ever produced
