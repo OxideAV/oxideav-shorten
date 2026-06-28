@@ -140,7 +140,7 @@ use oxideav_core::{
     Error as CoreError, Frame, Packet, Result as CoreResult, SampleFormat,
 };
 
-use crate::bitreader::BitReader;
+use crate::bitreader::{BitReader, BytePadding};
 use crate::block::{
     read_bitshift_payload, read_blocksize_payload, read_function_code, read_verbatim_payload,
     FunctionCode,
@@ -213,6 +213,15 @@ pub struct ShortenDecoder {
     verbatim_prefix: Vec<u8>,
     decoded: bool,
     eof: bool,
+    /// SHN-stream-proper byte length (`spec/04` §2.1) of the most
+    /// recently decoded buffer — the byte-exact split point between the
+    /// SHN stream proper and any out-of-band seek-table sidecar. `None`
+    /// until a complete stream has been decoded.
+    stream_proper_len: Option<usize>,
+    /// Post-`BLOCK_FN_QUIT` zero padding observed at the byte boundary
+    /// (`spec/05` §4) of the most recently decoded buffer. `None` until
+    /// a complete stream has been decoded.
+    quit_padding: Option<BytePadding>,
     /// PTS to attach to the emitted [`AudioFrame`]. Taken from the
     /// first packet whose `pts.is_some()`.
     pts: Option<i64>,
@@ -241,6 +250,8 @@ impl ShortenDecoder {
             verbatim_prefix: Vec::new(),
             decoded: false,
             eof: false,
+            stream_proper_len: None,
+            quit_padding: None,
             pts: None,
         }
     }
@@ -250,6 +261,28 @@ impl ShortenDecoder {
     /// stream has been decoded.
     pub fn verbatim_prefix(&self) -> &[u8] {
         &self.verbatim_prefix
+    }
+
+    /// The byte-exact length of the SHN stream proper (`spec/04` §2.1)
+    /// of the decoded buffer — the offset at which any out-of-band
+    /// seek-table sidecar begins. `None` until a complete stream has
+    /// been decoded.
+    ///
+    /// Equals [`crate::DecodedStream::stream_proper_len`] for the same
+    /// input bytes, surfaced at the `oxideav_core::Decoder` trait level
+    /// so a framework caller can locate a `SHNAMPSK` sidecar without
+    /// dropping to the free-function `decode_stream` API.
+    pub fn stream_proper_len(&self) -> Option<usize> {
+        self.stream_proper_len
+    }
+
+    /// The post-`BLOCK_FN_QUIT` zero padding (`spec/05` §4) observed at
+    /// the byte boundary of the decoded buffer. `None` until a complete
+    /// stream has been decoded. Equals
+    /// [`crate::DecodedStream::quit_padding`];
+    /// [`BytePadding::is_spec_conformant`] checks the §4 rule.
+    pub fn quit_padding(&self) -> Option<BytePadding> {
+        self.quit_padding
     }
 
     /// Try to decode whatever bytes are currently buffered. On
@@ -276,6 +309,8 @@ impl ShortenDecoder {
                 self.output.channels = Some(stream.header.channels as u16);
                 self.output.sample_format = Some(host_sample_format(stream.header.filetype)?);
                 self.verbatim_prefix = stream.verbatim;
+                self.stream_proper_len = Some(stream.stream_proper_len);
+                self.quit_padding = Some(stream.quit_padding);
                 self.pending.push_back(frame);
                 self.decoded = true;
                 self.buffer.clear();
@@ -563,6 +598,13 @@ pub struct ShortenStreamingDecoder {
     /// True once we've emitted at least one frame; controls the "first
     /// frame carries pts, others carry None" logic above.
     first_frame_emitted: bool,
+    /// SHN-stream-proper byte length (`spec/04` §2.1), assigned when
+    /// `BLOCK_FN_QUIT` is reached and its zero padding consumed. `None`
+    /// until then. The byte-exact sidecar split point.
+    stream_proper_len: Option<usize>,
+    /// Post-`BLOCK_FN_QUIT` zero padding (`spec/05` §4), observed when
+    /// the QUIT branch aligns to the byte boundary. `None` until then.
+    quit_padding: Option<BytePadding>,
     /// `Some(msg)` if a previous `try_advance` surfaced an
     /// unrecoverable error. Cached so subsequent `receive_frame` calls
     /// re-surface the same message rather than retrying the doomed
@@ -610,8 +652,29 @@ impl ShortenStreamingDecoder {
             eof: false,
             pts: None,
             first_frame_emitted: false,
+            stream_proper_len: None,
+            quit_padding: None,
             fatal: None,
         }
+    }
+
+    /// The byte-exact length of the SHN stream proper (`spec/04` §2.1) —
+    /// the offset at which any out-of-band seek-table sidecar begins.
+    /// `None` until `BLOCK_FN_QUIT` has been consumed. After termination
+    /// this equals both [`ShortenDecoder::stream_proper_len`] and the
+    /// free-function [`crate::DecodedStream::stream_proper_len`] for the
+    /// same input bytes — surfaced here so a streaming framework caller
+    /// can split a `SHNAMPSK` sidecar without buffering the whole decode.
+    pub fn stream_proper_len(&self) -> Option<usize> {
+        self.stream_proper_len
+    }
+
+    /// The post-`BLOCK_FN_QUIT` zero padding (`spec/05` §4) observed at
+    /// the byte boundary. `None` until `BLOCK_FN_QUIT` has been
+    /// consumed. Equals [`crate::DecodedStream::quit_padding`];
+    /// [`BytePadding::is_spec_conformant`] checks the §4 rule.
+    pub fn quit_padding(&self) -> Option<BytePadding> {
+        self.quit_padding
     }
 
     /// Bytes carrying the host-format envelope (concatenated
@@ -737,6 +800,26 @@ impl ShortenStreamingDecoder {
             match fc {
                 FunctionCode::Quit => {
                     self.commands += 1;
+                    // spec/04 §2.1: consume the post-QUIT zero padding to
+                    // the next byte boundary so the reported SHN-proper
+                    // length is byte-exact (the same split point the
+                    // batch driver reports), observing the padding bits
+                    // for the spec/05 §4 check. Decode stays lenient on a
+                    // non-conformant tail. A truncated padding read (the
+                    // QUIT field landed in the last delivered byte but no
+                    // following byte arrived) is impossible: aligning to
+                    // the *current* byte never reads past the byte the
+                    // function code already occupies.
+                    match reader.align_to_byte_observing_padding() {
+                        Ok((post_version_end, padding)) => {
+                            self.stream_proper_len = Some(MIN_HEADER_BYTES + post_version_end);
+                            self.quit_padding = Some(padding);
+                        }
+                        Err(e) => {
+                            let core = shorten_error_to_core(e);
+                            return Err(self.fail(core));
+                        }
+                    }
                     self.bits_consumed = reader.bits_consumed_so_far(total_body_bits);
                     self.eof = true;
                     return Ok(());
@@ -1435,6 +1518,88 @@ mod tests {
         let pkt = Packet::new(0, TimeBase::new(1, 44_100), bytes);
         dec.send_packet(&pkt).expect("send_packet");
         assert_eq!(dec.verbatim_prefix(), &[0x01, 0x02, 0x03]);
+    }
+
+    /// The whole-stream `ShortenDecoder` wrapper surfaces the same
+    /// `BLOCK_FN_QUIT` byte boundary (`stream_proper_len`) and post-QUIT
+    /// padding (`quit_padding`) the free-function `decode_stream` returns
+    /// — `None` before decode, then equal to the batch values
+    /// (`spec/04` §2.1 / `spec/05` §4). Verified with a trailing
+    /// sidecar appended so the boundary is strictly inside the buffer.
+    #[test]
+    fn whole_stream_decoder_surfaces_quit_boundary() {
+        let mut bits = header_param_bits(FILETYPE_S16LH, 1, 4, 0, 0, 0);
+        append_diff_block(&mut bits, 0, 5, &[7, 8, 9, 10]);
+        bits.extend(encode_uvar(4, FNSIZE)); // QUIT
+        let mut bytes = assemble(&bits);
+        let proper = bytes.len();
+        bytes.extend_from_slice(b"TRAILERBYTES"); // out-of-band tail
+
+        let reference = decode_stream(&bytes).expect("decode_stream");
+        assert_eq!(reference.stream_proper_len, proper);
+
+        let mut dec = ShortenDecoder::new(
+            CodecId::new(CODEC_ID_STR),
+            CodecParameters::audio(CodecId::new(CODEC_ID_STR)),
+        );
+        assert_eq!(dec.stream_proper_len(), None);
+        assert_eq!(dec.quit_padding(), None);
+
+        let pkt = Packet::new(0, TimeBase::new(1, 44_100), bytes);
+        dec.send_packet(&pkt).expect("send_packet");
+
+        assert_eq!(dec.stream_proper_len(), Some(reference.stream_proper_len));
+        assert_eq!(dec.stream_proper_len(), Some(proper));
+        assert_eq!(dec.quit_padding(), Some(reference.quit_padding));
+        assert!(dec.quit_padding().unwrap().is_spec_conformant());
+    }
+
+    /// The streaming `ShortenStreamingDecoder` wrapper computes the same
+    /// `BLOCK_FN_QUIT` byte boundary as the batch driver even when the
+    /// stream is delivered one byte at a time across many `send_packet`
+    /// calls — the boundary is `None` until QUIT, then equals the
+    /// free-function `decode_stream` value (`spec/04` §2.1 / `spec/05`
+    /// §4). A trailing sidecar keeps the boundary strictly interior.
+    #[test]
+    fn streaming_decoder_surfaces_quit_boundary_byte_by_byte() {
+        let mut bits = header_param_bits(FILETYPE_S16LH, 2, 2, 0, 0, 0);
+        append_diff_block(&mut bits, 0, 5, &[10, 20]); // ch0
+        append_diff_block(&mut bits, 0, 5, &[30, 40]); // ch1
+        bits.extend(encode_uvar(4, FNSIZE)); // QUIT
+        let mut bytes = assemble(&bits);
+        let proper = bytes.len();
+        bytes.extend_from_slice(b"SIDE"); // out-of-band tail
+
+        let reference = decode_stream(&bytes).expect("decode_stream");
+        assert_eq!(reference.stream_proper_len, proper);
+
+        let mut dec =
+            ShortenStreamingDecoder::new(CodecId::new(STREAMING_CODEC_ID_STR), streaming_params());
+        assert_eq!(dec.stream_proper_len(), None);
+        assert_eq!(dec.quit_padding(), None);
+
+        // Feed one byte per packet to exercise the chop-anywhere path.
+        // Stop once BLOCK_FN_QUIT is reached — the wrapper rejects bytes
+        // after the terminator, and the trailing sidecar is out of band
+        // (the decoder must locate the boundary without consuming it).
+        let tb = TimeBase::new(1, 44_100);
+        for (i, &b) in bytes.iter().enumerate() {
+            if dec.stream_proper_len().is_some() {
+                break;
+            }
+            let mut pkt = Packet::new(0, tb, vec![b]);
+            if i == 0 {
+                pkt.pts = Some(0);
+            }
+            dec.send_packet(&pkt).expect("send_packet one byte");
+            // Drain any frames produced so far to keep the queue moving.
+            while let Ok(Frame::Audio(_)) = dec.receive_frame() {}
+        }
+
+        assert_eq!(dec.stream_proper_len(), Some(reference.stream_proper_len));
+        assert_eq!(dec.stream_proper_len(), Some(proper));
+        assert_eq!(dec.quit_padding(), Some(reference.quit_padding));
+        assert!(dec.quit_padding().unwrap().is_spec_conformant());
     }
 
     // ============================================================

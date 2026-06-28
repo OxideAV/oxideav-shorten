@@ -34,6 +34,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the in-module wrapper assertion. No wire-format change — this is a
   pure read-side API addition over the existing QUIT handling.
 
+- **Round 379 — `BLOCK_FN_QUIT` boundary surfaced at the
+  `oxideav_core::Decoder` trait layer (`spec/04` §2.1 / `spec/05` §4).**
+  The free-function `decode_stream` and the `StreamDecoder` iterator
+  both expose the SHN-stream-proper byte length and post-QUIT padding,
+  but the two `oxideav_core::Decoder` trait wrappers (`ShortenDecoder`
+  whole-stream + `ShortenStreamingDecoder` chop-anywhere) discarded
+  them. This round adds `stream_proper_len()` and `quit_padding()`
+  accessors to both wrappers. `ShortenDecoder` forwards the values its
+  inner `decode_stream` call already produced; `ShortenStreamingDecoder`
+  now consumes the post-QUIT zero padding to the byte boundary in its
+  hand-rolled command walker (it previously only set `eof`) and reports
+  the byte-exact boundary even when the stream is delivered one byte per
+  `send_packet`. Both return `None` until `BLOCK_FN_QUIT` is consumed,
+  then equal the batch driver's values — completing the boundary-exposure
+  chain across all three API layers (free fn → struct iterator → trait
+  wrapper) so a framework caller can locate a `SHNAMPSK` sidecar without
+  dropping to the low-level API. +2 tests (whole-stream boundary with a
+  trailing sidecar, streaming boundary fed byte-by-byte).
+
 - **Round 379 — boundary cross-validation: QUIT alignment ≡ SHNAMPSK
   `sidecar_start` (`spec/05` §5.2).** The SHN-stream-proper end is
   computed two independent ways — bottom-up from the wire (the decoder's
