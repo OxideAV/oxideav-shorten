@@ -34,6 +34,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   the in-module wrapper assertion. No wire-format change — this is a
   pure read-side API addition over the existing QUIT handling.
 
+- **Round 379 — boundary cross-validation: QUIT alignment ≡ SHNAMPSK
+  `sidecar_start` (`spec/05` §5.2).** The SHN-stream-proper end is
+  computed two independent ways — bottom-up from the wire (the decoder's
+  `BLOCK_FN_QUIT` zero-bit byte alignment, `stream_proper_len`) and
+  top-down from the file tail (the `SHNAMPSK` trailer's 4-byte LE length
+  field, `detect_shnampsk_trailer().sidecar_start`). `spec/05` §5.2 pins
+  that these must coincide. A new integration test
+  (`quit_boundary_and_shnampsk_sidecar_start_agree`) decodes a
+  trailer-bearing file through the batch driver AND the streaming
+  iterator and asserts a three-way agreement: `decode_stream(file)
+  .stream_proper_len == StreamDecoder::stream_proper_len() ==
+  detect_shnampsk_trailer(file).sidecar_start`, with
+  `StreamDecoder::trailer_len() == sidecar_len`. The decoder reads the
+  whole file (trailer included) and must stop at QUIT without ever
+  interpreting the sidecar as commands. This was previously asserted
+  only against the byte-tail detector, never against the decoder's own
+  boundary computation. +1 test.
+
 - **Round 345 — lossy `-q N` encode path (`spec/03` §3.7 / `spec/04`
   §3).** The decoder has handled `BLOCK_FN_BITSHIFT` (left-shift on
   emission) since round 7, but `encode_stream` only ever produced

@@ -22,8 +22,8 @@
 //! §3.6/§3.7/§3.8 + `spec/05` §1 + §1.4 + §2.
 
 use oxideav_shorten::{
-    decode_stream, detect_shnampsk_trailer, split_off_shnampsk_trailer, FunctionCode, ENERGYSIZE,
-    FNSIZE, SEEK_MAGIC, SHNAMPSK_SIGNATURE, TRAILER_TAIL_LEN,
+    decode_stream, decode_stream_iter, detect_shnampsk_trailer, split_off_shnampsk_trailer,
+    FunctionCode, ENERGYSIZE, FNSIZE, SEEK_MAGIC, SHNAMPSK_SIGNATURE, TRAILER_TAIL_LEN,
 };
 
 // ---- synthetic-stream builders (mirror those used elsewhere) ----
@@ -196,4 +196,51 @@ fn trailer_present_path_strips_then_decodes_identically() {
     assert_eq!(dec_ref.verbatim, dec_trim.verbatim);
     assert_eq!(dec_ref.header.channels, dec_trim.header.channels);
     assert_eq!(dec_ref.header.filetype, dec_trim.header.filetype);
+}
+
+/// The decoder's own `BLOCK_FN_QUIT` byte-alignment boundary
+/// (`stream_proper_len`, computed bottom-up from the wire) and the
+/// `SHNAMPSK` detector's `sidecar_start` (computed top-down from the
+/// trailing length field) must agree exactly on a well-formed file — two
+/// independent computations of the same split point. `spec/05` §5.2 ties
+/// them together: the SHN wire format terminates at the QUIT padding, so
+/// the sidecar begins precisely where `stream_proper_len` points. This
+/// is the cross-validation the prior two tests did not assert; a bug in
+/// either boundary computation would surface as a mismatch here.
+#[test]
+fn quit_boundary_and_shnampsk_sidecar_start_agree() {
+    let shn = synthesise_stream();
+    let mut file = shn.clone();
+    let body = vec![0x5Au8; 40];
+    append_well_formed_trailer(&mut file, &body);
+
+    // Top-down: the SHNAMPSK detector reports where the sidecar starts.
+    let t = detect_shnampsk_trailer(&file)
+        .expect("detect")
+        .expect("trailer present");
+
+    // Bottom-up (batch): the wire decoder reports the SHN-proper end via
+    // the QUIT byte alignment. Run it over the WHOLE file (trailer and
+    // all) — the decoder must stop at QUIT and never read the sidecar.
+    let dec_full = decode_stream(&file).expect("decode_stream over full file");
+    assert_eq!(
+        dec_full.stream_proper_len, t.sidecar_start,
+        "QUIT boundary must equal SHNAMPSK sidecar_start"
+    );
+    // And the SHN-proper length equals the untrailered stream length.
+    assert_eq!(dec_full.stream_proper_len, shn.len());
+
+    // Bottom-up (streaming): the StreamDecoder must arrive at the same
+    // boundary and report the trailer size = full len - proper len.
+    let mut iter = decode_stream_iter(&file).expect("decode_stream_iter");
+    while iter.next_block().expect("ok").is_some() {}
+    assert_eq!(iter.stream_proper_len(), Some(t.sidecar_start));
+    assert_eq!(iter.trailer_len(), Some(file.len() - shn.len()));
+    assert_eq!(iter.trailer_len(), Some(t.sidecar_len as usize));
+
+    // All three computations agree on the same byte offset.
+    assert_eq!(
+        dec_full.stream_proper_len,
+        iter.stream_proper_len().unwrap()
+    );
 }
