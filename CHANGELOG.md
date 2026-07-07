@@ -8,6 +8,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 398 — malformed-input robustness fuzzer for the public
+  decode surface.** New `tests/decode_robustness_fuzz.rs` pins the
+  decoder's hostile-input contract: both public decode entry points —
+  the whole-stream `decode_stream` driver and the constant-memory
+  `StreamDecoder` iterator — must return a `Result` (typically `Err`)
+  and never panic, abort, or hang on arbitrary bytes. The test drives a
+  62k-case deterministic corpus through both entry points inside
+  `std::panic::catch_unwind` and asserts none panic. The corpus is
+  built structurally rather than as pure noise: every truncation prefix
+  of four valid baseline streams (mono/stereo, LPC-on, mean-on,
+  verbatim-prefix, empty), every single-bit flip of each baseline,
+  20k PRNG-driven byte-substitution mutations, 20k `ajkg`+version+random
+  headers (which reach the per-block command loop and frequently the
+  over-cap resource fields the new bounds guard must reject), and 20k
+  pure-noise buffers. The PRNG is an in-test xorshift64* (no external
+  dependency); the baselines are produced by the crate's own
+  `encode_stream`. A `baselines_are_self_consistent` companion test
+  guarantees the mutated streams themselves decode cleanly, so a
+  "no panic" pass cannot be vacuously satisfied by every input failing
+  the magic check. This exercise also validates the round-398 resource
+  bounds under fuzzing (no OOM abort on a crafted header).
+
 - **Round 398 — decode-time header resource bounds (`spec/01`
   §3.2/§3.4/§3.5).** The three stream-header `ulong()` fields that
   linearly size decoder allocations — `H_channels` (one sample-history
