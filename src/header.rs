@@ -91,7 +91,77 @@ pub struct ShortenStreamHeader {
     pub skipbytes: u32,
 }
 
+/// Implementation-side safety cap on `H_channels`. The spec pins no
+/// maximum (`spec/01` §3.2 describes the field only as "the count of
+/// independent predictor states"); real Shorten streams carry a
+/// handful of channels (fixture `F1` is 2). The decoder allocates one
+/// sample-history carry, one mean estimator, and one output vector per
+/// channel, so an uncapped `H_channels` from a crafted header is an
+/// out-of-memory vector. `1024` is ~128× the realistic ceiling while
+/// still bounding the allocation — chosen in the same spirit as
+/// [`crate::block::BLOCKSIZE_MAX`] and the driver's `MAX_COMMANDS`.
+pub const MAX_CHANNELS: u32 = 1024;
+
+/// Implementation-side safety cap on `H_maxlpcorder`. The spec bounds
+/// per-block LPC order at `H_maxlpcorder` (`spec/03` §3.5) and the
+/// per-channel carry length at `max(3, H_maxlpcorder)` (`spec/01` §4 /
+/// `spec/03` §3.11), so this field linearly sizes every channel's
+/// carry buffer. TR.156's reference encoder uses small orders (the
+/// `-p` default is single-digit); `1024` is far beyond any real order
+/// while still bounding the per-channel carry allocation.
+pub const MAX_LPC_ORDER: u32 = 1024;
+
+/// Implementation-side safety cap on `H_meanblocks`. The field sizes
+/// each channel's mean-estimator sliding window (`spec/05` §2.3); the
+/// TR.156 `-m` default is a small single- or double-digit count.
+/// `4096` is far beyond any real window while bounding the per-channel
+/// estimator allocation.
+pub const MAX_MEANBLOCKS: u32 = 4096;
+
 impl ShortenStreamHeader {
+    /// Reject a header whose resource-sizing fields would drive an
+    /// unbounded decode-time allocation.
+    ///
+    /// The six header `ulong()` fields are attacker-controllable and
+    /// three of them linearly size decoder buffers: `H_channels` (one
+    /// carry + one mean estimator + one output vector per channel),
+    /// `H_maxlpcorder` (each channel's sample-history carry, via
+    /// [`Self::sample_history_carry_len`]), and `H_meanblocks` (each
+    /// channel's mean-estimator window). The spec pins no upper bound
+    /// on any of them, so this method applies the implementation-side
+    /// safety caps [`MAX_CHANNELS`], [`MAX_LPC_ORDER`], and
+    /// [`MAX_MEANBLOCKS`] before the decoder allocates. Both the
+    /// whole-stream driver ([`crate::decode_stream`]) and the streaming
+    /// decoder ([`crate::StreamDecoder`]) call this immediately after
+    /// parsing so a ~20-byte crafted header cannot force a multi-GB
+    /// allocation. Returns [`Error::HeaderResourceTooLarge`] naming the
+    /// first offending field; no real Shorten stream approaches the
+    /// caps.
+    pub fn check_decode_resource_bounds(&self) -> Result<()> {
+        if self.channels > MAX_CHANNELS {
+            return Err(Error::HeaderResourceTooLarge {
+                field: "H_channels",
+                value: self.channels,
+                cap: MAX_CHANNELS,
+            });
+        }
+        if self.maxlpcorder > MAX_LPC_ORDER {
+            return Err(Error::HeaderResourceTooLarge {
+                field: "H_maxlpcorder",
+                value: self.maxlpcorder,
+                cap: MAX_LPC_ORDER,
+            });
+        }
+        if self.meanblocks > MAX_MEANBLOCKS {
+            return Err(Error::HeaderResourceTooLarge {
+                field: "H_meanblocks",
+                value: self.meanblocks,
+                cap: MAX_MEANBLOCKS,
+            });
+        }
+        Ok(())
+    }
+
     /// Length in samples of the per-channel sample-history carry
     /// buffer the decoder will allocate after the header lands
     /// (`spec/01` §4). The buffer length is the maximum of the
@@ -474,6 +544,92 @@ mod tests {
         // parser should exhaust mid-`H_blocksize`.
         let buf = [0x61, 0x6A, 0x6B, 0x67, 0x02, 0xFB];
         assert_eq!(parse_stream_header(&buf), Err(Error::Truncated));
+    }
+
+    fn header_with(channels: u32, maxlpcorder: u32, meanblocks: u32) -> ShortenStreamHeader {
+        ShortenStreamHeader {
+            version: 2,
+            filetype: 5,
+            channels,
+            blocksize: 256,
+            maxlpcorder,
+            meanblocks,
+            skipbytes: 0,
+        }
+    }
+
+    #[test]
+    fn resource_bounds_accept_realistic_and_at_cap_headers() {
+        // A realistic 2-channel header decodes-clean, and each field
+        // exactly at its cap is still accepted (the guard rejects
+        // strictly above the cap).
+        assert_eq!(header_with(2, 0, 4).check_decode_resource_bounds(), Ok(()));
+        assert_eq!(
+            header_with(MAX_CHANNELS, MAX_LPC_ORDER, MAX_MEANBLOCKS).check_decode_resource_bounds(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn resource_bounds_reject_over_cap_channels() {
+        let over = MAX_CHANNELS + 1;
+        assert_eq!(
+            header_with(over, 0, 4).check_decode_resource_bounds(),
+            Err(Error::HeaderResourceTooLarge {
+                field: "H_channels",
+                value: over,
+                cap: MAX_CHANNELS,
+            })
+        );
+        // A field set to u32::MAX (the trivial OOM attack) is rejected
+        // just the same, without allocating.
+        assert!(matches!(
+            header_with(u32::MAX, 0, 4).check_decode_resource_bounds(),
+            Err(Error::HeaderResourceTooLarge {
+                field: "H_channels",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn resource_bounds_reject_over_cap_maxlpcorder() {
+        let over = MAX_LPC_ORDER + 1;
+        assert_eq!(
+            header_with(2, over, 4).check_decode_resource_bounds(),
+            Err(Error::HeaderResourceTooLarge {
+                field: "H_maxlpcorder",
+                value: over,
+                cap: MAX_LPC_ORDER,
+            })
+        );
+    }
+
+    #[test]
+    fn resource_bounds_reject_over_cap_meanblocks() {
+        let over = MAX_MEANBLOCKS + 1;
+        assert_eq!(
+            header_with(2, 0, over).check_decode_resource_bounds(),
+            Err(Error::HeaderResourceTooLarge {
+                field: "H_meanblocks",
+                value: over,
+                cap: MAX_MEANBLOCKS,
+            })
+        );
+    }
+
+    #[test]
+    fn resource_bounds_report_channels_before_other_fields() {
+        // When multiple fields exceed their caps the guard names
+        // H_channels first (the field checked first / the dominant
+        // allocation multiplier).
+        assert!(matches!(
+            header_with(u32::MAX, u32::MAX, u32::MAX).check_decode_resource_bounds(),
+            Err(Error::HeaderResourceTooLarge {
+                field: "H_channels",
+                ..
+            })
+        ));
     }
 
     #[test]

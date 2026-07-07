@@ -165,6 +165,11 @@ pub fn decode_stream(bytes: &[u8]) -> Result<DecodedStream> {
     if header.channels == 0 {
         return Err(Error::Truncated);
     }
+    // Bound the three header fields that linearly size decode-time
+    // allocations (H_channels / H_maxlpcorder / H_meanblocks) before
+    // allocating, so a crafted header cannot force an OOM. The spec
+    // pins no maximum on any of them (see `check_decode_resource_bounds`).
+    header.check_decode_resource_bounds()?;
     let n_channels = header.channels as usize;
 
     // Re-open a fresh reader over the bytes after the byte-aligned
@@ -689,6 +694,59 @@ mod tests {
         let bits = header_param_bits(5, 0, 4, 0, 0, 0);
         let buf = assemble(&bits);
         assert_eq!(decode_stream(&buf), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn over_cap_channels_header_is_rejected_before_allocating() {
+        // A ~20-byte header naming H_channels = 100_000 would, without
+        // the resource-bounds guard, drive three 100_000-element vector
+        // allocations before the first command is even read. The guard
+        // rejects it cleanly instead. (The stream has no command body
+        // at all, proving the rejection happens at header time.)
+        let bits = header_param_bits(5, 100_000, 256, 0, 0, 0);
+        let buf = assemble(&bits);
+        assert_eq!(
+            decode_stream(&buf),
+            Err(Error::HeaderResourceTooLarge {
+                field: "H_channels",
+                value: 100_000,
+                cap: crate::header::MAX_CHANNELS,
+            })
+        );
+    }
+
+    #[test]
+    fn over_cap_maxlpcorder_header_is_rejected_before_allocating() {
+        // H_maxlpcorder sizes each channel's sample-history carry
+        // (max(3, order) i32s). An over-cap order is rejected before the
+        // per-channel carry allocation.
+        let over = crate::header::MAX_LPC_ORDER + 1;
+        let bits = header_param_bits(5, 2, 256, over, 0, 0);
+        let buf = assemble(&bits);
+        assert_eq!(
+            decode_stream(&buf),
+            Err(Error::HeaderResourceTooLarge {
+                field: "H_maxlpcorder",
+                value: over,
+                cap: crate::header::MAX_LPC_ORDER,
+            })
+        );
+    }
+
+    #[test]
+    fn over_cap_meanblocks_header_is_rejected_before_allocating() {
+        // H_meanblocks sizes each channel's mean-estimator window.
+        let over = crate::header::MAX_MEANBLOCKS + 1;
+        let bits = header_param_bits(5, 2, 256, 0, over, 0);
+        let buf = assemble(&bits);
+        assert_eq!(
+            decode_stream(&buf),
+            Err(Error::HeaderResourceTooLarge {
+                field: "H_meanblocks",
+                value: over,
+                cap: crate::header::MAX_MEANBLOCKS,
+            })
+        );
     }
 
     #[test]

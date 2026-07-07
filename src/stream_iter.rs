@@ -226,6 +226,12 @@ impl<'a> StreamDecoder<'a> {
         if header.channels == 0 {
             return Err(Error::Truncated);
         }
+        // Bound the header fields that linearly size the per-channel
+        // carry / mean-estimator allocations before allocating, so a
+        // crafted header cannot force an OOM (see
+        // `check_decode_resource_bounds`). Identical guard to the
+        // whole-stream driver.
+        header.check_decode_resource_bounds()?;
         let n_channels = header.channels as usize;
 
         // Re-open a fresh reader past the magic + version prefix and
@@ -1013,6 +1019,25 @@ mod tests {
         assert_eq!(iter.current_channel(), 0);
 
         assert!(iter.next_block().expect("ok").is_none());
+    }
+
+    #[test]
+    fn streaming_new_rejects_over_cap_channels_before_allocating() {
+        // The constant-memory streaming decoder allocates the same
+        // per-channel carry / mean-estimator vectors at construction as
+        // the whole-stream driver, so it applies the identical
+        // resource-bounds guard. An over-cap H_channels is rejected by
+        // `StreamDecoder::new` rather than driving an OOM.
+        let bits = header_param_bits(5, 100_000, 256, 0, 0, 0);
+        let buf = assemble(&bits);
+        assert_eq!(
+            StreamDecoder::new(&buf).err(),
+            Some(Error::HeaderResourceTooLarge {
+                field: "H_channels",
+                value: 100_000,
+                cap: crate::header::MAX_CHANNELS,
+            })
+        );
     }
 
     #[test]

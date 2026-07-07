@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 398 — decode-time header resource bounds (`spec/01`
+  §3.2/§3.4/§3.5).** The three stream-header `ulong()` fields that
+  linearly size decoder allocations — `H_channels` (one sample-history
+  carry + one mean estimator + one output vector per channel),
+  `H_maxlpcorder` (each channel's carry length `max(3, order)`), and
+  `H_meanblocks` (each channel's mean-estimator window) — are
+  attacker-controllable and were previously read straight from the
+  header with only a `H_channels == 0` reject. A ~20-byte crafted
+  header naming e.g. `H_channels = 2^31` therefore drove a multi-GB
+  allocation (out-of-memory abort) from a trivially small input. This
+  round adds `ShortenStreamHeader::check_decode_resource_bounds()`,
+  which enforces the implementation-side safety caps `MAX_CHANNELS`
+  (1024), `MAX_LPC_ORDER` (1024), and `MAX_MEANBLOCKS` (4096) — all far
+  beyond any real Shorten stream (fixture `F1` is 2 channels) and in the
+  same spirit as the existing `BLOCKSIZE_MAX` / `MAX_BLOCK_SAMPLES` /
+  `MAX_COMMANDS` caps that the spec likewise leaves unpinned. Both
+  decode entry points call the guard immediately after parsing and
+  before allocating: the whole-stream `decode_stream` driver and the
+  constant-memory `StreamDecoder::new`. Over-cap fields now surface a
+  new `Error::HeaderResourceTooLarge { field, value, cap }` naming the
+  offending field, rather than aborting the process. +9 tests: five
+  unit tests on the guard method (realistic + at-cap accept, over-cap
+  reject per field, first-offending-field ordering), three driver
+  integration tests proving `decode_stream` rejects each over-cap field
+  before allocating, and one streaming test proving `StreamDecoder::new`
+  applies the identical guard. No wire-format change — a read-side
+  robustness hardening over the existing header parser.
+
 - **Round 379 — streaming `BLOCK_FN_QUIT` byte-boundary parity
   (`spec/04` §2.1 / `spec/05` §4).** The whole-stream `decode_stream`
   driver has exposed `DecodedStream::stream_proper_len` (the byte-exact

@@ -96,6 +96,32 @@ pub enum Error {
     /// reporting "no trailer present" so a caller that wanted the
     /// trailer is told the structural mismatch.
     MalformedShnampskTrailer,
+    /// A stream-header resource field (`H_channels`, `H_maxlpcorder`,
+    /// or `H_meanblocks`) decoded to a value whose decode-time buffer
+    /// allocation would exceed the implementation's per-field safety
+    /// cap. The spec pins no upper bound on these fields (`spec/01`
+    /// §3.2 / §3.4 / §3.5 describe them only qualitatively), so this is
+    /// an implementation-side guard in the same spirit as
+    /// [`Error::BlockTooLarge`] and the `MAX_COMMANDS` command cap: the
+    /// six header `ulong()` fields are attacker-controllable, and each
+    /// of these three linearly sizes a decoder allocation
+    /// (`H_channels` → one carry + one mean estimator + one output
+    /// vector per channel; `H_maxlpcorder` → each channel's
+    /// sample-history carry; `H_meanblocks` → each channel's
+    /// mean-estimator window). Without a cap a ~20-byte crafted header
+    /// could drive a multi-gigabyte allocation from a trivially small
+    /// input. `field` names the offending header field, `value` is the
+    /// decoded value, and `cap` is the rejected-above threshold. No
+    /// real Shorten stream approaches these caps.
+    HeaderResourceTooLarge {
+        /// The offending header field name (`"H_channels"`,
+        /// `"H_maxlpcorder"`, or `"H_meanblocks"`).
+        field: &'static str,
+        /// The decoded field value that exceeded the cap.
+        value: u32,
+        /// The implementation safety cap the value exceeded.
+        cap: u32,
+    },
     /// Round 1 does not decode the per-block command stream that
     /// follows the parameter block. Returned from any non-header API
     /// surface that the orphan-rebuild scaffold has not wired up yet.
@@ -141,6 +167,10 @@ impl core::fmt::Display for Error {
             Error::BitshiftTooLarge(b) => write!(
                 f,
                 "oxideav-shorten: BITSHIFT command bshift {b} exceeds safety cap"
+            ),
+            Error::HeaderResourceTooLarge { field, value, cap } => write!(
+                f,
+                "oxideav-shorten: header field {field} value {value} exceeds decode safety cap {cap}"
             ),
             Error::MalformedShnampskTrailer => f.write_str(
                 "oxideav-shorten: SHNAMPSK trailer present but len_u32 / SEEK anchor inconsistent",

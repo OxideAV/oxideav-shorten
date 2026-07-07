@@ -70,6 +70,17 @@ v2/v3 path:
 * **SHNAMPSK seek-table trailer** — `detect_shnampsk_trailer` /
   `split_off_shnampsk_trailer` separate the SHN-stream-proper bytes
   from the non-standard sidecar some distributed `.shn` files append.
+* **Decode-time resource bounds** — the three header `ulong()` fields
+  that linearly size decoder allocations (`H_channels`,
+  `H_maxlpcorder`, `H_meanblocks`) are validated against
+  implementation-side safety caps (`MAX_CHANNELS` = 1024,
+  `MAX_LPC_ORDER` = 1024, `MAX_MEANBLOCKS` = 4096) before any buffer is
+  allocated, in both `decode_stream` and `StreamDecoder::new`. The spec
+  pins no maximum on these fields, so a crafted ~20-byte header could
+  otherwise force a multi-gigabyte allocation; an over-cap value now
+  returns `Error::HeaderResourceTooLarge` (same spirit as the existing
+  `BLOCKSIZE_MAX` / `MAX_COMMANDS` caps). No real Shorten stream
+  approaches these caps.
 
 Three `H_filetype` sample-format codes are pinned and packed:
 `2` (`u8`, `U8P`), `3` (`s16hl`, big-endian `S16P`), and
