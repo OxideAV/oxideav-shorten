@@ -853,6 +853,27 @@ impl ShortenStreamingDecoder {
                         }
                     }
                     self.bits_consumed = reader.bits_consumed_so_far(total_body_bits);
+                    // A QUIT that lands mid channel-round leaves some
+                    // channels one block short of the others: the
+                    // planar AudioFrame cannot represent the ragged
+                    // tail, and the whole-stream wrapper rejects the
+                    // same stream at frame packing. Surface the same
+                    // failure here instead of silently discarding the
+                    // partial round (round-453 `packet_chunking` fuzz
+                    // finding).
+                    // An empty pending block (H_blocksize = 0 or a
+                    // zero-length tail) adds no samples, so it cannot
+                    // make the planes ragged and does not count.
+                    if let Some(k) = self
+                        .pending_round
+                        .iter()
+                        .position(|s| s.as_ref().is_some_and(|b| !b.samples.is_empty()))
+                    {
+                        self.eof = true;
+                        return Err(self.fail(CoreError::invalid(format!(
+                            "oxideav-shorten: BLOCK_FN_QUIT mid channel-round (channel {k} has a decoded block its peers lack)"
+                        ))));
+                    }
                     self.eof = true;
                     return Ok(());
                 }

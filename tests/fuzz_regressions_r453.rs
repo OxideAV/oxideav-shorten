@@ -7,8 +7,9 @@
 
 use oxideav_core::{CodecId, CodecParameters, Error as CoreError, Frame, Packet, TimeBase};
 use oxideav_shorten::{
-    encode_stream, make_decoder, make_streaming_decoder, parse_stream_header, write_stream_header,
-    BitWriter, EncodeError, ShortenStreamHeader,
+    encode_stream, make_decoder, make_streaming_decoder, parse_stream_header,
+    write_byte_aligned_prefix, write_parameter_block, write_quit_command, write_stream_header,
+    write_zero_block, BitWriter, EncodeError, ShortenStreamHeader,
 };
 
 /// `parse_header` fuzz target, round 453: a header field with bit 31
@@ -176,4 +177,61 @@ fn streaming_wrapper_rejects_over_cap_header_resources() {
         msg.contains("H_channels"),
         "error should name the offending field: {msg}"
     );
+}
+
+/// `packet_chunking` fuzz target, round 453: on a stream whose
+/// `BLOCK_FN_QUIT` lands mid channel-round (channel 0 has one more
+/// block than channel 1) the whole-stream wrapper rejected the ragged
+/// planes at frame packing while the streaming wrapper silently
+/// discarded the partial round and reported a clean `Eof`. Both
+/// wrappers must now reject the stream.
+#[test]
+fn quit_mid_channel_round_rejected_by_both_wrappers() {
+    let header = ShortenStreamHeader {
+        version: 2,
+        filetype: 5,
+        channels: 2,
+        blocksize: 8,
+        maxlpcorder: 0,
+        meanblocks: 0,
+        skipbytes: 0,
+    };
+    // Header, one ZERO block (lands on channel 0), then QUIT: channel
+    // 1 never receives its block of the round.
+    let mut bytes = Vec::new();
+    write_byte_aligned_prefix(&mut bytes, header.version).expect("prefix");
+    let mut w = BitWriter::new();
+    write_parameter_block(&mut w, &header);
+    write_zero_block(&mut w);
+    write_quit_command(&mut w);
+    w.pad_to_byte();
+    bytes.extend(w.into_bytes());
+
+    let params = CodecParameters::audio(CodecId::new(oxideav_shorten::CODEC_ID_STR));
+    let tb = TimeBase::new(1, 44_100);
+    for (name, mut dec) in [
+        ("whole", make_decoder(&params).expect("make_decoder")),
+        (
+            "streaming",
+            make_streaming_decoder(&params).expect("make_streaming_decoder"),
+        ),
+    ] {
+        let sent = dec.send_packet(&Packet::new(0, tb, bytes.clone()));
+        let flushed = dec.flush();
+        let received = dec.receive_frame();
+        let any_err = sent.is_err()
+            || flushed.is_err()
+            || matches!(
+                received,
+                Err(CoreError::Other(_)) | Err(CoreError::InvalidData(_))
+            );
+        assert!(
+            any_err,
+            "{name}: a mid-round QUIT must surface an error, got send={sent:?} flush={flushed:?} recv={received:?}"
+        );
+        assert!(
+            received.is_err(),
+            "{name}: no frame may be produced from a ragged round"
+        );
+    }
 }
