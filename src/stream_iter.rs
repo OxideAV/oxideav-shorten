@@ -765,7 +765,7 @@ mod tests {
         let mut bits = header_param_bits(5, 1, 2, 0, 0, 0);
         bits.extend(encode_uvar(9, FNSIZE));
         bits.extend(encode_uvar(3, 5));
-        for b in [b'R', b'I', b'F'] {
+        for &b in b"RIF" {
             bits.extend(encode_uvar(b as u32, 8));
         }
         append_diff_block(&mut bits, 0, 3, &[100, -50]);
@@ -977,7 +977,7 @@ mod tests {
         // VERBATIM (housekeeping for cursor purposes per spec/03 §2.1).
         bits.extend(encode_uvar(9, FNSIZE));
         bits.extend(encode_uvar(2, 5));
-        for b in [b'X', b'Y'] {
+        for &b in b"XY" {
             bits.extend(encode_uvar(b as u32, 8));
         }
         // DIFF0 ch0 — cursor 0 -> 1 after.

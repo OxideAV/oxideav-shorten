@@ -161,7 +161,7 @@ fn full_stream_through_iterator_matches_driver_per_channel_and_verbatim() {
     // 7. VERBATIM "END" (3 bytes).
     bits.extend(encode_uvar(9, FNSIZE));
     bits.extend(encode_uvar(3, 5));
-    for b in [b'E', b'N', b'D'] {
+    for &b in b"END" {
         bits.extend(encode_uvar(b as u32, 8));
     }
     // 8. QUIT.

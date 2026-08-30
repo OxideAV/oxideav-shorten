@@ -127,14 +127,30 @@ impl BitWriter {
     /// the length formula in `spec/02` §2.1.
     pub fn write_uvar(&mut self, value: u32, n: u32) {
         debug_assert!(n <= 32, "write_uvar n exceeds u32 width");
-        let prefix_zeros = if n == 0 { value } else { value >> n };
+        // `n == 32` is a legal `ulong()` width (a value with bit 31 set
+        // has `natural_ulong_width == 32`); the whole value then sits in
+        // the mantissa and the prefix is empty. `value >> 32` would
+        // overflow, so the width-32 case is special-cased (fuzz-found
+        // via `parse_header`, round 453).
+        let prefix_zeros = match n {
+            0 => value,
+            1..=31 => value >> n,
+            _ => 0,
+        };
         for _ in 0..prefix_zeros {
             self.write_bit(0);
         }
         self.write_bit(1);
         if n > 0 {
-            // Mantissa lives in the low `n` bits.
-            let mantissa = value & ((1u32 << n) - 1);
+            // Mantissa lives in the low `n` bits. At `n == 32` the
+            // mask expression `(1 << n) - 1` would overflow just like
+            // the prefix shift above; the mantissa is then the whole
+            // value.
+            let mantissa = if n >= 32 {
+                value
+            } else {
+                value & ((1u32 << n) - 1)
+            };
             self.write_bits(mantissa, n);
         }
     }

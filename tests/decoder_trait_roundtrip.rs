@@ -147,7 +147,7 @@ fn build_two_channel_s16lh_stream() -> Vec<u8> {
     // VERBATIM prefix: 4-byte "RIFF" envelope head (`spec/03` §3.10).
     bits.extend(encode_uvar(9, FNSIZE));
     bits.extend(encode_uvar(4, 5));
-    for b in [b'R', b'I', b'F', b'F'] {
+    for &b in b"RIFF" {
         bits.extend(encode_uvar(b as u32, 8));
     }
     // DIFF1 ch0 residuals [1, 2, 3, 4] over zero carry

@@ -279,9 +279,11 @@ pub const ENCODER_VERSION: u8 = 2;
 /// round-15 / round-16 predictor encoders can surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
-    /// A header carried a format version outside `{1, 2, 3}`. The
-    /// encoder writes whichever version is requested, but values
-    /// outside the spec set are rejected.
+    /// A header carried a format version outside `{2, 3}`. Version 1
+    /// is in the spec's scope but its parameter-block layout is
+    /// unpinned and the decoder rejects it, so the encoder refuses to
+    /// write a stream its own decoder cannot read (see
+    /// [`write_byte_aligned_prefix`]).
     UnsupportedVersion(u8),
     /// The verbatim payload length exceeded the
     /// `uvar(VERBATIM_CHUNK_SIZE = 5)` length-field cap of
@@ -447,12 +449,20 @@ pub type EncodeResult<T> = core::result::Result<T, EncodeError>;
 /// Emit the byte-aligned 4-byte `ajkg` magic + 1-byte version prefix
 /// to `out` per `spec/01` §1.
 ///
-/// The version byte may be in `{1, 2, 3}` per `spec/00`; values outside
-/// that set surface [`EncodeError::UnsupportedVersion`]. The function
-/// writes 5 raw bytes; `out`'s prior contents are preserved and the
-/// returned `out.len()` increment is exactly 5.
+/// The version byte may be `2` or `3` (the two versions sharing the
+/// six-field parameter-block layout this encoder writes, `spec/00`
+/// §"Format versions"); every other value surfaces
+/// [`EncodeError::UnsupportedVersion`]. Version `1` is in the spec's
+/// scope but its parameter-block layout is not pinned (`spec/01` §3.5
+/// makes the mean-estimator field version-conditional), so the crate's
+/// own decoder rejects a v1 stream with `Error::UnsupportedVersion(1)`;
+/// writing the v2 layout under a v1 version byte would therefore
+/// produce bytes the decoder refuses. The encoder rejects it up front
+/// (fuzz-found via `encode_roundtrip`, round 453). The function writes
+/// 5 raw bytes; `out`'s prior contents are preserved and the returned
+/// `out.len()` increment is exactly 5.
 pub fn write_byte_aligned_prefix(out: &mut Vec<u8>, version: u8) -> EncodeResult<()> {
-    if !matches!(version, 1..=3) {
+    if !matches!(version, 2..=3) {
         return Err(EncodeError::UnsupportedVersion(version));
     }
     out.extend_from_slice(&MAGIC);
@@ -1771,8 +1781,8 @@ mod tests {
     }
 
     #[test]
-    fn write_byte_aligned_prefix_accepts_v1_v2_v3() {
-        for &v in &[1u8, 2, 3] {
+    fn write_byte_aligned_prefix_accepts_v2_v3() {
+        for &v in &[2u8, 3] {
             let mut out = Vec::new();
             write_byte_aligned_prefix(&mut out, v).expect("write");
             assert_eq!(out[4], v);
@@ -1780,8 +1790,12 @@ mod tests {
     }
 
     #[test]
-    fn write_byte_aligned_prefix_rejects_v0_and_v4() {
-        for &v in &[0u8, 4, 99] {
+    fn write_byte_aligned_prefix_rejects_v0_v1_v4() {
+        // v1 is rejected because the v1 parameter-block layout is
+        // unpinned (`spec/01` §3.5) and the crate's decoder refuses a
+        // v1 stream; writing the v2 layout under a v1 byte would emit
+        // bytes `decode_stream` cannot read (round-453 fuzz finding).
+        for &v in &[0u8, 1, 4, 99] {
             let mut out = Vec::new();
             assert_eq!(
                 write_byte_aligned_prefix(&mut out, v),

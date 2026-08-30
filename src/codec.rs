@@ -378,6 +378,13 @@ impl Decoder for ShortenDecoder {
             self.try_decode()?;
         }
         self.eof = true;
+        if !self.decoded && !self.buffer.is_empty() {
+            // Bytes were delivered but `BLOCK_FN_QUIT` was never
+            // reached: the stream is truncated. Surface it rather than
+            // reporting a clean `Eof` with no frame (fuzz-found via
+            // `packet_chunking`, round 453).
+            return Err(truncated_at_flush(self.buffer.len()));
+        }
         Ok(())
     }
 
@@ -483,6 +490,16 @@ fn host_sample_format(filetype: u32) -> CoreResult<SampleFormat> {
 /// [`oxideav_core::Error`]. The framework's error enum has no
 /// per-codec variant tree, so each crate-local variant maps onto a
 /// generic flavour with a descriptive message.
+/// The error both trait wrappers surface from `flush()` when bytes were
+/// delivered but the stream never reached `BLOCK_FN_QUIT` (`spec/03`
+/// §3.8): the input is truncated and silently reporting `Eof` would
+/// lose the caller's audio without notice.
+fn truncated_at_flush(buffered: usize) -> CoreError {
+    CoreError::invalid(format!(
+        "oxideav-shorten: stream truncated — flush() called with {buffered} buffered byte(s) and BLOCK_FN_QUIT never reached"
+    ))
+}
+
 fn shorten_error_to_core(e: ShortenError) -> CoreError {
     match e {
         ShortenError::Truncated => CoreError::NeedMore,
@@ -719,6 +736,19 @@ impl ShortenStreamingDecoder {
                         "oxideav-shorten: header H_channels = 0 (round-robin cursor undefined)",
                     ));
                 }
+                // Decode-time resource bounds (round 398), identical
+                // guard to `decode_stream` and `StreamDecoder::new`:
+                // the three ulong() header fields below each linearly
+                // size the per-channel allocations that follow, and a
+                // ~20-byte crafted header must not be able to reserve
+                // gigabytes before any sample byte arrives. This third
+                // decode path was missing the guard (round-453
+                // `packet_chunking` fuzz finding: an 87-byte header
+                // claiming H_channels = 1_709_129 drove > 8 GiB of
+                // per-channel state allocations).
+                header
+                    .check_decode_resource_bounds()
+                    .map_err(shorten_error_to_core)?;
                 let n_channels = header.channels as usize;
                 let carry_len = header.sample_history_carry_len() as usize;
                 self.carries = (0..n_channels)
@@ -1094,6 +1124,15 @@ impl Decoder for ShortenStreamingDecoder {
     fn flush(&mut self) -> CoreResult<()> {
         if !self.eof {
             self.try_advance()?;
+            if !self.eof && !self.buffer.is_empty() {
+                // Bytes were delivered but `BLOCK_FN_QUIT` was never
+                // reached: the stream is truncated. Frames already
+                // queued stay retrievable; the caller is told the
+                // stream ended early (fuzz-found via
+                // `packet_chunking`, round 453).
+                self.eof = true;
+                return Err(truncated_at_flush(self.buffer.len()));
+            }
         }
         self.eof = true;
         Ok(())
@@ -1297,7 +1336,7 @@ mod tests {
         // VERBATIM: 4-byte host-format envelope prefix.
         bits.extend(encode_uvar(9, FNSIZE));
         bits.extend(encode_uvar(4, 5));
-        for b in [b'R', b'I', b'F', b'F'] {
+        for &b in b"RIFF" {
             bits.extend(encode_uvar(b as u32, 8));
         }
         // DIFF1 ch0 [1, 2, 3, 4] over zero carry -> [1, 3, 6, 10]
@@ -1748,7 +1787,7 @@ mod tests {
         // VERBATIM envelope (cursor unchanged).
         bits.extend(encode_uvar(9, FNSIZE));
         bits.extend(encode_uvar(4, 5));
-        for b in [b'R', b'I', b'F', b'F'] {
+        for &b in b"RIFF" {
             bits.extend(encode_uvar(b as u32, 8));
         }
         // BITSHIFT = 0 (no-op; exercises the absorb path).
@@ -1876,12 +1915,12 @@ mod tests {
         // Two VERBATIM blocks before any samples.
         bits.extend(encode_uvar(9, FNSIZE));
         bits.extend(encode_uvar(3, 5));
-        for b in [b'R', b'I', b'F'] {
+        for &b in b"RIF" {
             bits.extend(encode_uvar(b as u32, 8));
         }
         bits.extend(encode_uvar(9, FNSIZE));
         bits.extend(encode_uvar(2, 5));
-        for b in [b'F', b'X'] {
+        for &b in b"FX" {
             bits.extend(encode_uvar(b as u32, 8));
         }
         // Then a single sample block + QUIT.
