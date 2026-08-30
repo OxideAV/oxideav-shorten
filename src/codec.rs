@@ -885,7 +885,10 @@ impl ShortenStreamingDecoder {
                         // BLOCKSIZE override while channel slots are
                         // partially filled would produce mismatched
                         // planes after the round completes.
-                        if self.pending_round.iter().any(|s| s.is_some())
+                        if self
+                            .pending_round
+                            .iter()
+                            .any(|s| s.as_ref().is_some_and(|b| !b.samples.is_empty()))
                             && new_bs != self.block_size
                         {
                             return Err(self.fail(CoreError::invalid(

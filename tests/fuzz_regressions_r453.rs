@@ -235,3 +235,30 @@ fn quit_mid_channel_round_rejected_by_both_wrappers() {
         );
     }
 }
+
+/// `packet_chunking` fuzz target, round 453 (second wave): with
+/// `H_blocksize = 0` every pending block is empty, so a
+/// `BLOCK_FN_BLOCKSIZE` (or `BLOCK_FN_QUIT`) arriving "mid round"
+/// cannot make the planes ragged — the whole-stream wrapper accepts
+/// the stream (all channels zero-length) while the streaming wrapper's
+/// mid-round guards fired on the empty slots. Both guards now ignore
+/// empty pending blocks. The bytes are the fuzz artifact's stream.
+#[test]
+fn empty_pending_blocks_do_not_trip_mid_round_guards() {
+    let bytes: [u8; 48] = [
+        0x61, 0x6a, 0x6b, 0x67, 0x02, 0xf7, 0x89, 0x6a, 0x67, 0x61, 0x01, 0x20, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0x9f, 0x52, 0xa6, 0xd0, 0x69, 0x34, 0x6a, 0x33, 0x5f, 0x70, 0x00, 0x00, 0x01,
+        0x3b, 0x00, 0xf1, 0x61, 0xc9, 0x85, 0x26, 0x0c, 0x18, 0xb0, 0xa1, 0xc1, 0x81, 0x0a, 0xff,
+        0xff, 0xdc, 0x72,
+    ];
+    let whole = oxideav_shorten::decode_stream(&bytes).expect("artifact stream decodes");
+    assert!(whole.channels.iter().all(|c| c.is_empty()));
+
+    let params = CodecParameters::audio(CodecId::new(oxideav_shorten::CODEC_ID_STR));
+    let tb = TimeBase::new(1, 44_100);
+    let mut dec = make_streaming_decoder(&params).expect("make_streaming_decoder");
+    dec.send_packet(&Packet::new(0, tb, bytes.to_vec()))
+        .expect("streaming wrapper accepts the zero-blocksize stream");
+    dec.flush().expect("flush is clean at BLOCK_FN_QUIT");
+    assert!(matches!(dec.receive_frame(), Err(CoreError::Eof)));
+}

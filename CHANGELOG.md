@@ -86,7 +86,11 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   frame packing (ragged planes) but accepted by the streaming wrapper,
   which discarded the incomplete round and reported a clean `Eof`.
   The streaming wrapper now fails with the same class of error, so the
-  two trait wrappers agree on every input.
+  two trait wrappers agree on every input. Conversely, both of the
+  streaming wrapper's mid-round guards (QUIT and `BLOCK_FN_BLOCKSIZE`)
+  now ignore *empty* pending blocks — with `H_blocksize = 0` every
+  block is zero-length and cannot make the planes ragged, yet the
+  guards fired while the whole-stream wrapper accepted the stream.
 - Clippy 1.98 `byte_char_slices` sweep across in-tree test bitstream
   builders (`[b'R', b'I', b'F', b'F']` → `b"RIFF"` et al.).
 
