@@ -6,6 +6,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/OxideAV/oxideav-shorten/compare/v0.0.3...v0.0.4) - 2026-08-30
+
+### Other
+
+- streaming wrapper mid-round guards ignore empty pending blocks (fuzz-found wrapper disagreement)
+- README Fuzzing section + CHANGELOG for the round-453 fuzz campaign
+- streaming wrapper rejects BLOCK_FN_QUIT mid channel-round (fuzz-found wrapper disagreement)
+- encoder property-test suite — sample-exact round trips over random parameter grids
+- cargo-fuzz harness — five structure-aware targets + scheduled Fuzz workflow
+- four fuzz-found fixes — write_uvar width-32 overflow, v1 encode rejection, truncated-stream flush, streaming-wrapper resource bounds
+
 ### Added
 
 - **Round 453 — cargo-fuzz harness, fleet Fuzz workflow, and three
