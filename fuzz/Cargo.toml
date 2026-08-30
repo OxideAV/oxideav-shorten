@@ -1,0 +1,85 @@
+[package]
+name = "oxideav-shorten-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Shorten's whole surface is driven from attacker-controlled bytes: the
+# byte-aligned `ajkg` + version prefix, the six `ulong()` parameter-block
+# fields, and then a bit-level command stream (function codes 0..=9,
+# Rice-coded residuals, QLPC orders/coefficients, BLOCKSIZE / BITSHIFT
+# state mutators, the VERBATIM envelope, and the QUIT byte-boundary
+# padding), optionally followed by a non-standard SHNAMPSK seek-table
+# sidecar. There is no external library used as a cross-decode oracle
+# (the clean-room wall bars every third-party Shorten implementation),
+# so the harness covers the crate's own internal contracts:
+#
+# - **`parse_header`**: panic-free `parse_stream_header` on arbitrary
+#   bytes, plus the writer/parser equivalence `parse(write(h)) == h`
+#   for every header the parser accepts.
+# - **`decode`**: panic-free whole-stream `decode_stream` and
+#   constant-memory `StreamDecoder` on arbitrary bytes, and the
+#   two-path differential (same samples / verbatim / QUIT boundary /
+#   padding, or the same failure class) on every input. Output is
+#   bounded target-side by a documented sample cap.
+# - **`encode_roundtrip`**: structure-aware — every fuzz-derived header
+#   field / bit depth / bshift / verbatim prefix is contract-valid, so
+#   `encode_stream` / `encode_stream_lossy` MUST succeed and both decode
+#   paths MUST reconstruct `(s >> bshift) << bshift` sample-exact.
+# - **`trailer`**: panic-free `detect_shnampsk_trailer` /
+#   `split_off_shnampsk_trailer` on arbitrary tails, the
+#   signature-present ⇒ never-`Ok(None)` rule, and the bottom-up
+#   (QUIT alignment) vs top-down (`len_u32`) boundary agreement on
+#   valid-stream + fuzz-built sidecar composites.
+# - **`packet_chunking`**: the two `oxideav_core::Decoder` wrappers fed
+#   the same stream through fuzz-chosen packet boundaries must agree
+#   with `decode_stream` byte-for-byte on the packed planes.
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.oxideav-shorten]
+path = ".."
+features = ["registry"]
+
+[dependencies.oxideav-core]
+version = "0.1"
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_header"
+path = "fuzz_targets/parse_header.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "encode_roundtrip"
+path = "fuzz_targets/encode_roundtrip.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "trailer"
+path = "fuzz_targets/trailer.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "packet_chunking"
+path = "fuzz_targets/packet_chunking.rs"
+test = false
+doc = false
