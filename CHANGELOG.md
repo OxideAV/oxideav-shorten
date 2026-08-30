@@ -8,6 +8,88 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Round 453 — cargo-fuzz harness, fleet Fuzz workflow, and three
+  fuzz-found fixes.** New `fuzz/` sub-crate (mirroring the fleet
+  convention) with five structure-aware targets — `parse_header`
+  (header parse + writer/parser equivalence), `decode` (whole-stream
+  `decode_stream` vs constant-memory `StreamDecoder` differential:
+  same samples / verbatim / QUIT boundary / padding or the same
+  `Error`), `encode_roundtrip` (contract-valid fuzz-derived headers,
+  bit depths 1..=24, bshift 0..=31, verbatim prefixes: encode MUST
+  succeed and both decode paths MUST reconstruct
+  `(s >> bshift) << bshift` sample-exact), `trailer` (SHNAMPSK
+  envelope rules + top-down/bottom-up boundary agreement on
+  composites), and `packet_chunking` (the two `oxideav_core::Decoder`
+  wrappers fed fuzz-chosen packet boundaries must agree with
+  `decode_stream`) — plus a scheduled + dispatchable `Fuzz` workflow
+  (daily, org-shared `crate-fuzz.yml`) and seed corpora produced by
+  the crate's own encoder. Local deep runs surfaced three defects,
+  each fixed with a regression pin in
+  `tests/fuzz_regressions_r453.rs` (see the Fixed entries below).
+- **Round 453 — encoder property-test suite.** New
+  `tests/encoder_property_roundtrip.rs` pins a reproducible slice of
+  the fuzz harness's `encode_roundtrip` parameter space in plain
+  `cargo test`: 160 lossless random-grid configurations (channels
+  1..=6, block sizes 1..=300, LPC orders 0..=12, mean windows 0..=6,
+  bit depths 4..=24, random verbatim prefixes), 60 lossy
+  configurations (`bshift` 1..=12 over noise and quadratic-ramp
+  signals, asserting the `(s >> bshift) << bshift` reconstruction),
+  and a degenerate-shape battery (empty streams, single samples,
+  constants, i16/24-bit extremes, `bs = 1` with over-length LPC
+  orders, `bshift = 31`) — every case decoded through BOTH public
+  decode paths and required sample-exact.
+
+### Fixed
+
+- **`BitWriter::write_uvar` width-32 shift overflow** (round-453
+  `parse_header` fuzz finding). A header field with bit 31 set has
+  `natural_ulong_width == 32`, and the prefix-zero count
+  `value >> n` (and the mantissa mask `(1 << n) - 1`) overflowed at
+  `n == 32` — a debug-build panic reachable through
+  `write_stream_header` on any header the parser itself accepts.
+  Width 32 now puts the whole value in the mantissa with an empty
+  prefix per the `spec/02` §2.1 length formula (`⌊v/2^32⌋ = 0`).
+- **`encode_stream` accepted `version: 1` and emitted undecodable
+  bytes** (round-453 `encode_roundtrip` fuzz finding). The v1
+  parameter-block layout is unpinned (`spec/01` §3.5 makes the
+  mean-estimator field version-conditional) and the decoder rejects
+  v1 streams with `Error::UnsupportedVersion(1)`, yet
+  `write_byte_aligned_prefix` accepted `version: 1` and wrote the v2
+  layout under a v1 version byte — a stream the crate's own decoder
+  refuses. The encoder now rejects v1 up front with
+  `EncodeError::UnsupportedVersion(1)`; accepted encoder versions
+  are `{2, 3}`.
+- **`flush()` on a truncated stream silently reported a clean `Eof`**
+  (round-453 `packet_chunking` fuzz finding). Both trait wrappers
+  (`ShortenDecoder`, `ShortenStreamingDecoder`) returned `Ok` from
+  `flush()` when bytes had been delivered but `BLOCK_FN_QUIT` was
+  never reached, and the subsequent `receive_frame` reported `Eof` —
+  the whole-stream wrapper dropped the entire stream without notice,
+  the streaming wrapper the unterminated tail. `flush()` now surfaces
+  a truncation error (already-queued frames stay retrievable on the
+  streaming shape); a complete stream still flushes cleanly.
+- **`ShortenStreamingDecoder` was missing the round-398 decode-time
+  resource bounds** (round-453 `packet_chunking` fuzz finding, the one
+  genuine hostile-reservation OOM of the round). `decode_stream` and
+  `StreamDecoder::new` validate `H_channels` / `H_maxlpcorder` /
+  `H_meanblocks` against the implementation caps before allocating,
+  but the chop-anywhere trait wrapper's `try_parse_header` did not —
+  an 87-byte stream whose header claimed `H_channels = 1_709_129`
+  drove more than 8 GiB of per-channel carry / mean-estimator /
+  pending-round allocations before a single sample byte was needed.
+  The wrapper now applies the identical
+  `check_decode_resource_bounds` guard.
+- **`ShortenStreamingDecoder` silently dropped a partial channel-round
+  at `BLOCK_FN_QUIT`** (round-453 `packet_chunking` fuzz finding). A
+  stream whose QUIT lands mid channel-round (some channels one block
+  short of the others) was rejected by the whole-stream wrapper at
+  frame packing (ragged planes) but accepted by the streaming wrapper,
+  which discarded the incomplete round and reported a clean `Eof`.
+  The streaming wrapper now fails with the same class of error, so the
+  two trait wrappers agree on every input.
+- Clippy 1.98 `byte_char_slices` sweep across in-tree test bitstream
+  builders (`[b'R', b'I', b'F', b'F']` → `b"RIFF"` et al.).
+
 - **Round 398 — malformed-input robustness fuzzer for the public
   decode surface.** New `tests/decode_robustness_fuzz.rs` pins the
   decoder's hostile-input contract: both public decode entry points —

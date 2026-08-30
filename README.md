@@ -151,6 +151,50 @@ crate's own `encode_stream` (no external data). This also exercises the
 decode-time resource bounds under fuzzing (a crafted header cannot OOM
 the decoder).
 
+## Fuzzing
+
+`fuzz/` is a cargo-fuzz sub-crate with five structure-aware targets,
+run daily (and on demand) by the `Fuzz` workflow via the org-shared
+`crate-fuzz.yml` (30-minute budget split across targets, corpus cached
+between runs; a crash uploads the offending input and fails the job):
+
+* **`parse_header`** — panic-free `parse_stream_header` on arbitrary
+  bytes plus writer/parser equivalence: every accepted header must
+  re-serialise through `write_stream_header` and re-parse identically.
+* **`decode`** — the two public decode paths (`decode_stream` vs
+  `StreamDecoder`) as a differential: identical samples / verbatim /
+  QUIT boundary / padding on success, the identical `Error` on
+  failure. Output is bounded target-side (documented sample/block
+  caps) — a `BLOCK_FN_ZERO` run with a huge sub-block size expands
+  legitimately, so the decoder itself is never truncated.
+* **`encode_roundtrip`** — structure-aware: fuzz-derived headers
+  (v2/v3, 1..=8 channels, block sizes 1..=2048, LPC orders 0..=40,
+  mean windows 0..=8), bit depths 1..=24 and bshift 0..=31 are all
+  mapped into the encoder's contract-valid domain, so `encode_stream`
+  / `encode_stream_lossy` MUST succeed and both decode paths MUST
+  reconstruct `(s >> bshift) << bshift` sample-exact — an `expect`
+  fires only on a real defect.
+* **`trailer`** — SHNAMPSK envelope rules on arbitrary tails
+  (signature present ⇒ never "no trailer"; detect/split agreement)
+  plus valid-stream + fuzz-shaped-sidecar composites pinning the
+  top-down `len_u32` boundary against the decoder's bottom-up QUIT
+  boundary.
+* **`packet_chunking`** — the two `oxideav_core::Decoder` wrappers fed
+  the same bytes across fuzz-chosen packet boundaries must agree with
+  `decode_stream` (packed planes, `stream_proper_len`, termination).
+
+The round-453 deep runs (≥ 25 min per target, ASAN) surfaced five
+defects, all fixed with regression pins in
+`tests/fuzz_regressions_r453.rs` (details in `CHANGELOG.md`): a
+`BitWriter::write_uvar` width-32 shift overflow; `encode_stream`
+accepting `version: 1` (whose layout is unpinned and whose streams the
+crate's own decoder rejects); `flush()` reporting a clean `Eof` on a
+truncated stream; `ShortenStreamingDecoder` missing the decode-time
+resource bounds (an 87-byte header claiming 1.7 M channels reserved
+> 8 GiB); and the streaming wrapper silently dropping a partial
+channel-round at `BLOCK_FN_QUIT` where the whole-stream wrapper
+rejects it.
+
 ## Not yet supported
 
 Both remaining gaps are **blocked on the spec, not on this crate** — the
