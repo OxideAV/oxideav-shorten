@@ -6,6 +6,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/OxideAV/oxideav-shorten/compare/v0.0.4...v0.0.5) - 2026-10-23
+
+### Other
+
+- edition 2024, MSRV 1.95
+
 ### Changed
 
 - edition 2024, MSRV 1.95
