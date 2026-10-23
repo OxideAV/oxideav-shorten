@@ -118,8 +118,8 @@
 use crate::bitwriter::BitWriter;
 use crate::block::BITSHIFT_MAX;
 use crate::encoder::{
-    write_bitshift_command, write_blocksize_command, write_byte_aligned_prefix,
-    write_parameter_block, write_quit_command, write_verbatim_block, EncodeError, EncodeResult,
+    EncodeError, EncodeResult, write_bitshift_command, write_blocksize_command,
+    write_byte_aligned_prefix, write_parameter_block, write_quit_command, write_verbatim_block,
 };
 use crate::header::ShortenStreamHeader;
 use crate::predictor::{ChannelCarry, MeanEstimator};
@@ -230,7 +230,7 @@ fn encode_stream_inner(
         return Err(EncodeError::ZeroChannels);
     }
     let n_channels = header.channels as usize;
-    if samples.len() % n_channels != 0 {
+    if !samples.len().is_multiple_of(n_channels) {
         return Err(EncodeError::RaggedInterleave {
             samples: samples.len(),
             channels: header.channels,

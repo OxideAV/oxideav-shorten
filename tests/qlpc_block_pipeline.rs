@@ -28,8 +28,8 @@
 //! the reconstructed samples + the carry hand-off across blocks.
 
 use oxideav_shorten::{
-    decode_qlpc_block, parse_stream_header, read_function_code, BitReader, ChannelCarry,
-    FunctionCode, ENERGYSIZE, LPCQSIZE, LPCQUANT, MAGIC,
+    BitReader, ChannelCarry, ENERGYSIZE, FunctionCode, LPCQSIZE, LPCQUANT, MAGIC,
+    decode_qlpc_block, parse_stream_header, read_function_code,
 };
 
 fn pack_bits_msb_first(bits: &[u32]) -> Vec<u8> {

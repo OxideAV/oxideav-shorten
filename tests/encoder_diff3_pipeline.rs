@@ -18,9 +18,9 @@
 //! §1 / §2.1 / §2.2 (MSB-first uvar / svar primitives).
 
 use oxideav_shorten::{
-    decode_stream, min_energy_for_diff3, write_byte_aligned_prefix, write_diff3_block,
-    write_parameter_block, write_quit_command, write_verbatim_block, BitWriter, ChannelCarry,
-    ShortenStreamHeader,
+    BitWriter, ChannelCarry, ShortenStreamHeader, decode_stream, min_energy_for_diff3,
+    write_byte_aligned_prefix, write_diff3_block, write_parameter_block, write_quit_command,
+    write_verbatim_block,
 };
 
 fn synth_header(

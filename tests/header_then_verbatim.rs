@@ -30,8 +30,8 @@
 //! clean-room rebuild have wired up.
 
 use oxideav_shorten::{
-    parse_stream_header, read_function_code, read_verbatim_payload, BitReader, FunctionCode,
-    FNSIZE, MAGIC, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE,
+    BitReader, FNSIZE, FunctionCode, MAGIC, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE,
+    parse_stream_header, read_function_code, read_verbatim_payload,
 };
 
 fn pack_bits_msb_first(bits: &[u32]) -> Vec<u8> {

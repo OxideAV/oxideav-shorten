@@ -33,7 +33,7 @@
 //! small while preserving the ZERO-then-DIFF0 ordering and the
 //! zero-mean reconstruction semantics.
 
-use oxideav_shorten::{decode_stream, MAGIC};
+use oxideav_shorten::{MAGIC, decode_stream};
 
 fn pack_bits_msb_first(bits: &[u32]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -89,11 +89,7 @@ fn encode_ulong(value: u32, w: u32) -> Vec<u32> {
 }
 
 fn bits_for(v: u32) -> u32 {
-    if v == 0 {
-        0
-    } else {
-        32 - v.leading_zeros()
-    }
+    if v == 0 { 0 } else { 32 - v.leading_zeros() }
 }
 
 /// F4 parameter block (`spec/04` §6.1: filetype `s16lh = 5`, two

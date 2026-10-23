@@ -343,11 +343,7 @@ impl<'a> BitReader<'a> {
     pub fn read_svar(&mut self, n: u32) -> Result<i64> {
         let u = self.read_uvar(n)?;
         let mag = (u >> 1) as i64;
-        if u & 1 == 0 {
-            Ok(mag)
-        } else {
-            Ok(!mag)
-        }
+        if u & 1 == 0 { Ok(mag) } else { Ok(!mag) }
     }
 }
 

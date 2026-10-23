@@ -17,7 +17,7 @@
 //! the spec set explicitly anchors and (b) the unpinned-code negative
 //! contract spec/05 §6 + §8 requires.
 
-use oxideav_shorten::{parse_stream_header, Filetype, MAGIC};
+use oxideav_shorten::{Filetype, MAGIC, parse_stream_header};
 
 /// Bit-packer helper mirroring the shape used elsewhere in this
 /// crate's integration tests: takes an MSB-first bit sequence and

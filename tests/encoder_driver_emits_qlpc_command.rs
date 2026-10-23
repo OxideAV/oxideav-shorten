@@ -46,9 +46,9 @@
 //! so the consumed bit widths are exactly the decoder's.
 
 use oxideav_shorten::{
+    BitReader, ChannelCarry, FunctionCode, MeanEstimator, PolyOrder, ShortenStreamHeader,
     decode_diff_block, decode_qlpc_block, decode_stream, encode_stream, fill_zero_block,
     parse_stream_header, read_blocksize_payload, read_function_code, read_verbatim_payload,
-    BitReader, ChannelCarry, FunctionCode, MeanEstimator, PolyOrder, ShortenStreamHeader,
 };
 
 fn v2_header(

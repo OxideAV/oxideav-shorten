@@ -154,12 +154,12 @@
 //!   byte-alignment with zero padding).
 
 use crate::bitreader::UVAR_PREFIX_CAP;
-use crate::bitwriter::{natural_ulong_width, BitWriter};
+use crate::bitwriter::{BitWriter, natural_ulong_width};
 use crate::block::{
-    BITSHIFTSIZE, BITSHIFT_MAX, BLOCKSIZE_MAX, FNSIZE, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE,
+    BITSHIFT_MAX, BITSHIFTSIZE, BLOCKSIZE_MAX, FNSIZE, VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE,
     VERBATIM_MAX_LEN,
 };
-use crate::header::{ShortenStreamHeader, MAGIC};
+use crate::header::{MAGIC, ShortenStreamHeader};
 use crate::predictor::{ChannelCarry, ENERGYSIZE, LPCQSIZE, LPCQUANT};
 
 /// `BLOCK_FN_VERBATIM` function-code numeric value (`spec/03` §3.10 /
@@ -2011,8 +2011,8 @@ mod tests {
     #[test]
     fn diff0_block_roundtrips_through_decode_diff_block() {
         use crate::bitreader::BitReader;
-        use crate::block::{read_function_code, FunctionCode};
-        use crate::predictor::{decode_diff_block, ChannelCarry, PolyOrder};
+        use crate::block::{FunctionCode, read_function_code};
+        use crate::predictor::{ChannelCarry, PolyOrder, decode_diff_block};
 
         // A representative spread of DIFF0 residual blocks at width
         // values covering e ∈ {0..7}.
@@ -2086,7 +2086,7 @@ mod tests {
     fn write_diff0_block_mean_consistency_full_roundtrip() {
         use crate::bitreader::BitReader;
         use crate::block::read_function_code;
-        use crate::predictor::{decode_diff_block, ChannelCarry, PolyOrder};
+        use crate::predictor::{ChannelCarry, PolyOrder, decode_diff_block};
 
         // Spec/05 §2.3 reconstruction: s(t) = e0(t) + μ_chan. Encoder
         // emits e0(t) = s(t) − μ_chan; decoder adds μ_chan back. The
@@ -2233,8 +2233,8 @@ mod tests {
     #[test]
     fn diff1_block_roundtrips_through_decode_diff_block() {
         use crate::bitreader::BitReader;
-        use crate::block::{read_function_code, FunctionCode};
-        use crate::predictor::{decode_diff_block, ChannelCarry, PolyOrder};
+        use crate::block::{FunctionCode, read_function_code};
+        use crate::predictor::{ChannelCarry, PolyOrder, decode_diff_block};
 
         // Representative spread covering small and large per-sample
         // first-differences. Carry is zero-initialised at the start of
@@ -2277,7 +2277,7 @@ mod tests {
     fn diff1_block_roundtrips_with_non_zero_carry_seed() {
         use crate::bitreader::BitReader;
         use crate::block::read_function_code;
-        use crate::predictor::{decode_diff_block, ChannelCarry, PolyOrder};
+        use crate::predictor::{ChannelCarry, PolyOrder, decode_diff_block};
 
         // The encoder seeds s(t-1) from carry.at(0); the decoder reads
         // the same carry. Both sides start from a carry that has just
@@ -2464,8 +2464,8 @@ mod tests {
     #[test]
     fn diff2_block_roundtrips_through_decode_diff_block() {
         use crate::bitreader::BitReader;
-        use crate::block::{read_function_code, FunctionCode};
-        use crate::predictor::{decode_diff_block, ChannelCarry, PolyOrder};
+        use crate::block::{FunctionCode, read_function_code};
+        use crate::predictor::{ChannelCarry, PolyOrder, decode_diff_block};
 
         // Representative spread of test samples; carry zero-initialised
         // per-case to match a fresh-channel block.
@@ -2507,7 +2507,7 @@ mod tests {
     fn diff2_block_roundtrips_with_non_zero_carry_seed() {
         use crate::bitreader::BitReader;
         use crate::block::read_function_code;
-        use crate::predictor::{decode_diff_block, ChannelCarry, PolyOrder};
+        use crate::predictor::{ChannelCarry, PolyOrder, decode_diff_block};
 
         // Encoder + decoder share the same carry state, which has just
         // absorbed a prior block ending on samples 90, 100.
@@ -2725,8 +2725,8 @@ mod tests {
     #[test]
     fn diff3_block_roundtrips_through_decode_diff_block() {
         use crate::bitreader::BitReader;
-        use crate::block::{read_function_code, FunctionCode};
-        use crate::predictor::{decode_diff_block, ChannelCarry, PolyOrder};
+        use crate::block::{FunctionCode, read_function_code};
+        use crate::predictor::{ChannelCarry, PolyOrder, decode_diff_block};
 
         // Representative spread of test samples; carry zero-initialised
         // per-case to match a fresh-channel block.
@@ -2767,7 +2767,7 @@ mod tests {
     fn diff3_block_roundtrips_with_non_zero_carry_seed() {
         use crate::bitreader::BitReader;
         use crate::block::read_function_code;
-        use crate::predictor::{decode_diff_block, ChannelCarry, PolyOrder};
+        use crate::predictor::{ChannelCarry, PolyOrder, decode_diff_block};
 
         // Encoder + decoder share the same carry state, which has just
         // absorbed a prior block ending on samples 80, 90, 100.
@@ -2984,8 +2984,8 @@ mod tests {
     #[test]
     fn qlpc_block_roundtrips_through_decode_qlpc_block_order_zero() {
         use crate::bitreader::BitReader;
-        use crate::block::{read_function_code, FunctionCode};
-        use crate::predictor::{decode_qlpc_block, ChannelCarry};
+        use crate::block::{FunctionCode, read_function_code};
+        use crate::predictor::{ChannelCarry, decode_qlpc_block};
 
         let samples: &[i32] = &[10, -7, 3, 0, -1];
         let carry = ChannelCarry::new(3);
@@ -3007,7 +3007,7 @@ mod tests {
     fn qlpc_block_roundtrips_through_decode_qlpc_block_order_three() {
         use crate::bitreader::BitReader;
         use crate::block::read_function_code;
-        use crate::predictor::{decode_qlpc_block, ChannelCarry};
+        use crate::predictor::{ChannelCarry, decode_qlpc_block};
 
         // Order 3 with a non-trivial coefficient vector. Use a smooth
         // sample sequence so the residuals are bounded.
@@ -3032,7 +3032,7 @@ mod tests {
     fn qlpc_block_roundtrips_with_non_zero_carry_seed() {
         use crate::bitreader::BitReader;
         use crate::block::read_function_code;
-        use crate::predictor::{decode_qlpc_block, ChannelCarry};
+        use crate::predictor::{ChannelCarry, decode_qlpc_block};
 
         // Encoder + decoder share a carry already populated by a prior
         // block on this channel. With a1 = 1 the predictor is the
@@ -3189,7 +3189,7 @@ mod tests {
     #[test]
     fn write_quit_block_roundtrips_through_read_function_code() {
         use crate::bitreader::BitReader;
-        use crate::block::{read_function_code, FunctionCode};
+        use crate::block::{FunctionCode, read_function_code};
 
         // Round-trip: the 4-bit `0100` the writer emits is dispatched
         // to `FunctionCode::Quit` by the decoder, confirming writer and
@@ -3205,7 +3205,7 @@ mod tests {
     #[test]
     fn write_zero_block_roundtrips_through_read_function_code() {
         use crate::bitreader::BitReader;
-        use crate::block::{read_function_code, FunctionCode};
+        use crate::block::{FunctionCode, read_function_code};
 
         let mut w = BitWriter::new();
         write_zero_block(&mut w);
@@ -3350,7 +3350,7 @@ mod tests {
     #[test]
     fn write_bitshift_command_roundtrips_through_decoder_primitives() {
         use crate::bitreader::BitReader;
-        use crate::block::{read_bitshift_payload, read_function_code, FunctionCode};
+        use crate::block::{FunctionCode, read_bitshift_payload, read_function_code};
 
         // Cover the anchor-fixture bshift values plus the boundary
         // cases (0 = explicit no-op, BITSHIFT_MAX = cap-edge accept).
@@ -3435,7 +3435,7 @@ mod tests {
     #[test]
     fn write_blocksize_command_roundtrips_through_decoder_primitives() {
         use crate::bitreader::BitReader;
-        use crate::block::{read_blocksize_payload, read_function_code, FunctionCode};
+        use crate::block::{FunctionCode, read_blocksize_payload, read_function_code};
 
         // Cover the spec/04 §4 anchor value (F2's `new_bs = 155`),
         // the default H_blocksize (256 — appears in fixture F1 header

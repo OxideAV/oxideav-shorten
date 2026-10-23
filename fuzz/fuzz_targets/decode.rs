@@ -29,7 +29,7 @@
 //! cap and then abandoned.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_shorten::{decode_stream, DecodedBlock, StreamDecoder};
+use oxideav_shorten::{DecodedBlock, StreamDecoder, decode_stream};
 
 /// Total decoded-sample cap before the accumulating path is skipped.
 const SAMPLE_CAP: usize = 1 << 20;
@@ -48,7 +48,11 @@ fuzz_target!(|data: &[u8]| {
         Ok(d) => d,
         Err(e) => {
             let whole = decode_stream(data);
-            assert_eq!(whole.err(), Some(e), "header-stage failure class must agree");
+            assert_eq!(
+                whole.err(),
+                Some(e),
+                "header-stage failure class must agree"
+            );
             return;
         }
     };
@@ -89,7 +93,11 @@ fuzz_target!(|data: &[u8]| {
     let whole = decode_stream(data);
     match outcome {
         Err(e) => {
-            assert_eq!(whole.err(), Some(e), "failure class must agree across both paths");
+            assert_eq!(
+                whole.err(),
+                Some(e),
+                "failure class must agree across both paths"
+            );
         }
         Ok(()) => {
             assert!(dec.is_finished());

@@ -23,7 +23,7 @@
 use oxideav_core::{
     AudioFrame, CodecId, CodecParameters, CodecRegistry, Frame, Packet, SampleFormat, TimeBase,
 };
-use oxideav_shorten::{make_encoder, register_codecs, register_encoder, CODEC_ID_STR};
+use oxideav_shorten::{CODEC_ID_STR, make_encoder, register_codecs, register_encoder};
 
 fn params(channels: u16) -> CodecParameters {
     let mut p = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
@@ -79,7 +79,9 @@ fn registry_encode_then_registry_decode_mono_sample_exact() {
     };
     // Re-unpack the decoded plane (s16lh) and compare to the source.
     let decoded: Vec<i32> = frame.data[0]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
         .collect();
     assert_eq!(decoded, samples);

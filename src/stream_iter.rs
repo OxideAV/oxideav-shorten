@@ -67,14 +67,14 @@
 
 use crate::bitreader::{BitReader, BytePadding};
 use crate::block::{
-    read_bitshift_payload, read_blocksize_payload, read_function_code, read_verbatim_payload,
-    FunctionCode,
+    FunctionCode, read_bitshift_payload, read_blocksize_payload, read_function_code,
+    read_verbatim_payload,
 };
 use crate::driver::MAX_COMMANDS;
 use crate::error::{Error, Result};
-use crate::header::{parse_stream_header, ShortenStreamHeader};
+use crate::header::{ShortenStreamHeader, parse_stream_header};
 use crate::predictor::{
-    decode_diff_block, decode_qlpc_block, fill_zero_block, ChannelCarry, MeanEstimator, PolyOrder,
+    ChannelCarry, MeanEstimator, PolyOrder, decode_diff_block, decode_qlpc_block, fill_zero_block,
 };
 
 /// One item yielded by [`StreamDecoder::next_block`].
@@ -631,13 +631,7 @@ mod tests {
         meanblocks: u32,
         skipbytes: u32,
     ) -> Vec<u32> {
-        let bits_for = |v: u32| -> u32 {
-            if v == 0 {
-                0
-            } else {
-                32 - v.leading_zeros()
-            }
-        };
+        let bits_for = |v: u32| -> u32 { if v == 0 { 0 } else { 32 - v.leading_zeros() } };
         let mut bits = Vec::new();
         bits.extend(encode_ulong(filetype, bits_for(filetype)));
         bits.extend(encode_ulong(channels, bits_for(channels)));

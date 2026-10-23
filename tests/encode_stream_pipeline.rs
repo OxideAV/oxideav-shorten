@@ -25,7 +25,7 @@
 //! * `docs/audio/shorten/spec/01-stream-header.md` (header parse +
 //!   carry-length derivation).
 
-use oxideav_shorten::{decode_stream, encode_stream, ShortenStreamHeader};
+use oxideav_shorten::{ShortenStreamHeader, decode_stream, encode_stream};
 
 fn header(channels: u32, blocksize: u32, maxlpcorder: u32, meanblocks: u32) -> ShortenStreamHeader {
     ShortenStreamHeader {

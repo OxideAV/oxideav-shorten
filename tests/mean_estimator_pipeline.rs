@@ -43,8 +43,8 @@
 //! samples = 8.
 
 use oxideav_shorten::{
-    decode_diff_block, fill_zero_block, parse_stream_header, read_function_code, BitReader,
-    ChannelCarry, FunctionCode, MeanEstimator, PolyOrder, ENERGYSIZE, FNSIZE, MAGIC,
+    BitReader, ChannelCarry, ENERGYSIZE, FNSIZE, FunctionCode, MAGIC, MeanEstimator, PolyOrder,
+    decode_diff_block, fill_zero_block, parse_stream_header, read_function_code,
 };
 
 fn pack_bits_msb_first(bits: &[u32]) -> Vec<u8> {

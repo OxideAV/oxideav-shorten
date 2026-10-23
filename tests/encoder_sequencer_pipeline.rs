@@ -23,9 +23,9 @@
 //!   from) + §2.4 (ZERO-block eligibility against `μ_chan`).
 
 use oxideav_shorten::{
-    decode_stream, select_predictor, select_predictor_with_qlpc, write_blocksize_command,
-    write_byte_aligned_prefix, write_parameter_block, write_quit_command, write_selected_block,
-    BitWriter, ChannelCarry, Choice, ShortenStreamHeader,
+    BitWriter, ChannelCarry, Choice, ShortenStreamHeader, decode_stream, select_predictor,
+    select_predictor_with_qlpc, write_blocksize_command, write_byte_aligned_prefix,
+    write_parameter_block, write_quit_command, write_selected_block,
 };
 
 fn synth_header(

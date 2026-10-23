@@ -527,7 +527,7 @@ mod tests {
         // immediately.
         let mut buf = synth_v2_header(3, 1, 512, 0, 7, 0);
         buf[4] = 3; // version 3 reuses the v2 six-field layout per
-                    // `spec/00` §"Format versions".
+        // `spec/00` §"Format versions".
         let parsed = parse_stream_header(&buf).expect("synthetic v3 must parse");
         assert_eq!(parsed.header.version, 3);
         assert_eq!(parsed.header.filetype, 3);

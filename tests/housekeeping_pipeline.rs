@@ -40,9 +40,9 @@
 //! the carry hand-off across the BLOCKSIZE-override boundary.
 
 use oxideav_shorten::{
+    BITSHIFTSIZE, BitReader, ChannelCarry, ENERGYSIZE, FNSIZE, FunctionCode, MAGIC, PolyOrder,
     decode_diff_block, parse_stream_header, read_bitshift_payload, read_blocksize_payload,
-    read_function_code, BitReader, ChannelCarry, FunctionCode, PolyOrder, BITSHIFTSIZE, ENERGYSIZE,
-    FNSIZE, MAGIC,
+    read_function_code,
 };
 
 fn pack_bits_msb_first(bits: &[u32]) -> Vec<u8> {
@@ -156,8 +156,8 @@ fn header_then_bitshift_diff_blocksize_diff_quit_pipeline() {
     // BLOCKSIZE command: function code 5 then ulong() new_bs = 4.
     block_bits.extend(encode_uvar(5, FNSIZE));
     block_bits.extend(encode_ulong(4, 3)); // 4 fits in 3 bits
-                                           // DIFF1 block B — 4 samples, residuals all 1 (width 2 ⇒ encoded
-                                           // energy = 1).
+    // DIFF1 block B — 4 samples, residuals all 1 (width 2 ⇒ encoded
+    // energy = 1).
     append_diff1_block(&mut block_bits, 1, &[1, 1, 1, 1]);
     // QUIT terminator.
     block_bits.extend(encode_uvar(4, FNSIZE));

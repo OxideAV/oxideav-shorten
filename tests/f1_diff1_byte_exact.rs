@@ -35,7 +35,7 @@
 //! as `n - 1` and that decoding at the un-incremented width desyncs the
 //! sample reconstruction.
 
-use oxideav_shorten::{decode_stream, BitReader, FunctionCode, MAGIC};
+use oxideav_shorten::{BitReader, FunctionCode, MAGIC, decode_stream};
 
 // ---- minimal MSB-first bit-stream builders (mirror the synthetic
 //      builders used by the other integration tests) ----
@@ -108,13 +108,7 @@ fn encode_ulong(value: u32, w: u32) -> Vec<u32> {
 /// per-channel — decoding ch0 in isolation reproduces the same pinned
 /// PCM while keeping the round-robin cursor on ch0 for a single block.
 fn f1_header_param_bits(blocksize: u32) -> Vec<u32> {
-    let bits_for = |v: u32| -> u32 {
-        if v == 0 {
-            0
-        } else {
-            32 - v.leading_zeros()
-        }
-    };
+    let bits_for = |v: u32| -> u32 { if v == 0 { 0 } else { 32 - v.leading_zeros() } };
     let mut bits = Vec::new();
     bits.extend(encode_ulong(5, bits_for(5))); // H_filetype = s16lh
     bits.extend(encode_ulong(1, bits_for(1))); // H_channels = 1 (F1 ch0 in isolation)

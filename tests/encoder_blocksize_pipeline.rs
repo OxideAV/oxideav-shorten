@@ -25,8 +25,8 @@
 //!   value itself).
 
 use oxideav_shorten::{
-    decode_stream, min_energy_for_diff1, write_blocksize_command, write_byte_aligned_prefix,
-    write_diff1_block, write_parameter_block, write_quit_command, BitWriter, ShortenStreamHeader,
+    BitWriter, ShortenStreamHeader, decode_stream, min_energy_for_diff1, write_blocksize_command,
+    write_byte_aligned_prefix, write_diff1_block, write_parameter_block, write_quit_command,
 };
 
 fn synth_header(

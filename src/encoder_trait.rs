@@ -431,24 +431,28 @@ fn unpack_plane(filetype: u32, plane: &[u8]) -> CoreResult<Vec<i32>> {
     match filetype {
         FILETYPE_U8 => Ok(plane.iter().map(|&b| b as i32).collect()),
         FILETYPE_S16HL => {
-            if plane.len() % 2 != 0 {
+            if !plane.len().is_multiple_of(2) {
                 return Err(CoreError::invalid(
                     "oxideav-shorten: s16hl plane length is not a multiple of 2",
                 ));
             }
             Ok(plane
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_be_bytes([c[0], c[1]]) as i32)
                 .collect())
         }
         FILETYPE_S16LH => {
-            if plane.len() % 2 != 0 {
+            if !plane.len().is_multiple_of(2) {
                 return Err(CoreError::invalid(
                     "oxideav-shorten: s16lh plane length is not a multiple of 2",
                 ));
             }
             Ok(plane
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
                 .collect())
         }

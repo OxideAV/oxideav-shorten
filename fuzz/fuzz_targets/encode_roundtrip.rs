@@ -43,8 +43,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_shorten::{
-    decode_stream, encode_stream, encode_stream_lossy, DecodedBlock, EncodeError,
-    ShortenStreamHeader, StreamDecoder,
+    DecodedBlock, EncodeError, ShortenStreamHeader, StreamDecoder, decode_stream, encode_stream,
+    encode_stream_lossy,
 };
 
 const MAX_SAMPLES: usize = 16 * 1024;
@@ -71,7 +71,9 @@ fuzz_target!(|data: &[u8]| {
 
     let n = channels as usize;
     let mut samples: Vec<i32> = rest
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|c| {
             let raw = u32::from_le_bytes([c[0], c[1], c[2], 0]);
             let masked = raw & ((1u32 << depth) - 1);
@@ -118,7 +120,13 @@ fuzz_target!(|data: &[u8]| {
                 .iter()
                 .skip(c)
                 .step_by(n)
-                .map(|&s| if bshift == 0 { s } else { (s >> bshift) << bshift })
+                .map(|&s| {
+                    if bshift == 0 {
+                        s
+                    } else {
+                        (s >> bshift) << bshift
+                    }
+                })
                 .collect()
         })
         .collect();
@@ -127,8 +135,15 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(dec.header, header, "header round-trips");
     assert_eq!(dec.verbatim, verbatim, "verbatim prefix round-trips");
     assert_eq!(dec.channels, expected, "samples round-trip");
-    assert_eq!(dec.stream_proper_len, bytes.len(), "no trailer on encoder output");
-    assert!(dec.quit_padding.is_spec_conformant(), "QUIT padding is spec/05 §4 conformant");
+    assert_eq!(
+        dec.stream_proper_len,
+        bytes.len(),
+        "no trailer on encoder output"
+    );
+    assert!(
+        dec.quit_padding.is_spec_conformant(),
+        "QUIT padding is spec/05 §4 conformant"
+    );
 
     let mut it = StreamDecoder::new(&bytes).expect("streaming path opens");
     let mut planes: Vec<Vec<i32>> = vec![Vec::new(); n];

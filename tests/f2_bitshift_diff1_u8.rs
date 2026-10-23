@@ -27,7 +27,7 @@
 //! verbatim-prefix carry, the `BLOCK_FN_BITSHIFT` state, and the
 //! `(sample << bshift)` emit of `spec/03` §3.7 / `spec/05` §1.4.
 
-use oxideav_shorten::{decode_stream, MAGIC};
+use oxideav_shorten::{MAGIC, decode_stream};
 
 fn pack_bits_msb_first(bits: &[u32]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -83,11 +83,7 @@ fn encode_ulong(value: u32, w: u32) -> Vec<u32> {
 }
 
 fn bits_for(v: u32) -> u32 {
-    if v == 0 {
-        0
-    } else {
-        32 - v.leading_zeros()
-    }
+    if v == 0 { 0 } else { 32 - v.leading_zeros() }
 }
 
 /// F2 parameter block (`spec/04` §3.2 + `spec/05` §6: filetype

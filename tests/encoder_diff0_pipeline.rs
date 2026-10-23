@@ -13,8 +13,8 @@
 //! / §2.1 / §2.2 (MSB-first uvar / svar primitives).
 
 use oxideav_shorten::{
-    decode_stream, encode_envelope_stream, min_energy_for_diff0, write_byte_aligned_prefix,
-    write_diff0_block, write_parameter_block, write_quit_command, BitWriter, ShortenStreamHeader,
+    BitWriter, ShortenStreamHeader, decode_stream, encode_envelope_stream, min_energy_for_diff0,
+    write_byte_aligned_prefix, write_diff0_block, write_parameter_block, write_quit_command,
 };
 
 fn synth_header(
@@ -126,8 +126,8 @@ fn diff0_with_verbatim_prefix_envelope_preserves_payload_and_samples() {
     // the DIFF0 block in before the QUIT terminator.
     let envelope = encode_envelope_stream(&header, &preamble).expect("envelope");
     assert!(envelope.len() > 32); // sanity — at least the preamble fits.
-                                  // Sanity check the envelope-only file decodes to the same header
-                                  // + verbatim with no samples.
+    // Sanity check the envelope-only file decodes to the same header
+    // + verbatim with no samples.
     let env_dec = decode_stream(&envelope).expect("envelope decodes");
     assert_eq!(env_dec.verbatim, preamble);
     assert_eq!(env_dec.channels[0], Vec::<i32>::new());

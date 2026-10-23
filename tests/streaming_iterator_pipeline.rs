@@ -27,7 +27,7 @@
 //! plus the round-7 driver's behaviour — spec PDFs / clean-room
 //! workspace material only.
 
-use oxideav_shorten::{decode_stream, decode_stream_iter, DecodedBlock};
+use oxideav_shorten::{DecodedBlock, decode_stream, decode_stream_iter};
 
 // ---- synthetic-stream builders ----
 
@@ -93,13 +93,7 @@ fn header_param_bits(
     meanblocks: u32,
     skipbytes: u32,
 ) -> Vec<u32> {
-    let bits_for = |v: u32| -> u32 {
-        if v == 0 {
-            0
-        } else {
-            32 - v.leading_zeros()
-        }
-    };
+    let bits_for = |v: u32| -> u32 { if v == 0 { 0 } else { 32 - v.leading_zeros() } };
     let mut bits = Vec::new();
     bits.extend(encode_ulong(filetype, bits_for(filetype)));
     bits.extend(encode_ulong(channels, bits_for(channels)));

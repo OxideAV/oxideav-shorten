@@ -25,8 +25,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_shorten::{
-    decode_stream, detect_shnampsk_trailer, encode_stream, split_off_shnampsk_trailer, Error,
-    ShortenStreamHeader, StreamDecoder, SEEK_MAGIC, SHNAMPSK_SIGNATURE, TRAILER_TAIL_LEN,
+    Error, SEEK_MAGIC, SHNAMPSK_SIGNATURE, ShortenStreamHeader, StreamDecoder, TRAILER_TAIL_LEN,
+    decode_stream, detect_shnampsk_trailer, encode_stream, split_off_shnampsk_trailer,
 };
 
 fn check_raw(bytes: &[u8]) {
@@ -99,7 +99,10 @@ fuzz_target!(|data: &[u8]| {
     let t = detect_shnampsk_trailer(&file)
         .expect("well-formed composite detects")
         .expect("well-formed composite has a trailer");
-    assert_eq!(t.sidecar_start, start, "top-down boundary equals the QUIT boundary");
+    assert_eq!(
+        t.sidecar_start, start,
+        "top-down boundary equals the QUIT boundary"
+    );
     assert_eq!(t.sidecar_len, sidecar_len);
     assert_eq!(t.seek_format_version, seek_version);
 
@@ -108,7 +111,11 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(with_trailer.stream_proper_len, start);
     assert_eq!(with_trailer.channels, clean.channels);
     let mut it = StreamDecoder::new(&file).expect("streaming opens");
-    while it.next_block().expect("streaming decodes past-trailer stream").is_some() {}
+    while it
+        .next_block()
+        .expect("streaming decodes past-trailer stream")
+        .is_some()
+    {}
     assert_eq!(it.trailer_len(), Some(sidecar_len as usize));
 
     let (s, side) = split_off_shnampsk_trailer(&file).expect("split");

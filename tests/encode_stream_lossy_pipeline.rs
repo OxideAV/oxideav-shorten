@@ -26,7 +26,7 @@
 //! * `docs/audio/shorten/spec/05-state-and-quirks.md` §1.4 (the carry +
 //!   mean estimator consume the pre-shift / quantised samples).
 
-use oxideav_shorten::{decode_stream, encode_stream, encode_stream_lossy, ShortenStreamHeader};
+use oxideav_shorten::{ShortenStreamHeader, decode_stream, encode_stream, encode_stream_lossy};
 
 fn header(channels: u32, blocksize: u32, maxlpcorder: u32, meanblocks: u32) -> ShortenStreamHeader {
     ShortenStreamHeader {

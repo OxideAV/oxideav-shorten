@@ -31,9 +31,9 @@
 //!   `H_meanblocks = 0` so `μ_chan = 0` throughout).
 
 use oxideav_shorten::{
-    decode_stream, select_predictor, select_predictor_auto, write_byte_aligned_prefix,
-    write_parameter_block, write_quit_command, write_selected_block, BitWriter, ChannelCarry,
-    Choice, ShortenStreamHeader,
+    BitWriter, ChannelCarry, Choice, ShortenStreamHeader, decode_stream, select_predictor,
+    select_predictor_auto, write_byte_aligned_prefix, write_parameter_block, write_quit_command,
+    write_selected_block,
 };
 
 fn synth_header(channels: u32, blocksize: u32, maxlpcorder: u32) -> ShortenStreamHeader {

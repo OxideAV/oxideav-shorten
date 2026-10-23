@@ -17,8 +17,8 @@
 //!   padding is `spec/05` §4-conformant.
 
 use oxideav_shorten::{
-    decode_stream, encode_stream, encode_stream_lossy, DecodedBlock, ShortenStreamHeader,
-    StreamDecoder,
+    DecodedBlock, ShortenStreamHeader, StreamDecoder, decode_stream, encode_stream,
+    encode_stream_lossy,
 };
 
 /// Deterministic xorshift64* PRNG (same shape as the robustness

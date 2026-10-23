@@ -23,7 +23,7 @@
 //!    `bits_consumed_after_v` count as the writer reports.
 
 use libfuzzer_sys::fuzz_target;
-use oxideav_shorten::{parse_stream_header, write_stream_header, Error, CARRY_LEN_FLOOR};
+use oxideav_shorten::{CARRY_LEN_FLOOR, Error, parse_stream_header, write_stream_header};
 
 fuzz_target!(|data: &[u8]| {
     let parsed = match parse_stream_header(data) {
@@ -51,7 +51,10 @@ fuzz_target!(|data: &[u8]| {
     let mut out = Vec::new();
     let bits = write_stream_header(&mut out, &h).expect("accepted header re-serialises");
     let again = parse_stream_header(&out).expect("re-serialised header parses");
-    assert_eq!(again.header, h, "header round-trips through write_stream_header");
+    assert_eq!(
+        again.header, h,
+        "header round-trips through write_stream_header"
+    );
     assert_eq!(
         again.bits_consumed_after_v, bits,
         "writer-reported bit count matches the parser's"

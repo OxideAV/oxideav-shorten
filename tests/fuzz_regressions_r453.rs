@@ -7,9 +7,9 @@
 
 use oxideav_core::{CodecId, CodecParameters, Error as CoreError, Frame, Packet, TimeBase};
 use oxideav_shorten::{
-    encode_stream, make_decoder, make_streaming_decoder, parse_stream_header,
-    write_byte_aligned_prefix, write_parameter_block, write_quit_command, write_stream_header,
-    write_zero_block, BitWriter, EncodeError, ShortenStreamHeader,
+    BitWriter, EncodeError, ShortenStreamHeader, encode_stream, make_decoder,
+    make_streaming_decoder, parse_stream_header, write_byte_aligned_prefix, write_parameter_block,
+    write_quit_command, write_stream_header, write_zero_block,
 };
 
 /// `parse_header` fuzz target, round 453: a header field with bit 31

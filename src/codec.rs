@@ -142,15 +142,15 @@ use oxideav_core::{
 
 use crate::bitreader::{BitReader, BytePadding};
 use crate::block::{
-    read_bitshift_payload, read_blocksize_payload, read_function_code, read_verbatim_payload,
-    FunctionCode,
+    FunctionCode, read_bitshift_payload, read_blocksize_payload, read_function_code,
+    read_verbatim_payload,
 };
 use crate::decode_stream;
 use crate::driver::MAX_COMMANDS;
 use crate::error::Error as ShortenError;
-use crate::header::{parse_stream_header, ShortenStreamHeader, MIN_HEADER_BYTES};
+use crate::header::{MIN_HEADER_BYTES, ShortenStreamHeader, parse_stream_header};
 use crate::predictor::{
-    decode_diff_block, decode_qlpc_block, fill_zero_block, ChannelCarry, MeanEstimator, PolyOrder,
+    ChannelCarry, MeanEstimator, PolyOrder, decode_diff_block, decode_qlpc_block, fill_zero_block,
 };
 
 /// String form of the codec id this crate registers under.
@@ -1294,13 +1294,7 @@ mod tests {
         meanblocks: u32,
         skipbytes: u32,
     ) -> Vec<u32> {
-        let bits_for = |v: u32| -> u32 {
-            if v == 0 {
-                0
-            } else {
-                32 - v.leading_zeros()
-            }
-        };
+        let bits_for = |v: u32| -> u32 { if v == 0 { 0 } else { 32 - v.leading_zeros() } };
         let mut bits = Vec::new();
         bits.extend(encode_ulong(filetype, bits_for(filetype)));
         bits.extend(encode_ulong(channels, bits_for(channels)));
@@ -1820,10 +1814,10 @@ mod tests {
         // Round 0: DIFF1 ch0, DIFF0 ch1
         append_diff_block(&mut bits, 1, 3, &[1, 1, 1, 1]); // ch0 DIFF1
         append_diff_block(&mut bits, 0, 4, &[10, 20, 30, 40]); // ch1 DIFF0
-                                                               // Round 1: DIFF0 ch0, DIFF0 ch1
+        // Round 1: DIFF0 ch0, DIFF0 ch1
         append_diff_block(&mut bits, 0, 4, &[3, 4, 5, 6]); // ch0 DIFF0
         append_diff_block(&mut bits, 0, 4, &[11, 22, 33, 44]); // ch1 DIFF0
-                                                               // BLOCKSIZE override (channel-round boundary), 4 -> 2
+        // BLOCKSIZE override (channel-round boundary), 4 -> 2
         bits.extend(encode_uvar(5, FNSIZE));
         bits.extend(encode_ulong(2, 2));
         // Round 2 (smaller bs): DIFF0 ch0, ZERO ch1 (mean-driven)
@@ -1846,7 +1840,7 @@ mod tests {
                     // Decode each plane back to i32 per the s16lh layout.
                     for (ci, plane) in a.data.iter().enumerate() {
                         assert_eq!(plane.len() % 2, 0);
-                        for chunk in plane.chunks_exact(2) {
+                        for chunk in plane.as_chunks::<2>().0 {
                             let s = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
                             per_channel[ci].push(s);
                         }
@@ -2087,8 +2081,9 @@ mod tests {
         let mut ctx = oxideav_core::RuntimeContext::new();
         crate::register(&mut ctx);
         assert!(ctx.codecs.has_decoder(&CodecId::new(CODEC_ID_STR)));
-        assert!(ctx
-            .codecs
-            .has_decoder(&CodecId::new(STREAMING_CODEC_ID_STR)));
+        assert!(
+            ctx.codecs
+                .has_decoder(&CodecId::new(STREAMING_CODEC_ID_STR))
+        );
     }
 }

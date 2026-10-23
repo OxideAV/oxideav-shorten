@@ -18,9 +18,9 @@
 //! quit dispatch.
 
 use oxideav_shorten::{
-    decode_stream, encode_envelope_stream, parse_stream_header, write_byte_aligned_prefix,
-    write_parameter_block, write_quit_command, write_stream_header, write_verbatim_block,
-    BitWriter, EncodeError, ShortenStreamHeader,
+    BitWriter, EncodeError, ShortenStreamHeader, decode_stream, encode_envelope_stream,
+    parse_stream_header, write_byte_aligned_prefix, write_parameter_block, write_quit_command,
+    write_stream_header, write_verbatim_block,
 };
 
 fn synth_header(

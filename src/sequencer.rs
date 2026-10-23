@@ -120,9 +120,9 @@
 use crate::bitwriter::BitWriter;
 use crate::block::FNSIZE;
 use crate::encoder::{
+    EncodeResult, FN_DIFF0, FN_DIFF1, FN_DIFF2, FN_DIFF3, FN_QLPC, FN_ZERO, MAX_QLPC_ORDER,
     optimal_energy_for_residuals_wide, qlpc_residuals, residual_bits_at_energy, write_diff0_block,
     write_diff1_block, write_diff2_block, write_diff3_block, write_qlpc_block, write_zero_block,
-    EncodeResult, FN_DIFF0, FN_DIFF1, FN_DIFF2, FN_DIFF3, FN_QLPC, FN_ZERO, MAX_QLPC_ORDER,
 };
 use crate::predictor::{ChannelCarry, ENERGYSIZE, LPCQSIZE, LPCQUANT};
 
@@ -774,10 +774,10 @@ pub fn evaluate_candidates_with_qlpc(
     if let Some(c) = evaluate_diff3(samples, carry) {
         out.push(c);
     }
-    if let Some(coefs) = qlpc_candidate {
-        if let Some(c) = evaluate_qlpc(samples, coefs, carry) {
-            out.push(c);
-        }
+    if let Some(coefs) = qlpc_candidate
+        && let Some(c) = evaluate_qlpc(samples, coefs, carry)
+    {
+        out.push(c);
     }
     out
 }

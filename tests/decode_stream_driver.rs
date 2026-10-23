@@ -20,7 +20,7 @@
 //! * `spec/03` §3.10 — verbatim prefix collection.
 //! * `spec/03` §3.8 — `BLOCK_FN_QUIT` termination.
 
-use oxideav_shorten::{decode_stream, FNSIZE, LPCQSIZE, LPCQUANT, MAGIC};
+use oxideav_shorten::{FNSIZE, LPCQSIZE, LPCQUANT, MAGIC, decode_stream};
 
 fn pack_bits_msb_first(bits: &[u32]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -77,11 +77,7 @@ fn encode_ulong(value: u32, w: u32) -> Vec<u32> {
 }
 
 fn bits_for(v: u32) -> u32 {
-    if v == 0 {
-        0
-    } else {
-        32 - v.leading_zeros()
-    }
+    if v == 0 { 0 } else { 32 - v.leading_zeros() }
 }
 
 fn header_param_bits(

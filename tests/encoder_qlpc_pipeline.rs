@@ -18,9 +18,9 @@
 //! `spec/02` §4.3 / §4.4 (`LPCQSIZE = 2`, `LPCQUANT = 2`).
 
 use oxideav_shorten::{
-    decode_stream, min_energy_for_qlpc, qlpc_residuals, write_byte_aligned_prefix,
-    write_parameter_block, write_qlpc_block, write_quit_command, write_verbatim_block, BitWriter,
-    ChannelCarry, ShortenStreamHeader,
+    BitWriter, ChannelCarry, ShortenStreamHeader, decode_stream, min_energy_for_qlpc,
+    qlpc_residuals, write_byte_aligned_prefix, write_parameter_block, write_qlpc_block,
+    write_quit_command, write_verbatim_block,
 };
 
 fn synth_header(

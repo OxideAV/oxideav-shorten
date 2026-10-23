@@ -22,8 +22,8 @@
 //! §3.6/§3.7/§3.8 + `spec/05` §1 + §1.4 + §2.
 
 use oxideav_shorten::{
+    ENERGYSIZE, FNSIZE, FunctionCode, SEEK_MAGIC, SHNAMPSK_SIGNATURE, TRAILER_TAIL_LEN,
     decode_stream, decode_stream_iter, detect_shnampsk_trailer, split_off_shnampsk_trailer,
-    FunctionCode, ENERGYSIZE, FNSIZE, SEEK_MAGIC, SHNAMPSK_SIGNATURE, TRAILER_TAIL_LEN,
 };
 
 // ---- synthetic-stream builders (mirror those used elsewhere) ----
@@ -90,13 +90,7 @@ fn header_param_bits(
     meanblocks: u32,
     skipbytes: u32,
 ) -> Vec<u32> {
-    let bits_for = |v: u32| -> u32 {
-        if v == 0 {
-            0
-        } else {
-            32 - v.leading_zeros()
-        }
-    };
+    let bits_for = |v: u32| -> u32 { if v == 0 { 0 } else { 32 - v.leading_zeros() } };
     let mut bits = Vec::new();
     bits.extend(encode_ulong(filetype, bits_for(filetype)));
     bits.extend(encode_ulong(channels, bits_for(channels)));

@@ -28,8 +28,8 @@
 //! cursor).
 
 use oxideav_shorten::{
-    decode_diff_block, parse_stream_header, read_function_code, BitReader, ChannelCarry,
-    FunctionCode, MeanEstimator, PolyOrder, ENERGYSIZE, FNSIZE, MAGIC,
+    BitReader, ChannelCarry, ENERGYSIZE, FNSIZE, FunctionCode, MAGIC, MeanEstimator, PolyOrder,
+    decode_diff_block, parse_stream_header, read_function_code,
 };
 
 fn pack_bits_msb_first(bits: &[u32]) -> Vec<u8> {
@@ -160,7 +160,7 @@ fn header_then_diff1_blocks_round_trip_with_channel_cursor() {
         .collect();
     let mut cursor: usize = 0;
     let bs = parsed.header.blocksize.min(4); // override locally to 4
-                                             // for test fixtures.
+    // for test fixtures.
 
     // We override `bs` here rather than emitting a BLOCK_FN_BLOCKSIZE
     // command (that command's payload-state mutation isn't wired up

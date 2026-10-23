@@ -32,7 +32,7 @@ use oxideav_core::{
     CodecId, CodecParameters, CodecRegistry, Error as CoreError, Frame, Packet, TimeBase,
 };
 use oxideav_shorten::{
-    decode_stream, register_codecs, ShortenDecoder, CODEC_ID_STR, FILETYPE_S16LH, FNSIZE, MAGIC,
+    CODEC_ID_STR, FILETYPE_S16LH, FNSIZE, MAGIC, ShortenDecoder, decode_stream, register_codecs,
 };
 
 // ---- bit-packer + uvar/svar/ulong builders mirroring driver.rs ----
@@ -92,11 +92,7 @@ fn encode_ulong(value: u32, w: u32) -> Vec<u32> {
 }
 
 fn bits_for(v: u32) -> u32 {
-    if v == 0 {
-        0
-    } else {
-        32 - v.leading_zeros()
-    }
+    if v == 0 { 0 } else { 32 - v.leading_zeros() }
 }
 
 fn header_param_bits(

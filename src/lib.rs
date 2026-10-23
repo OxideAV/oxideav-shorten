@@ -297,54 +297,54 @@ mod sidecar;
 mod stream_iter;
 
 pub use crate::bitreader::{BitReader, BytePadding, ULONGSIZE};
-pub use crate::bitwriter::{natural_ulong_width, BitWriter};
+pub use crate::bitwriter::{BitWriter, natural_ulong_width};
 pub use crate::block::{
-    read_bitshift_payload, read_blocksize_payload, read_function_code, read_verbatim_payload,
-    FunctionCode, VerbatimChunk, BITSHIFTSIZE, BITSHIFT_MAX, BLOCKSIZE_MAX, FNSIZE,
-    VERBATIM_BYTE_SIZE, VERBATIM_CHUNK_SIZE, VERBATIM_MAX_LEN,
+    BITSHIFT_MAX, BITSHIFTSIZE, BLOCKSIZE_MAX, FNSIZE, FunctionCode, VERBATIM_BYTE_SIZE,
+    VERBATIM_CHUNK_SIZE, VERBATIM_MAX_LEN, VerbatimChunk, read_bitshift_payload,
+    read_blocksize_payload, read_function_code, read_verbatim_payload,
 };
 #[cfg(feature = "registry")]
 pub use crate::codec::{
-    make_decoder, make_streaming_decoder, register_codecs, register_streaming_codecs,
-    ShortenDecoder, ShortenStreamingDecoder, CODEC_ID_STR, FILETYPE_S16HL, FILETYPE_S16LH,
-    FILETYPE_U8, STREAMING_CODEC_ID_STR,
+    CODEC_ID_STR, FILETYPE_S16HL, FILETYPE_S16LH, FILETYPE_U8, STREAMING_CODEC_ID_STR,
+    ShortenDecoder, ShortenStreamingDecoder, make_decoder, make_streaming_decoder, register_codecs,
+    register_streaming_codecs,
 };
-pub use crate::driver::{decode_stream, DecodedStream, MAX_COMMANDS};
+pub use crate::driver::{DecodedStream, MAX_COMMANDS, decode_stream};
 pub use crate::encode_driver::{encode_stream, encode_stream_lossy};
 pub use crate::encoder::{
-    encode_envelope_stream, min_energy_for_diff0, min_energy_for_diff1, min_energy_for_diff2,
-    min_energy_for_diff3, min_energy_for_qlpc, optimal_energy_for_diff0, optimal_energy_for_diff1,
-    optimal_energy_for_diff2, optimal_energy_for_diff3, optimal_energy_for_qlpc,
-    optimal_energy_for_residuals, optimal_energy_for_residuals_wide, qlpc_residuals,
-    residual_bits_at_energy, write_bitshift_command, write_blocksize_command,
+    ENCODER_VERSION, EncodeError, EncodeResult, FN_BITSHIFT, FN_BLOCKSIZE, FN_DIFF0, FN_DIFF1,
+    FN_DIFF2, FN_DIFF3, FN_QLPC, FN_QUIT, FN_VERBATIM, FN_ZERO, MAX_ENERGY, MAX_NATURAL_ENERGY,
+    MAX_QLPC_ORDER, encode_envelope_stream, min_energy_for_diff0, min_energy_for_diff1,
+    min_energy_for_diff2, min_energy_for_diff3, min_energy_for_qlpc, optimal_energy_for_diff0,
+    optimal_energy_for_diff1, optimal_energy_for_diff2, optimal_energy_for_diff3,
+    optimal_energy_for_qlpc, optimal_energy_for_residuals, optimal_energy_for_residuals_wide,
+    qlpc_residuals, residual_bits_at_energy, write_bitshift_command, write_blocksize_command,
     write_byte_aligned_prefix, write_diff0_block, write_diff1_block, write_diff2_block,
     write_diff3_block, write_parameter_block, write_qlpc_block, write_quit_command,
-    write_stream_header, write_verbatim_block, write_zero_block, EncodeError, EncodeResult,
-    ENCODER_VERSION, FN_BITSHIFT, FN_BLOCKSIZE, FN_DIFF0, FN_DIFF1, FN_DIFF2, FN_DIFF3, FN_QLPC,
-    FN_QUIT, FN_VERBATIM, FN_ZERO, MAX_ENERGY, MAX_NATURAL_ENERGY, MAX_QLPC_ORDER,
+    write_stream_header, write_verbatim_block, write_zero_block,
 };
 #[cfg(feature = "registry")]
 pub use crate::encoder_trait::{
-    make_encoder, register_encoder, ShortenEncoder, DEFAULT_BLOCKSIZE, ENCODER_HEADER_VERSION,
+    DEFAULT_BLOCKSIZE, ENCODER_HEADER_VERSION, ShortenEncoder, make_encoder, register_encoder,
 };
 pub use crate::error::{Error, Result};
 pub use crate::header::{
-    parse_stream_header, Filetype, ParsedHeader, ShortenStreamHeader, MAGIC, MIN_HEADER_BYTES,
+    Filetype, MAGIC, MIN_HEADER_BYTES, ParsedHeader, ShortenStreamHeader, parse_stream_header,
 };
 pub use crate::predictor::{
-    decode_diff_block, decode_qlpc_block, fill_zero_block, ChannelCarry, MeanEstimator, PolyOrder,
-    CARRY_LEN_FLOOR, ENERGYSIZE, LPCQSIZE, LPCQUANT,
+    CARRY_LEN_FLOOR, ChannelCarry, ENERGYSIZE, LPCQSIZE, LPCQUANT, MeanEstimator, PolyOrder,
+    decode_diff_block, decode_qlpc_block, fill_zero_block,
 };
 pub use crate::sequencer::{
-    derive_qlpc_candidate, derive_qlpc_coefs, evaluate_candidates, evaluate_candidates_auto,
-    evaluate_candidates_with_qlpc, select_predictor, select_predictor_auto,
-    select_predictor_with_qlpc, write_selected_block, Choice, MAX_QLPC_AUTO_ORDER,
+    Choice, MAX_QLPC_AUTO_ORDER, derive_qlpc_candidate, derive_qlpc_coefs, evaluate_candidates,
+    evaluate_candidates_auto, evaluate_candidates_with_qlpc, select_predictor,
+    select_predictor_auto, select_predictor_with_qlpc, write_selected_block,
 };
 pub use crate::sidecar::{
-    detect_shnampsk_trailer, split_off_shnampsk_trailer, ShnampskTrailer, MIN_SIDECAR_LEN,
-    SEEK_MAGIC, SEEK_VERSION_OFFSET, SHNAMPSK_SIGNATURE, SIDECAR_LEN_CAP, TRAILER_TAIL_LEN,
+    MIN_SIDECAR_LEN, SEEK_MAGIC, SEEK_VERSION_OFFSET, SHNAMPSK_SIGNATURE, SIDECAR_LEN_CAP,
+    ShnampskTrailer, TRAILER_TAIL_LEN, detect_shnampsk_trailer, split_off_shnampsk_trailer,
 };
-pub use crate::stream_iter::{decode_stream_iter, DecodedBlock, StreamDecoder};
+pub use crate::stream_iter::{DecodedBlock, StreamDecoder, decode_stream_iter};
 
 /// Install the Shorten decoder factories into the runtime context's
 /// codec registry. Round 8 (paired with the round-7 whole-stream

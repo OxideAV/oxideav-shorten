@@ -35,8 +35,8 @@ use oxideav_core::{
     CodecId, CodecParameters, Decoder, Error as CoreError, Frame, Packet, TimeBase,
 };
 use oxideav_shorten::{
-    decode_stream, encode_stream, make_decoder, make_streaming_decoder, ShortenStreamHeader,
-    CODEC_ID_STR, FILETYPE_S16LH,
+    CODEC_ID_STR, FILETYPE_S16LH, ShortenStreamHeader, decode_stream, encode_stream, make_decoder,
+    make_streaming_decoder,
 };
 
 const MAX_FRAMES: usize = 1 << 20;
@@ -45,26 +45,31 @@ fn feed(dec: &mut Box<dyn Decoder>, bytes: &[u8], chunk: usize) -> Result<Vec<Ve
     let tb = TimeBase::new(1, 44_100);
     let mut planes: Vec<Vec<u8>> = Vec::new();
     let mut frames = 0usize;
-    let mut drain = |dec: &mut Box<dyn Decoder>, planes: &mut Vec<Vec<u8>>| -> Result<(), CoreError> {
-        loop {
-            match dec.receive_frame() {
-                Ok(Frame::Audio(a)) => {
-                    frames += 1;
-                    assert!(frames <= MAX_FRAMES, "frame flood");
-                    if planes.is_empty() {
-                        planes.resize(a.data.len(), Vec::new());
+    let mut drain =
+        |dec: &mut Box<dyn Decoder>, planes: &mut Vec<Vec<u8>>| -> Result<(), CoreError> {
+            loop {
+                match dec.receive_frame() {
+                    Ok(Frame::Audio(a)) => {
+                        frames += 1;
+                        assert!(frames <= MAX_FRAMES, "frame flood");
+                        if planes.is_empty() {
+                            planes.resize(a.data.len(), Vec::new());
+                        }
+                        assert_eq!(
+                            planes.len(),
+                            a.data.len(),
+                            "channel count changed mid-stream"
+                        );
+                        for (p, d) in planes.iter_mut().zip(a.data.iter()) {
+                            p.extend_from_slice(d);
+                        }
                     }
-                    assert_eq!(planes.len(), a.data.len(), "channel count changed mid-stream");
-                    for (p, d) in planes.iter_mut().zip(a.data.iter()) {
-                        p.extend_from_slice(d);
-                    }
+                    Ok(other) => panic!("non-audio frame {other:?}"),
+                    Err(CoreError::NeedMore) | Err(CoreError::Eof) => return Ok(()),
+                    Err(e) => return Err(e),
                 }
-                Ok(other) => panic!("non-audio frame {other:?}"),
-                Err(CoreError::NeedMore) | Err(CoreError::Eof) => return Ok(()),
-                Err(e) => return Err(e),
             }
-        }
-    };
+        };
     let chunk = chunk.max(1);
     for (i, piece) in bytes.chunks(chunk).enumerate() {
         dec.send_packet(&Packet::new(0, tb, piece.to_vec()).with_pts(i as i64))?;
@@ -100,7 +105,9 @@ fuzz_target!(|data: &[u8]| {
         let blocksize = 1 + (data[1] % 64) as u32;
         let n = channels as usize;
         let mut samples: Vec<i32> = data[3..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
             .collect();
         samples.truncate(samples.len() - samples.len() % n);
@@ -142,7 +149,11 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(b, expected, "streaming wrapper planes");
     } else {
         // Raw mode: both wrappers must agree on success vs failure.
-        assert_eq!(a.is_ok(), b.is_ok(), "wrappers disagree on validity: {a:?} vs {b:?}");
+        assert_eq!(
+            a.is_ok(),
+            b.is_ok(),
+            "wrappers disagree on validity: {a:?} vs {b:?}"
+        );
         if let (Ok(a), Ok(b)) = (a, b) {
             assert_eq!(a, b, "wrappers disagree on planes");
         }
