@@ -296,12 +296,20 @@ mod sequencer;
 mod sidecar;
 mod stream_iter;
 
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use crate::bitreader::{BitReader, BytePadding, ULONGSIZE};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use crate::bitwriter::{BitWriter, natural_ulong_width};
 pub use crate::block::{
     BITSHIFT_MAX, BITSHIFTSIZE, BLOCKSIZE_MAX, FNSIZE, FunctionCode, VERBATIM_BYTE_SIZE,
-    VERBATIM_CHUNK_SIZE, VERBATIM_MAX_LEN, VerbatimChunk, read_bitshift_payload,
-    read_blocksize_payload, read_function_code, read_verbatim_payload,
+    VERBATIM_CHUNK_SIZE, VERBATIM_MAX_LEN, VerbatimChunk,
+};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub use crate::block::{
+    read_bitshift_payload, read_blocksize_payload, read_function_code, read_verbatim_payload,
 };
 #[cfg(feature = "registry")]
 pub use crate::codec::{
@@ -314,11 +322,7 @@ pub use crate::encode_driver::{encode_stream, encode_stream_lossy};
 pub use crate::encoder::{
     ENCODER_VERSION, EncodeError, EncodeResult, FN_BITSHIFT, FN_BLOCKSIZE, FN_DIFF0, FN_DIFF1,
     FN_DIFF2, FN_DIFF3, FN_QLPC, FN_QUIT, FN_VERBATIM, FN_ZERO, MAX_ENERGY, MAX_NATURAL_ENERGY,
-    MAX_QLPC_ORDER, encode_envelope_stream, min_energy_for_diff0, min_energy_for_diff1,
-    min_energy_for_diff2, min_energy_for_diff3, min_energy_for_qlpc, optimal_energy_for_diff0,
-    optimal_energy_for_diff1, optimal_energy_for_diff2, optimal_energy_for_diff3,
-    optimal_energy_for_qlpc, optimal_energy_for_residuals, optimal_energy_for_residuals_wide,
-    qlpc_residuals, residual_bits_at_energy, write_bitshift_command, write_blocksize_command,
+    MAX_QLPC_ORDER, encode_envelope_stream, write_bitshift_command, write_blocksize_command,
     write_byte_aligned_prefix, write_diff0_block, write_diff1_block, write_diff2_block,
     write_diff3_block, write_parameter_block, write_qlpc_block, write_quit_command,
     write_stream_header, write_verbatim_block, write_zero_block,
@@ -327,13 +331,24 @@ pub use crate::encoder::{
 pub use crate::encoder_trait::{
     DEFAULT_BLOCKSIZE, ENCODER_HEADER_VERSION, ShortenEncoder, make_encoder, register_encoder,
 };
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub use crate::encoder::{
+    min_energy_for_diff0, min_energy_for_diff1, min_energy_for_diff2, min_energy_for_diff3,
+    min_energy_for_qlpc, optimal_energy_for_diff0, optimal_energy_for_diff1,
+    optimal_energy_for_diff2, optimal_energy_for_diff3, optimal_energy_for_qlpc,
+    optimal_energy_for_residuals, optimal_energy_for_residuals_wide, qlpc_residuals,
+    residual_bits_at_energy,
+};
 pub use crate::error::{Error, Result};
 pub use crate::header::{
     Filetype, MAGIC, MIN_HEADER_BYTES, ParsedHeader, ShortenStreamHeader, parse_stream_header,
 };
+pub use crate::predictor::{CARRY_LEN_FLOOR, ENERGYSIZE, LPCQSIZE, LPCQUANT, PolyOrder};
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
 pub use crate::predictor::{
-    CARRY_LEN_FLOOR, ChannelCarry, ENERGYSIZE, LPCQSIZE, LPCQUANT, MeanEstimator, PolyOrder,
-    decode_diff_block, decode_qlpc_block, fill_zero_block,
+    ChannelCarry, MeanEstimator, decode_diff_block, decode_qlpc_block, fill_zero_block,
 };
 pub use crate::sequencer::{
     Choice, MAX_QLPC_AUTO_ORDER, derive_qlpc_candidate, derive_qlpc_coefs, evaluate_candidates,

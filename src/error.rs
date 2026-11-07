@@ -6,6 +6,7 @@
 
 /// Errors produced by the Shorten file-header parser.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The stream is missing the four-byte `ajkg` magic at offset 0
     /// or is shorter than five bytes total. Per `spec/01` §1 the

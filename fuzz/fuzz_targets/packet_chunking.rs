@@ -111,15 +111,14 @@ fuzz_target!(|data: &[u8]| {
             .map(|c| i16::from_le_bytes([c[0], c[1]]) as i32)
             .collect();
         samples.truncate(samples.len() - samples.len() % n);
-        let header = ShortenStreamHeader {
-            version: 2,
-            filetype: FILETYPE_S16LH,
-            channels,
-            blocksize,
-            maxlpcorder: (data[1] % 4) as u32,
-            meanblocks: (data[1] % 3) as u32,
-            skipbytes: 0,
-        };
+        let header = ShortenStreamHeader::default()
+            .with_version(2)
+            .with_filetype(FILETYPE_S16LH)
+            .with_channels(channels)
+            .with_blocksize(blocksize)
+            .with_maxlpcorder((data[1] % 4) as u32)
+            .with_meanblocks((data[1] % 3) as u32)
+            .with_skipbytes(0);
         params.channels = Some(channels as u16);
         let bytes = encode_stream(&header, &samples, &[]).expect("valid stream encodes");
         let dec = decode_stream(&bytes).expect("valid stream decodes");

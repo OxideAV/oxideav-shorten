@@ -30,15 +30,14 @@ fn synth_header(
     meanblocks: u32,
     skipbytes: u32,
 ) -> ShortenStreamHeader {
-    ShortenStreamHeader {
-        version,
-        filetype,
-        channels,
-        blocksize,
-        maxlpcorder,
-        meanblocks,
-        skipbytes,
-    }
+    ShortenStreamHeader::default()
+        .with_version(version)
+        .with_filetype(filetype)
+        .with_channels(channels)
+        .with_blocksize(blocksize)
+        .with_maxlpcorder(maxlpcorder)
+        .with_meanblocks(meanblocks)
+        .with_skipbytes(skipbytes)
 }
 
 /// Compute the per-sample DIFF1 first-difference residual stream for

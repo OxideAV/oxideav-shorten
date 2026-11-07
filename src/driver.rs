@@ -80,7 +80,8 @@ use crate::predictor::{
 pub const MAX_COMMANDS: u64 = 1_000_000_000;
 
 /// The fully-decoded output of [`decode_stream`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct DecodedStream {
     /// The parsed stream header.
     pub header: ShortenStreamHeader,
@@ -121,6 +122,43 @@ pub struct DecodedStream {
     /// [`BytePadding::is_spec_conformant`]; for every encoder-produced
     /// stream this returns `true`.
     pub quit_padding: BytePadding,
+}
+
+impl DecodedStream {
+    /// Set `header`.
+    #[must_use]
+    pub fn with_header(mut self, v: ShortenStreamHeader) -> Self {
+        self.header = v;
+        self
+    }
+
+    /// Set `verbatim`.
+    #[must_use]
+    pub fn with_verbatim(mut self, v: Vec<u8>) -> Self {
+        self.verbatim = v;
+        self
+    }
+
+    /// Set `channels`.
+    #[must_use]
+    pub fn with_channels(mut self, v: Vec<Vec<i32>>) -> Self {
+        self.channels = v;
+        self
+    }
+
+    /// Set `stream_proper_len`.
+    #[must_use]
+    pub fn with_stream_proper_len(mut self, v: usize) -> Self {
+        self.stream_proper_len = v;
+        self
+    }
+
+    /// Set `quit_padding`.
+    #[must_use]
+    pub fn with_quit_padding(mut self, v: BytePadding) -> Self {
+        self.quit_padding = v;
+        self
+    }
 }
 
 impl DecodedStream {

@@ -7,8 +7,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Changed
+- API hygiene: `Error`, `EncodeError`, `DecodedStream`, `ShortenStreamHeader`, `ParsedHeader` and `ShnampskTrailer` are now `#[non_exhaustive]`. `PolyOrder`, `Choice` and `DecodedBlock` stay exhaustive (fixed by the TR.156 command set). The bit reader / writer, block-payload readers, predictor kernels (`ChannelCarry`, `MeanEstimator`, `decode_diff_block`, `decode_qlpc_block`, `fill_zero_block`) and the encoder energy / residual helpers are now `#[doc(hidden)]` re-exports.
 
 - edition 2024, MSRV 1.95
+
+### Added
+
+- `Default` and `with_<field>` setters on `DecodedStream`, `ShortenStreamHeader`, `ParsedHeader` and `ShnampskTrailer`; tests and fuzz targets build them through it.
 
 ## [0.0.4](https://github.com/OxideAV/oxideav-shorten/compare/v0.0.3...v0.0.4) - 2026-08-30
 

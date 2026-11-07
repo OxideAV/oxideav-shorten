@@ -52,15 +52,14 @@ fn write_uvar_width_32_no_shift_overflow() {
 /// undecodable stream.
 #[test]
 fn encode_stream_rejects_version_1() {
-    let header = ShortenStreamHeader {
-        version: 1,
-        filetype: 5,
-        channels: 1,
-        blocksize: 4,
-        maxlpcorder: 0,
-        meanblocks: 0,
-        skipbytes: 0,
-    };
+    let header = ShortenStreamHeader::default()
+        .with_version(1)
+        .with_filetype(5)
+        .with_channels(1)
+        .with_blocksize(4)
+        .with_maxlpcorder(0)
+        .with_meanblocks(0)
+        .with_skipbytes(0);
     assert_eq!(
         encode_stream(&header, &[1, 2, 3, 4], &[]).err(),
         Some(EncodeError::UnsupportedVersion(1))
@@ -75,15 +74,14 @@ fn encode_stream_rejects_version_1() {
 /// wrappers now surface an error from `flush()`.
 #[test]
 fn flush_on_truncated_stream_errors_instead_of_silent_eof() {
-    let header = ShortenStreamHeader {
-        version: 2,
-        filetype: 5,
-        channels: 1,
-        blocksize: 8,
-        maxlpcorder: 0,
-        meanblocks: 0,
-        skipbytes: 0,
-    };
+    let header = ShortenStreamHeader::default()
+        .with_version(2)
+        .with_filetype(5)
+        .with_channels(1)
+        .with_blocksize(8)
+        .with_maxlpcorder(0)
+        .with_meanblocks(0)
+        .with_skipbytes(0);
     let samples: Vec<i32> = (0..64).map(|t| (t * 37 % 500) - 250).collect();
     let bytes = encode_stream(&header, &samples, &[]).expect("encodes");
     let truncated = &bytes[..bytes.len() - 3];
@@ -154,15 +152,14 @@ fn flush_on_truncated_stream_errors_instead_of_silent_eof() {
 fn streaming_wrapper_rejects_over_cap_header_resources() {
     // A v2 header claiming 2^21 channels, otherwise minimal. Built
     // with the crate's own writer so the test tracks the wire format.
-    let header = ShortenStreamHeader {
-        version: 2,
-        filetype: 5,
-        channels: 1 << 21,
-        blocksize: 1,
-        maxlpcorder: 0,
-        meanblocks: 0,
-        skipbytes: 0,
-    };
+    let header = ShortenStreamHeader::default()
+        .with_version(2)
+        .with_filetype(5)
+        .with_channels(1 << 21)
+        .with_blocksize(1)
+        .with_maxlpcorder(0)
+        .with_meanblocks(0)
+        .with_skipbytes(0);
     let mut bytes = Vec::new();
     write_stream_header(&mut bytes, &header).expect("header serialises");
     bytes.extend_from_slice(&[0u8; 16]); // command-stream padding bytes
@@ -187,15 +184,14 @@ fn streaming_wrapper_rejects_over_cap_header_resources() {
 /// wrappers must now reject the stream.
 #[test]
 fn quit_mid_channel_round_rejected_by_both_wrappers() {
-    let header = ShortenStreamHeader {
-        version: 2,
-        filetype: 5,
-        channels: 2,
-        blocksize: 8,
-        maxlpcorder: 0,
-        meanblocks: 0,
-        skipbytes: 0,
-    };
+    let header = ShortenStreamHeader::default()
+        .with_version(2)
+        .with_filetype(5)
+        .with_channels(2)
+        .with_blocksize(8)
+        .with_maxlpcorder(0)
+        .with_meanblocks(0)
+        .with_skipbytes(0);
     // Header, one ZERO block (lands on channel 0), then QUIT: channel
     // 1 never receives its block of the round.
     let mut bytes = Vec::new();

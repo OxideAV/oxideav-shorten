@@ -84,23 +84,19 @@ fuzz_target!(|data: &[u8]| {
         .collect();
     samples.truncate(samples.len() - samples.len() % n);
 
-    let header = ShortenStreamHeader {
-        version,
-        filetype,
-        channels,
-        blocksize,
-        maxlpcorder,
-        meanblocks,
-        skipbytes,
-    };
+    let header = ShortenStreamHeader::default()
+        .with_version(version)
+        .with_filetype(filetype)
+        .with_channels(channels)
+        .with_blocksize(blocksize)
+        .with_maxlpcorder(maxlpcorder)
+        .with_meanblocks(meanblocks)
+        .with_skipbytes(skipbytes);
 
     if data[0] & 0x80 != 0 {
         // Version 1's layout is unpinned and the decoder rejects it, so
         // the encoder must refuse rather than emit undecodable bytes.
-        let v1 = ShortenStreamHeader {
-            version: 1,
-            ..header
-        };
+        let v1 = header.with_version(1);
         assert_eq!(
             encode_stream(&v1, &samples, verbatim).err(),
             Some(EncodeError::UnsupportedVersion(1))

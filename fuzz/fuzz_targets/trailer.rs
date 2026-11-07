@@ -71,15 +71,14 @@ fuzz_target!(|data: &[u8]| {
     let n = channels as usize;
     let mut samples: Vec<i32> = data[6..].iter().map(|&b| b as i8 as i32 * 37).collect();
     samples.truncate(samples.len() - samples.len() % n);
-    let header = ShortenStreamHeader {
-        version: 2,
-        filetype: 5,
-        channels,
-        blocksize,
-        maxlpcorder: 0,
-        meanblocks: 0,
-        skipbytes: 0,
-    };
+    let header = ShortenStreamHeader::default()
+        .with_version(2)
+        .with_filetype(5)
+        .with_channels(channels)
+        .with_blocksize(blocksize)
+        .with_maxlpcorder(0)
+        .with_meanblocks(0)
+        .with_skipbytes(0);
     let stream = encode_stream(&header, &samples, &[]).expect("valid stream encodes");
     let clean = decode_stream(&stream).expect("valid stream decodes");
     assert_eq!(clean.stream_proper_len, stream.len());

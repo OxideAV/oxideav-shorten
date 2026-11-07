@@ -57,15 +57,14 @@ fn v2_header(
     maxlpcorder: u32,
     meanblocks: u32,
 ) -> ShortenStreamHeader {
-    ShortenStreamHeader {
-        version: 2,
-        filetype: 5,
-        channels,
-        blocksize,
-        maxlpcorder,
-        meanblocks,
-        skipbytes: 0,
-    }
+    ShortenStreamHeader::default()
+        .with_version(2)
+        .with_filetype(5)
+        .with_channels(channels)
+        .with_blocksize(blocksize)
+        .with_maxlpcorder(maxlpcorder)
+        .with_meanblocks(meanblocks)
+        .with_skipbytes(0)
 }
 
 /// A bounded two-term integer recurrence `s(t) = s(t-1) - s(t-2)`

@@ -124,7 +124,8 @@ pub const SIDECAR_LEN_CAP: u32 = 16 * 1024 * 1024;
 /// does not interpret its numeric value — the §5.1 narrative names the
 /// field but does not enumerate its legal values — it is surfaced raw
 /// so a seek-table-consuming caller can branch on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct ShnampskTrailer {
     /// Offset of the first byte of the sidecar (the `S` of `SEEK`)
     /// within the original file bytes.
@@ -139,6 +140,29 @@ pub struct ShnampskTrailer {
     /// spec set pins the field's existence and one-byte width but not
     /// its legal value set.
     pub seek_format_version: u8,
+}
+
+impl ShnampskTrailer {
+    /// Set `sidecar_start`.
+    #[must_use]
+    pub fn with_sidecar_start(mut self, v: usize) -> Self {
+        self.sidecar_start = v;
+        self
+    }
+
+    /// Set `sidecar_len`.
+    #[must_use]
+    pub fn with_sidecar_len(mut self, v: u32) -> Self {
+        self.sidecar_len = v;
+        self
+    }
+
+    /// Set `seek_format_version`.
+    #[must_use]
+    pub fn with_seek_format_version(mut self, v: u8) -> Self {
+        self.seek_format_version = v;
+        self
+    }
 }
 
 /// Try to detect a `SHNAMPSK`-tagged seek-table sidecar at the tail of

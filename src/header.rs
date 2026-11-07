@@ -56,7 +56,8 @@ pub const MIN_HEADER_BYTES: usize = 5;
 /// Round 1 names the v2/v3 layout. A v1 stream is rejected at parse
 /// time with [`Error::UnsupportedVersion`] pending the v1-specific
 /// branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct ShortenStreamHeader {
     /// Format version at file offset `0x04`. In-scope values: `1`,
     /// `2`, `3` per `spec/00` §"Format versions".
@@ -89,6 +90,57 @@ pub struct ShortenStreamHeader {
     /// in the bit stream as a `BLOCK_FN_VERBATIM` command rather
     /// than inline in the header.
     pub skipbytes: u32,
+}
+
+impl ShortenStreamHeader {
+    /// Set `version`.
+    #[must_use]
+    pub fn with_version(mut self, v: u8) -> Self {
+        self.version = v;
+        self
+    }
+
+    /// Set `filetype`.
+    #[must_use]
+    pub fn with_filetype(mut self, v: u32) -> Self {
+        self.filetype = v;
+        self
+    }
+
+    /// Set `channels`.
+    #[must_use]
+    pub fn with_channels(mut self, v: u32) -> Self {
+        self.channels = v;
+        self
+    }
+
+    /// Set `blocksize`.
+    #[must_use]
+    pub fn with_blocksize(mut self, v: u32) -> Self {
+        self.blocksize = v;
+        self
+    }
+
+    /// Set `maxlpcorder`.
+    #[must_use]
+    pub fn with_maxlpcorder(mut self, v: u32) -> Self {
+        self.maxlpcorder = v;
+        self
+    }
+
+    /// Set `meanblocks`.
+    #[must_use]
+    pub fn with_meanblocks(mut self, v: u32) -> Self {
+        self.meanblocks = v;
+        self
+    }
+
+    /// Set `skipbytes`.
+    #[must_use]
+    pub fn with_skipbytes(mut self, v: u32) -> Self {
+        self.skipbytes = v;
+        self
+    }
 }
 
 /// Implementation-side safety cap on `H_channels`. The spec pins no
@@ -298,13 +350,30 @@ impl Filetype {
 /// (5 bytes × 8 bits).
 ///
 /// On fixture `F1` (`spec/02` §6.7) this is `43`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub struct ParsedHeader {
     /// The header fields themselves.
     pub header: ShortenStreamHeader,
     /// Bit-stream position at which the per-block command stream
     /// begins, measured from the start of byte `0x05`.
     pub bits_consumed_after_v: u32,
+}
+
+impl ParsedHeader {
+    /// Set `header`.
+    #[must_use]
+    pub fn with_header(mut self, v: ShortenStreamHeader) -> Self {
+        self.header = v;
+        self
+    }
+
+    /// Set `bits_consumed_after_v`.
+    #[must_use]
+    pub fn with_bits_consumed_after_v(mut self, v: u32) -> Self {
+        self.bits_consumed_after_v = v;
+        self
+    }
 }
 
 /// Parse the stream header from a byte buffer beginning at file

@@ -112,15 +112,14 @@ fn random_grid_lossless_sample_exact() {
     let mut rng = Rng::new(0x5348_4f52_5445_4e01);
     for case in 0..160u32 {
         let channels = 1 + rng.upto(5) as u32;
-        let header = ShortenStreamHeader {
-            version: 2 + rng.upto(1) as u8,
-            filetype: rng.upto(200) as u32,
-            channels,
-            blocksize: 1 + rng.upto(299) as u32,
-            maxlpcorder: rng.upto(12) as u32,
-            meanblocks: rng.upto(6) as u32,
-            skipbytes: rng.upto(90) as u32,
-        };
+        let header = ShortenStreamHeader::default()
+            .with_version(2 + rng.upto(1) as u8)
+            .with_filetype(rng.upto(200) as u32)
+            .with_channels(channels)
+            .with_blocksize(1 + rng.upto(299) as u32)
+            .with_maxlpcorder(rng.upto(12) as u32)
+            .with_meanblocks(rng.upto(6) as u32)
+            .with_skipbytes(rng.upto(90) as u32);
         let depth = 4 + rng.upto(20) as u32;
         let verbatim: Vec<u8> = (0..rng.upto(40)).map(|_| rng.next_u64() as u8).collect();
         let total = (rng.upto(600) as usize) / channels as usize * channels as usize;
@@ -142,15 +141,14 @@ fn random_grid_lossy_quantised_exact() {
     let mut rng = Rng::new(0x5348_4f52_5445_4e02);
     for case in 0..60u32 {
         let channels = 1 + rng.upto(3) as u32;
-        let header = ShortenStreamHeader {
-            version: 2,
-            filetype: 5,
-            channels,
-            blocksize: 1 + rng.upto(127) as u32,
-            maxlpcorder: rng.upto(8) as u32,
-            meanblocks: rng.upto(4) as u32,
-            skipbytes: 0,
-        };
+        let header = ShortenStreamHeader::default()
+            .with_version(2)
+            .with_filetype(5)
+            .with_channels(channels)
+            .with_blocksize(1 + rng.upto(127) as u32)
+            .with_maxlpcorder(rng.upto(8) as u32)
+            .with_meanblocks(rng.upto(4) as u32)
+            .with_skipbytes(0);
         let bshift = 1 + rng.upto(11) as u32;
         let total = (rng.upto(400) as usize) / channels as usize * channels as usize;
         let structured = case % 3 == 0;
@@ -180,14 +178,15 @@ fn random_grid_lossy_quantised_exact() {
 /// every depth-boundary, and blocksize-1 streams with high LPC orders.
 #[test]
 fn degenerate_shapes_sample_exact() {
-    let h = |channels, blocksize, maxlpcorder, meanblocks| ShortenStreamHeader {
-        version: 2,
-        filetype: 5,
-        channels,
-        blocksize,
-        maxlpcorder,
-        meanblocks,
-        skipbytes: 0,
+    let h = |channels, blocksize, maxlpcorder, meanblocks| {
+        ShortenStreamHeader::default()
+            .with_version(2)
+            .with_filetype(5)
+            .with_channels(channels)
+            .with_blocksize(blocksize)
+            .with_maxlpcorder(maxlpcorder)
+            .with_meanblocks(meanblocks)
+            .with_skipbytes(0)
     };
     // Empty stream (header + QUIT only).
     check_roundtrip(&h(1, 256, 0, 0), &[], &[], 0, "empty mono");

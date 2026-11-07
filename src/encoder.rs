@@ -278,6 +278,7 @@ pub const ENCODER_VERSION: u8 = 2;
 /// Errors the round-12 envelope encoder and the round-13 / round-14 /
 /// round-15 / round-16 predictor encoders can surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EncodeError {
     /// A header carried a format version outside `{2, 3}`. Version 1
     /// is in the spec's scope but its parameter-block layout is

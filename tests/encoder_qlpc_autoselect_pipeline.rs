@@ -37,15 +37,14 @@ use oxideav_shorten::{
 };
 
 fn synth_header(channels: u32, blocksize: u32, maxlpcorder: u32) -> ShortenStreamHeader {
-    ShortenStreamHeader {
-        version: 2,
-        filetype: 5,
-        channels,
-        blocksize,
-        maxlpcorder,
-        meanblocks: 0,
-        skipbytes: 0,
-    }
+    ShortenStreamHeader::default()
+        .with_version(2)
+        .with_filetype(5)
+        .with_channels(channels)
+        .with_blocksize(blocksize)
+        .with_maxlpcorder(maxlpcorder)
+        .with_meanblocks(0)
+        .with_skipbytes(0)
 }
 
 /// A bounded period-6 oscillation `s(t) = s(t − 1) − s(t − 2)` from

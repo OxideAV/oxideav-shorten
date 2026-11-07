@@ -41,15 +41,14 @@
 use oxideav_shorten::{ShortenStreamHeader, StreamDecoder, decode_stream, encode_stream};
 
 fn header(channels: u32, blocksize: u32, maxlpcorder: u32, meanblocks: u32) -> ShortenStreamHeader {
-    ShortenStreamHeader {
-        version: 2,
-        filetype: 5, // s16lh
-        channels,
-        blocksize,
-        maxlpcorder,
-        meanblocks,
-        skipbytes: 0,
-    }
+    ShortenStreamHeader::default()
+        .with_version(2)
+        .with_filetype(5)
+        .with_channels(channels)
+        .with_blocksize(blocksize)
+        .with_maxlpcorder(maxlpcorder)
+        .with_meanblocks(meanblocks)
+        .with_skipbytes(0)
 }
 
 /// Deterministic xorshift64* PRNG — reproducible corpus generation with
